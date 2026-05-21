@@ -1,0 +1,69 @@
+# Build directories
+build/
+build_*/
+cmake-build-*/
+
+# Compiled binaries
+lingqi_tantong
+test_basic
+*.exe
+*.out
+
+# Object files
+*.o
+*.obj
+*.lo
+
+# Static and shared libraries
+*.a
+*.la
+*.so
+*.dylib
+*.dll
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Output files (generated reports)
+output/*.csv
+output/*.json
+output/*.mp4
+output/*.avi
+output/viewer.html
+
+# Log files
+*.log
+
+# OS generated
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Model files (large ONNX models, typically stored separately)
+models/
+!models/.gitkeep
+
+# ESP-IDF / ESP32-P4
+esp32p4_firmware/build/
+esp32p4_firmware/sdkconfig
+esp32p4_firmware/sdkconfig.old
+esp32p4_firmware/dependencies.lock
+esp32p4_firmware/managed_components/

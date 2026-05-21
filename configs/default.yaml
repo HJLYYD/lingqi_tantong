@@ -1,0 +1,233 @@
+system:
+  use_onnx: false
+  log_level: INFO
+  startup_mode: realtime
+  max_frames: 0
+  ring_buffer_size: 16
+  target_fps: 15.0
+  worker_threads: 2
+
+video:
+  source: camera
+  camera_device: "/dev/video0"
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 15.0
+  camera_format: MJPEG
+  camera_buffer_count: 4
+  video_path: ""
+  output_path: "output/result.mp4"
+  save_frame_interval: 15
+
+arrow:
+  uart_device_A: "/dev/ttyS0"
+  uart_device_C: "/dev/ttyS1"
+  baudrate: 3000000
+  data_bits: 8
+  stop_bits: 1
+  parity: none
+  enable_fec: false
+  dual_link: true
+
+detection:
+  backend: cpu
+  fallback: heuristic
+  model: "models/Human Recognition/yolov8n.onnx"
+  model_path: "models/Human Recognition/yolov8n.onnx"
+  confidence_threshold: 0.25
+  iou_threshold: 0.45
+  input_size: 640
+  classes: 80
+
+pose:
+  backend: cpu
+  fallback: heuristic
+  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.onnx"
+  confidence_threshold: 0.30
+  iou_threshold: 0.45
+  input_size: [640, 640]
+  num_keypoints: 17
+  skeleton_type: coco
+
+face:
+  detection_backend: cpu
+  detection_fallback: color_symmetry
+  recognition_backend: cpu
+  detection_model_path: "models/Face Recognition/scrfd_10g_bnkps.onnx"
+  recognition_model_path: "models/Face Recognition/glintr100.onnx"
+  face_min_size: 24
+  confidence_threshold: 0.50
+  similarity_threshold: 0.55
+  input_size: [112, 112]
+  embedding_dim: 512
+  liveness_detection: false
+
+depth:
+  enabled: false
+  backend: cpu
+  model: "models/Depth/midas_v2.onnx"
+  method: pinhole_with_imu
+  input_size: [256, 256]
+  focal_length: 460.0
+  reference_width: 0.45
+
+tracking:
+  max_lost: 30
+  min_iou: 0.30
+  max_distance: 5.0
+  max_track_history: 300
+  max_trajectory_length: 300
+  kalman_process_noise: 0.05
+  kalman_measurement_noise: 0.10
+  init_state:
+    position_variance: 0.1
+    velocity_variance: 0.01
+  noise:
+    process_position: 0.01
+    process_velocity: 0.002
+    measurement: 0.04
+  ema_alpha: 0.25
+
+spatial:
+  fx: 500.0
+  fy: 500.0
+  cx: 320.0
+  cy: 240.0
+  default_focal_length: 500.0
+  avg_human_height: 1.70
+  avg_person_height: 1.70
+  min_depth: 0.3
+  max_depth: 120.0
+  imu_pitch_correction: true
+  camera_tilt_deg: 0.0
+  earth_radius: 6371000.0
+  coordinate_type: enu_local
+
+imu:
+  source: arrow_uart
+  sensor: external
+  gps_source: none
+  mag_declination: -5.5
+  accel_bias_x: 0.0
+  accel_bias_y: 0.0
+  accel_bias_z: 0.0
+  gyro_bias_x: 0.0
+  gyro_bias_y: 0.0
+  gyro_bias_z: 0.0
+
+mahony:
+  kp: 0.5
+  ki: 0.01
+  sample_freq: 200.0
+  two_kp: 1.0
+  two_ki: 0.02
+
+vins:
+  enabled: false
+  max_features: 150
+  min_parallax: 10.0
+  sliding_window_size: 10
+  imu_integration_time: 0.05
+
+atw:
+  enabled: false
+  method: reprojection
+  prediction_ms: 33
+  motion_model: imu_only
+
+kcplite:
+  enabled: false
+  mtu: 1400
+  window_size: 128
+  nodelay: 1
+  resend: 2
+  rx_queue_size: 64
+
+visualization:
+  show_info_bar: true
+  corner_markers: true
+  crosshair: true
+  render_size: [1920, 1080]
+  line_width: 2
+  font_scale: 2.0
+  show_ids: true
+  show_trajectory: true
+  trajectory_length: 45
+  draw_skeleton: true
+  skeleton_line_width: 1
+  point_radius: 3
+  show_fps: true
+  show_depth: true
+  show_imu_overlay: true
+  record_to_video: true
+  display_enabled: false
+  display_device: "/dev/fb0"
+  colors:
+    - [0, 255, 0]
+    - [255, 0, 0]
+    - [0, 0, 255]
+    - [255, 255, 0]
+    - [255, 0, 255]
+    - [0, 255, 255]
+    - [255, 128, 0]
+    - [128, 0, 255]
+
+ai_acceleration:
+  platform: onnx_runtime
+  precision: fp32
+  power_mode: balanced
+  ddr_bw_limit_mbps: 5400
+  model_cache_dir: "/tmp/lingqi_ai_cache"
+  preload_models: true
+  warmup_runs: 3
+
+performance:
+  rvv_enabled: true
+  rvv_vlen: 256
+  openmp_threads: 2
+  pipeline_pin_to_core: true
+  imu_core: 0
+  inference_core: 1
+  visualization_core: 2
+  l1_cache_optimize: true
+
+k1_hardware:
+  enabled: true
+  cluster0_ai_cores: "0-3"
+  cluster1_io_cores: "4-7"
+  tcm:
+    enabled: true
+    tcm_device: "/dev/tcm"
+    tcm_size_kb: 512
+    preload_model_weights: true
+    model_weight_max_kb: 480
+  vpu:
+    enabled: true
+    mpp_device: "/dev/mpp_service"
+    hardware_jpeg_decode: true
+    hardware_h264_encode: true
+    max_encode_resolution: [1920, 1080]
+    encoder_bitrate_kbps: 4000
+  jpu:
+    enabled: true
+    jpu_device: "/dev/jpu"
+    prefer_hardware: true
+  gpu:
+    enabled: true
+    drm_device: "/dev/dri/renderD128"
+    opengl_visualization: false
+  pipeline:
+    ring_buffer_size: 4
+    capture_thread_cpu: 4
+    infer_thread_cpu: 1
+    postprocess_thread_cpu: 0
+    viz_thread_cpu: 6
+    output_thread_cpu: 7
+    imu_thread_cpu: 0
+  power:
+    cpu_freq_max_mhz: 1600
+    governor: "ondemand"
+    dvfs_enabled: true
+  ddr:
+    bandwidth_limit_mbps: 5400
+    optimize_access_pattern: true
