@@ -18,11 +18,10 @@ typedef struct {
     int input_height;
     float confidence_threshold;
     float nms_threshold;
-    bool use_onnx;
 } SCRFDDetector;
 
 SCRFDDetector* scrfd_detector_create(const char* model_path, int input_w, int input_h,
-                                      float conf_thresh, float nms_thresh, bool use_onnx);
+                                      float conf_thresh, float nms_thresh);
 void scrfd_detector_destroy(SCRFDDetector* det);
 
 bool scrfd_detector_load_model(SCRFDDetector* det, const char* model_path);

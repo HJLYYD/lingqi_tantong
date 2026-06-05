@@ -9,12 +9,17 @@ extern "C" {
 
 #define TRACKING_MAX_TRACKS             256
 #define TRACKING_MAX_TRAJECTORY         300
-#define TRACKING_CONFIRMATION_FRAMES    3
+#define TRACKING_CONFIRMATION_FRAMES    3   /* faster confirmation — DFL scores are noisy so trust early */
 #define TRACKING_MAX_LOST_FRAMES        30
 #define TRACKING_OCCLUSION_WINDOW       15
-#define TRACKING_IOU_THRESHOLD_HIGH     0.3f
-#define TRACKING_IOU_THRESHOLD_LOW      0.1f
-#define TRACKING_CONFIDENCE_HIGH        0.5f
+/* ByteTrack-style two-stage matching with DFL-peakiness scores.
+ * DFL scores range 0.18-0.70 (mean≈0.36). HIGH/LOW are calibrated
+ * to this range so existing tracks don't get starved by threshold.
+ * HIGH=0.20: first-stage matching (new tracks need modest DFL signal).
+ * LOW=0.12:  second-stage recovery for momentarily-weak existing tracks. */
+#define TRACKING_IOU_THRESHOLD          0.5f
+#define TRACKING_CONFIDENCE_HIGH        0.20f  /* was 0.30 — too strict for DFL range */
+#define TRACKING_CONFIDENCE_LOW         0.12f  /* was 0.20 — too strict for recovery matching */
 #define TRACKING_EMA_ALPHA              0.3f
 
 typedef struct {

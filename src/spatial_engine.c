@@ -157,9 +157,6 @@ SpatialResult spatial_engine_calculate_position(SpatialLocalizationEngine* engin
         depth = corrected_depth;
     }
 
-    float norm_x = bbox_center_x(&detection->bbox) / frame_width;
-    float norm_y = bbox_center_y(&detection->bbox) / frame_height;
-
     float fx = engine->camera_matrix[0][0];
     float fy = engine->camera_matrix[1][1];
     float cx = engine->camera_matrix[0][2];
@@ -305,4 +302,42 @@ void spatial_engine_set_camera_pose(SpatialLocalizationEngine* engine, float pit
     engine->camera_roll = roll;
     engine->camera_yaw = yaw;
     engine->has_camera_pose = true;
+}
+
+/*
+ * Depth consistency check: reject detections whose depth estimate
+ * changes implausibly compared to the tracked object's recent history.
+ *
+ * A depth ratio > 2.0× or < 0.4× compared to the rolling average of
+ * the last 5 trajectory points suggests either:
+ *   - A false detection on background clutter
+ *   - An occlusion event (different person briefly occluding the tracked one)
+ *   - A depth estimation failure (person height prior violated)
+ *
+ * Returns true if the depth is consistent with recent history.
+ */
+bool spatial_engine_check_depth_consistency(SpatialLocalizationEngine* engine,
+                                              int track_id, float new_depth,
+                                              float max_jump_ratio) {
+    if (!engine || track_id < 0 || track_id >= SPATIAL_MAX_PERSONS) return true;
+
+    const TrajectoryBuffer* buf = &engine->trajectories[track_id];
+    if (buf->count < 3) return true;  /* Not enough history yet */
+
+    /* Compute rolling average of last N depth values */
+    int n = UTILS_MIN(5, buf->count);
+    float avg_depth = 0.0f;
+    int valid_pts = 0;
+    for (int i = buf->count - n; i < buf->count; i++) {
+        if (buf->positions[i].is_valid) {
+            avg_depth += buf->positions[i].z;
+            valid_pts++;
+        }
+    }
+
+    if (valid_pts == 0) return true;
+    avg_depth /= (float)valid_pts;
+
+    float ratio = new_depth / (avg_depth + 0.01f);
+    return (ratio >= (1.0f / max_jump_ratio) && ratio <= max_jump_ratio);
 }

@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define ARCFACE_FEATURE_DIM     512
+#define ARCFACE_FEATURE_DIM     128  /* ArcFace MobileFaceNet-cuted: output is [1,128]; must match core_types.h FEATURE_VECTOR_DIM */
 #define ARCFACE_MAX_FACES       256
 
 typedef struct OrtSession OrtSession;
@@ -24,13 +24,12 @@ typedef struct {
     int input_width;
     int input_height;
     float similarity_threshold;
-    bool use_onnx;
     FaceDatabaseEntry database[ARCFACE_MAX_FACES];
     int num_entries;
 } ArcFaceRecognizer;
 
 ArcFaceRecognizer* arcface_recognizer_create(const char* model_path, int input_w, int input_h,
-                                              float sim_thresh, bool use_onnx);
+                                              float sim_thresh);
 void arcface_recognizer_destroy(ArcFaceRecognizer* rec);
 
 bool arcface_recognizer_load_model(ArcFaceRecognizer* rec, const char* model_path);

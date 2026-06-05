@@ -1,12 +1,29 @@
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include "system_controller.h"
 #include "logger.h"
 #include "utils.h"
 #include "k1_platform.h"
+#include "video_processor.h"
+#ifdef HAS_ONNX_RUNTIME
+#include "ort_common.h"
+#ifdef HAS_SPACEMIT_EP
+#include "spacemit_ort_bridge.h"
+#endif
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
+
+static void associate_poses_with_objects(TrackedObject* objects, int num_objects,
+                                          PoseEstimation* poses, int num_poses);
+static void associate_faces_with_objects(TrackedObject* objects, int num_objects,
+                                          FaceIdentity* faces, int num_faces);
+static float get_current_fps(const SystemController* sc);
 
 #ifdef HAS_K1_PIPELINE
 #include <pthread.h>
@@ -116,6 +133,7 @@ static void k1_pipeline_init(K1Pipeline* pl, SystemController* sc) {
 }
 
 static void k1_pipeline_destroy(K1Pipeline* pl) {
+    pl->running = false;
     pl->shutdown = true;
 
     pthread_mutex_lock(&pl->ring_mutex);
@@ -233,20 +251,38 @@ static void k1_pipeline_slot_release(K1Pipeline* pl, int slot) {
     pthread_mutex_unlock(&pl->ring_mutex);
 }
 
+static void k1_apply_rt_priority(const char* role) {
+    struct sched_param sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = 50;
+    int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (rc == 0) {
+        log_info("[K1 Pipeline] %s thread elevated to SCHED_FIFO prio 50", role);
+    } else if (rc == EPERM) {
+        log_debug("[K1 Pipeline] %s: SCHED_FIFO unavailable (no CAP_SYS_NICE), using SCHED_OTHER", role);
+    } else {
+        log_warning("[K1 Pipeline] %s: pthread_setschedparam failed: %d", role, rc);
+    }
+}
+
 static void* k1_capture_thread(void* arg) {
     K1ThreadArg* ta = (K1ThreadArg*)arg;
     K1Pipeline* pl = ta->pipeline;
     SystemController* sc = pl->controller;
 
     k1_pin_current_to_cpu(ta->cpu_core);
+    k1_apply_rt_priority("Capture");
     log_info("[K1 Pipeline] Capture thread on CPU %d", ta->cpu_core);
 
     int cam_w = pl->slots[0].width;
     int cam_h = pl->slots[0].height;
 
-    uint8_t* frame_rgb = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
-    if (!frame_rgb) {
-        log_error("[K1 Pipeline] Failed to allocate capture buffer");
+    bool use_v4l2 = (sc->video_processor != NULL &&
+                    video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
+                    video_processor_is_opened(sc->video_processor));
+    bool use_arrow = (sc->arrow_receiver != NULL);
+    if (!use_v4l2 && !use_arrow) {
+        log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera, no Arrow UART)");
         return NULL;
     }
 
@@ -257,23 +293,36 @@ static void* k1_capture_thread(void* arg) {
         K1PipelineSlot* s = &pl->slots[slot];
         bool got_frame = false;
 
-        if (sc->arrow_receiver) {
+        if (use_v4l2) {
+            FrameData* fd = video_processor_read_frame_raw(sc->video_processor);
+            if (fd && fd->data && fd->width == cam_w && fd->height == cam_h) {
+                memcpy(s->rgb_data, fd->data, (size_t)cam_w * cam_h * 3);
+                s->timestamp_us = (int64_t)(fd->timestamp * 1e6);
+                s->frame_index = fd->frame_index;
+                got_frame = true;
+                frame_data_destroy(fd);
+            } else if (fd) {
+                if (fd->data && fd->width > 0 && fd->height > 0) {
+                    utils_resize_image(fd->data, fd->width, fd->height,
+                                       s->rgb_data, cam_w, cam_h, 3);
+                    s->timestamp_us = (int64_t)(fd->timestamp * 1e6);
+                    s->frame_index = fd->frame_index;
+                    got_frame = true;
+                }
+                frame_data_destroy(fd);
+            }
+        }
+
+        if (!got_frame && use_arrow) {
             arrow_receiver_update(sc->arrow_receiver);
             ArrowSourceFrame arrow_frame;
             if (arrow_receiver_get_latest_frame(sc->arrow_receiver, &arrow_frame)) {
-#ifdef HAS_K1_JPU
-                if (k1_platform_has_cap(K1_CAP_JPU)) {
-                    soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
-                                            s->rgb_data, cam_w, cam_h);
-                } else
-#endif
-                {
-                    soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
-                                            s->rgb_data, cam_w, cam_h);
+                if (soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
+                                            s->rgb_data, cam_w, cam_h) == 0) {
+                    got_frame = true;
+                    s->timestamp_us = (int64_t)(arrow_frame.timestamp * 1000.0);
+                    s->frame_index = arrow_frame.frame_index;
                 }
-                got_frame = true;
-                s->timestamp_us = arrow_frame.timestamp * 1000.0;
-                s->frame_index = arrow_frame.frame_index;
 
                 if (arrow_frame.has_pose) {
                     imu_handler_set_external_pose(sc->imu_handler,
@@ -288,15 +337,19 @@ static void* k1_capture_thread(void* arg) {
         }
 
         if (!got_frame) {
-            memset(s->rgb_data, 64, (size_t)cam_w * cam_h * 3);
-            s->timestamp_us = k1_get_time_us();
-            s->frame_index = sc->frame_count;
+            pthread_mutex_lock(&pl->ring_mutex);
+            pl->active_slots--;
+            pl->capture_idx = (pl->capture_idx - 1 + K1_RING_SIZE) % K1_RING_SIZE;
+            pthread_cond_signal(&pl->post_done_cond);
+            pthread_mutex_unlock(&pl->ring_mutex);
+            struct timespec ts = {0, 5000000L};
+            nanosleep(&ts, NULL);
+            continue;
         }
 
         k1_pipeline_slot_capture_done(pl, slot);
     }
 
-    free(frame_rgb);
     return NULL;
 }
 
@@ -306,6 +359,7 @@ static void* k1_inference_thread(void* arg) {
     SystemController* sc = pl->controller;
 
     k1_pin_current_to_cpu(ta->cpu_core);
+    k1_apply_rt_priority("Inference");
     log_info("[K1 Pipeline] Inference thread on CPU %d (Cluster0)", ta->cpu_core);
 
     while (pl->running) {
@@ -336,6 +390,7 @@ static void* k1_postprocess_thread(void* arg) {
     SystemController* sc = pl->controller;
 
     k1_pin_current_to_cpu(ta->cpu_core);
+    k1_apply_rt_priority("PostProcess");
     log_info("[K1 Pipeline] Post-process thread on CPU %d (Cluster0)", ta->cpu_core);
 
     int cam_w = pl->slots[0].width;
@@ -429,10 +484,10 @@ static void* k1_postprocess_thread(void* arg) {
     return NULL;
 }
 
-static SystemStatus system_controller_process_realtime_k1(SystemController* sc,
-                                                           const char* uart_device_A,
-                                                           const char* uart_device_C,
-                                                           int baudrate) {
+SystemStatus system_controller_process_realtime_k1(SystemController* sc,
+                                                    const char* uart_device_A,
+                                                    const char* uart_device_C,
+                                                    int baudrate) {
     SystemStatus status;
     memset(&status, 0, sizeof(SystemStatus));
 
@@ -448,7 +503,7 @@ static SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     log_info("============================================================");
 
     K1Platform* plat = k1_platform_init();
-    if (!plat || !plat->is_k1) {
+    if (!plat || !k1_platform_is_k1()) {
         log_warning("K1 platform not available, falling back to single-threaded mode");
         return system_controller_process_realtime(sc, uart_device_A, uart_device_C, baudrate);
     }
@@ -460,10 +515,12 @@ static SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     const char* camera_dev = config_get_string(sc->config, "video.camera_device", "/dev/video0");
     const char* camera_format = config_get_string(sc->config, "video.camera_format", "MJPEG");
 
-    if (camera_dev && uart_device_A) {
+    if (camera_dev) {
         sc->video_processor = video_processor_create_from_camera(camera_dev, cam_w, cam_h, cam_fps, camera_format);
         if (sc->video_processor) {
-            log_info("[K1 Pipeline] Camera device opened: %s", camera_dev);
+            log_info("[K1 Pipeline] Camera device opened: %s (%dx%d @ %.1f FPS)", camera_dev, cam_w, cam_h, cam_fps);
+        } else {
+            log_warning("[K1 Pipeline] V4L2 camera %s unavailable; will rely on Arrow UART", camera_dev);
         }
     }
 
@@ -480,11 +537,9 @@ static SystemStatus system_controller_process_realtime_k1(SystemController* sc,
 
     sc->ai_context = ai_accel_context_create();
     if (sc->ai_context) {
-        const char* model_path = config_get_string(sc->config, "detection.model",
-            "models/Human Recognition/yolov8n.onnx");
-        int input_sz = config_get_int(sc->config, "detection.input_size", 640);
-        ai_accel_load_model(sc->ai_context, AI_MODEL_YOLOV8N, model_path, input_sz, input_sz);
-        ai_accel_warmup(sc->ai_context, AI_MODEL_YOLOV8N, input_sz, input_sz);
+        log_info("[K1 Pipeline] %s", ai_accel_describe(sc->ai_context));
+    } else {
+        log_warning("[K1 Pipeline] AI accel context unavailable, ONNX CPU path only");
     }
 
     K1Pipeline pl;
@@ -568,7 +623,18 @@ SystemController* system_controller_create(const char* config_path) {
     if (!sc) return NULL;
 
     sc->config = config_manager_create(config_path);
-    sc->model_store = model_store_create("models", config_get_bool(sc->config, "system.use_onnx", false));
+#ifdef HAS_ONNX_RUNTIME
+    {
+        bool ep_pref = config_get_bool(sc->config, "system.use_spacemit_ep", true);
+        ort_set_ep_enabled(ep_pref);
+#ifdef HAS_SPACEMIT_EP
+        int ep_threads = config_get_int(sc->config, "system.spacemit_ep_intra_threads", 1);
+        spacemit_ort_set_ep_intra_threads(ep_threads);
+        log_info("SpacemiT EP config: enabled=%d, intra_threads=%d", ep_pref, ep_threads);
+#endif
+    }
+#endif
+    sc->model_store = model_store_create("models");
     if (!sc->model_store) {
         log_warning("Model store creation failed");
     }
@@ -578,13 +644,13 @@ SystemController* system_controller_create(const char* config_path) {
     const char* detection_backend = config_get_string(sc->config, "detection.backend", "cpu");
     bool use_ai_accel = (detection_backend != NULL && strcmp(detection_backend, "ai_accel") == 0);
     (void)use_ai_accel;
-    sc->inference_pipeline = inference_pipeline_create(config_get_bool(sc->config, "system.use_onnx", false));
+    sc->inference_pipeline = inference_pipeline_create();
     if (!sc->inference_pipeline) {
         log_warning("Inference pipeline creation failed");
     }
 
     if (sc->inference_pipeline) {
-        inference_pipeline_load_models(sc->inference_pipeline, "models");
+        inference_pipeline_load_models(sc->inference_pipeline, "models", sc->config);
     }
 
     sc->tracking_manager = object_tracker_create(
@@ -594,9 +660,13 @@ SystemController* system_controller_create(const char* config_path) {
         config_get_int(sc->config, "tracking.max_track_history", 300)
     );
 
-    float focal = config_get_float(sc->config, "spatial.fx", 500.0f);
+    float fx = config_get_float(sc->config, "spatial.fx", 960.0f);
+    float fy = config_get_float(sc->config, "spatial.fy", 960.0f);
+    float cx = config_get_float(sc->config, "spatial.cx", 960.0f);
+    float cy = config_get_float(sc->config, "spatial.cy", 540.0f);
     float avg_height = config_get_float(sc->config, "spatial.avg_human_height", 1.7f);
-    sc->spatial_engine = spatial_engine_create(NULL, NULL, focal, avg_height);
+    float cam_mat[9] = {fx, 0.0f, cx, 0.0f, fy, cy, 0.0f, 0.0f, 1.0f};
+    sc->spatial_engine = spatial_engine_create(cam_mat, NULL, fx, avg_height);
 
     sc->visualizer = visualizer_create(
         config_get_bool(sc->config, "visualization.show_info_bar", true),
@@ -739,7 +809,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
 
     char output_video_path[MAX_PATH_LEN];
     const char* output_dir = output_path ? output_path : "output";
-    snprintf(output_video_path, sizeof(output_video_path), "%s/output.avi", output_dir);
+    snprintf(output_video_path, sizeof(output_video_path), "%s/output.mp4", output_dir);
 
     const char* session_id = result_manager_start_session(sc->result_manager, video_path);
     (void)session_id;
@@ -766,6 +836,10 @@ SystemStatus system_controller_process_video(SystemController* sc,
     }
 
     VideoWriter* video_writer = NULL;
+    /* CLI override takes priority; fall back to config value */
+    if (save_frame_interval <= 0) {
+        save_frame_interval = config_get_int(sc->config, "video.save_frame_interval", 10);
+    }
     if (save_frame_interval > 0) {
         video_writer = video_writer_create(output_video_path, video_w, video_h, video_fps > 0.0f ? video_fps : 30.0f);
         if (video_writer) {
@@ -778,7 +852,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
     double prev_time = sc->start_time;
 
     FrameData* frame;
-    while ((frame = video_processor_read_frame_raw(processor)) != NULL) {
+    while (sc->running && (frame = video_processor_read_frame_raw(processor)) != NULL) {
         double frame_start = (double)utils_get_time_ms() / 1000.0;
         sc->frame_count++;
 
@@ -918,13 +992,7 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
 
     sc->ai_context = ai_accel_context_create();
     if (sc->ai_context) {
-        const char* yolov8_model = config_get_string(sc->config, "detection.model",
-            "models/Human Recognition/yolov8n.onnx");
-        if (yolov8_model && ai_accel_is_available()) {
-            int input_sz = config_get_int(sc->config, "detection.input_size", 640);
-            ai_accel_load_model(sc->ai_context, AI_MODEL_YOLOV8N, yolov8_model, input_sz, input_sz);
-            ai_accel_warmup(sc->ai_context, AI_MODEL_YOLOV8N, input_sz, input_sz);
-        }
+        log_info("[realtime] %s", ai_accel_describe(sc->ai_context));
     } else {
         log_warning("AI acceleration not available, using CPU inference via ONNX Runtime");
     }
@@ -936,12 +1004,12 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
     const char* camera_dev = config_get_string(sc->config, "video.camera_device", "/dev/video0");
     const char* camera_format = config_get_string(sc->config, "video.camera_format", "MJPEG");
 
-    if (camera_dev && uart_device_A) {
+    if (camera_dev) {
         sc->video_processor = video_processor_create_from_camera(camera_dev, cam_w, cam_h, cam_fps, camera_format);
         if (sc->video_processor) {
             log_info("Camera device opened: %s (%dx%d @ %.1f FPS)", camera_dev, cam_w, cam_h, cam_fps);
         } else {
-            log_warning("Camera device %s unavailable, using Arrow-only mode", camera_dev);
+            log_warning("Camera device %s unavailable, will rely on Arrow UART for frames", camera_dev);
         }
     }
 
@@ -994,12 +1062,31 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
 
         bool got_frame = false;
 
-        if (sc->arrow_receiver) {
+        if (sc->video_processor &&
+            video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
+            video_processor_is_opened(sc->video_processor)) {
+            FrameData* fd = video_processor_read_frame_raw(sc->video_processor);
+            if (fd && fd->data) {
+                if (fd->width == cam_w && fd->height == cam_h) {
+                    memcpy(frame_rgb, fd->data, (size_t)cam_w * cam_h * 3);
+                } else {
+                    utils_resize_image(fd->data, fd->width, fd->height,
+                                       frame_rgb, cam_w, cam_h, 3);
+                }
+                got_frame = true;
+                frame_data_destroy(fd);
+            } else if (fd) {
+                frame_data_destroy(fd);
+            }
+        }
+
+        if (!got_frame && sc->arrow_receiver) {
             ArrowSourceFrame arrow_frame;
             if (arrow_receiver_get_latest_frame(sc->arrow_receiver, &arrow_frame)) {
-                soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
-                                        frame_rgb, cam_w, cam_h);
-                got_frame = true;
+                if (soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
+                                            frame_rgb, cam_w, cam_h) == 0) {
+                    got_frame = true;
+                }
 
                 if (arrow_frame.has_pose) {
                     imu_handler_set_external_pose(sc->imu_handler,
@@ -1014,12 +1101,9 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
         }
 
         if (!got_frame) {
-            memset(frame_rgb, 64, (size_t)cam_w * cam_h * 3);
             log_debug("No frame available, waiting...");
-#ifdef PLATFORM_RISCV64
-            struct timespec ts = {0, 33333333L};
+            struct timespec ts = {0, 10000000L};
             nanosleep(&ts, NULL);
-#endif
             continue;
         }
 

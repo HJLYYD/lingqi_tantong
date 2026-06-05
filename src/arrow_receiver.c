@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <math.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -25,6 +26,9 @@
 #define ARROW_CRC_POLY          0x1021
 #define ARROW_CRC_INIT          0xFFFF
 
+#define ARROW_RECONNECT_INITIAL_S   1
+#define ARROW_RECONNECT_MAX_S       16
+
 struct ArrowReceiver {
     int uart_fd;
     int uart_fd_secondary;
@@ -33,6 +37,9 @@ struct ArrowReceiver {
     int baud_rate;
     bool connected;
     bool dual_link_active;
+
+    int reconnect_delay_s;
+    time_t last_reconnect_attempt;
 
     uint8_t rx_buffer[ARROW_UART_BUFFER_SIZE];
     int rx_head;
@@ -392,8 +399,58 @@ ArrowReceiver* arrow_receiver_create(const char* uart_dev_path, int baud_rate) {
 
     receiver->connected = true;
     receiver->dual_link_active = false;
+    receiver->reconnect_delay_s = ARROW_RECONNECT_INITIAL_S;
+    receiver->last_reconnect_attempt = 0;
     log_info("ArrowReceiver created on %s at %d baud", uart_dev_path, baud_rate);
     return receiver;
+}
+
+static void arrow_uart_reset_state(ArrowReceiver* receiver) {
+    receiver->state = ARROW_STATE_IDLE;
+    receiver->header_pos = 0;
+    receiver->payload_pos = 0;
+    receiver->payload_len = 0;
+    if (receiver->payload_buf) {
+        free(receiver->payload_buf);
+        receiver->payload_buf = NULL;
+    }
+    receiver->rx_head = 0;
+    receiver->rx_tail = 0;
+}
+
+static bool arrow_uart_try_reconnect(ArrowReceiver* receiver) {
+    time_t now = time(NULL);
+    int wait = receiver->reconnect_delay_s;
+    if (wait < ARROW_RECONNECT_INITIAL_S) wait = ARROW_RECONNECT_INITIAL_S;
+    if (wait > ARROW_RECONNECT_MAX_S) wait = ARROW_RECONNECT_MAX_S;
+    if (receiver->last_reconnect_attempt != 0 &&
+        now < receiver->last_reconnect_attempt + wait) {
+        return false;
+    }
+    receiver->last_reconnect_attempt = now;
+
+    if (receiver->uart_fd >= 0) {
+        close(receiver->uart_fd);
+        receiver->uart_fd = -1;
+    }
+
+    int fd = uart_open(receiver->uart_path, receiver->baud_rate);
+    if (fd < 0) {
+        log_warning("Arrow UART reconnect attempt to %s failed (backoff=%ds)",
+                    receiver->uart_path, wait);
+        receiver->reconnect_delay_s *= 2;
+        if (receiver->reconnect_delay_s > ARROW_RECONNECT_MAX_S)
+            receiver->reconnect_delay_s = ARROW_RECONNECT_MAX_S;
+        return false;
+    }
+
+    tcflush(fd, TCIOFLUSH);
+    receiver->uart_fd = fd;
+    receiver->connected = true;
+    receiver->reconnect_delay_s = ARROW_RECONNECT_INITIAL_S;
+    arrow_uart_reset_state(receiver);
+    log_info("Arrow UART reconnected to %s at %d baud", receiver->uart_path, receiver->baud_rate);
+    return true;
 }
 
 void arrow_receiver_destroy(ArrowReceiver* receiver) {
@@ -452,12 +509,24 @@ bool arrow_receiver_is_connected(ArrowReceiver* receiver) {
 }
 
 void arrow_receiver_update(ArrowReceiver* receiver) {
-    if (!receiver || !receiver->connected) return;
+    if (!receiver) return;
+    if (!receiver->connected) {
+        arrow_uart_try_reconnect(receiver);
+        if (!receiver->connected) return;
+    }
 
     int n = uart_read_into_buffer(receiver);
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         receiver->connected = false;
-        log_warning("Arrow UART disconnected: %s", receiver->uart_path);
+        log_warning("Arrow UART disconnected: %s (errno=%d %s)",
+                    receiver->uart_path, errno, strerror(errno));
+        arrow_uart_reset_state(receiver);
+        return;
+    }
+    if (n == 0) {
+        receiver->connected = false;
+        log_warning("Arrow UART EOF on %s (TX end closed)", receiver->uart_path);
+        arrow_uart_reset_state(receiver);
         return;
     }
 
@@ -470,6 +539,12 @@ void arrow_receiver_update(ArrowReceiver* receiver) {
                     ring_buffer_write(receiver, tmp[i]);
                 }
             }
+        } else if (n2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            log_warning("Arrow secondary UART error on %s, disabling dual-link",
+                        receiver->uart_path_secondary);
+            close(receiver->uart_fd_secondary);
+            receiver->uart_fd_secondary = -1;
+            receiver->dual_link_active = false;
         }
     }
 

@@ -208,9 +208,9 @@ int model_export_scene(
 
     if (format == EXPORT_GLTF) {
         /*
-         * GLTF 格式导出未实现，静默回退到 OBJ 格式。
-         * TODO: 实现 GLTF 2.0 导出 (使用 cgltf 库或手写 JSON)
-         * GLTF 规范: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
+         * GLTF format export not implemented, silently falling back to OBJ format.
+         * TODO: Implement GLTF 2.0 export (using cgltf library or hand-written JSON)
+         * GLTF spec: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
          */
         log_warning("GLTF export not yet implemented, falling back to OBJ format");
 

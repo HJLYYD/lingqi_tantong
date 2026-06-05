@@ -9,9 +9,12 @@
 #ifdef HAS_ONNX_RUNTIME
 #include <onnxruntime_c_api.h>
 #include "ort_common.h"
+#else
+#error "scrfd_detector requires HAS_ONNX_RUNTIME (real inference only - no heuristic fallback)"
 #endif
 
-#define SCRFD_MAX_FACES 20
+#define SCRFD_MAX_FACES         20
+#define SCRFD_MAX_INPUT_BYTES   (100UL * 1024UL * 1024UL)
 
 typedef struct {
     BoundingBox bbox;
@@ -19,8 +22,11 @@ typedef struct {
     float keypoints[SCRFD_NUM_KEYPOINTS][2];
 } RawFaceDetection;
 
+static const int SCRFD_STRIDES[3] = {8, 16, 32};
+static const int SCRFD_NUM_ANCHORS = 2;
+
 SCRFDDetector* scrfd_detector_create(const char* model_path, int input_w, int input_h,
-                                      float conf_thresh, float nms_thresh, bool use_onnx) {
+                                      float conf_thresh, float nms_thresh) {
     SCRFDDetector* det = (SCRFDDetector*)calloc(1, sizeof(SCRFDDetector));
     if (!det) return NULL;
 
@@ -28,10 +34,11 @@ SCRFDDetector* scrfd_detector_create(const char* model_path, int input_w, int in
     det->input_height = input_h > 0 ? input_h : 640;
     det->confidence_threshold = conf_thresh;
     det->nms_threshold = nms_thresh;
-    det->use_onnx = use_onnx;
 
-    if (model_path) {
-        scrfd_detector_load_model(det, model_path);
+    if (!model_path || !scrfd_detector_load_model(det, model_path)) {
+        log_error("SCRFDDetector: failed to load model %s", model_path ? model_path : "(null)");
+        free(det);
+        return NULL;
     }
 
     return det;
@@ -39,180 +46,36 @@ SCRFDDetector* scrfd_detector_create(const char* model_path, int input_w, int in
 
 void scrfd_detector_destroy(SCRFDDetector* det) {
     if (!det) return;
-#ifdef HAS_ONNX_RUNTIME
     const OrtApi* ort = ort_get_api();
     if (det->session && ort) {
         ort->ReleaseSession(det->session);
     }
-#endif
     free(det);
 }
 
 bool scrfd_detector_load_model(SCRFDDetector* det, const char* model_path) {
-    if (!det || !model_path) {
-        log_error("Model path is NULL");
+    if (!det || !model_path) return false;
+
+    size_t file_size = 0;
+    if (ort_validate_onnx_file(model_path, &file_size) != 0) {
         return false;
-    }
-
-    FILE* f = fopen(model_path, "rb");
-    if (!f) {
-        log_error("Cannot open SCRFD model file: %s", model_path);
-        return false;
-    }
-
-    fseek(f, 0, SEEK_END);
-    size_t file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (file_size < 1024) {
-        fclose(f);
-        log_error("SCRFD model file too small: %s", model_path);
-        return false;
-    }
-
-    uint8_t magic[4];
-    size_t bytes_read = fread(magic, 1, 4, f);
-    fclose(f);
-
-    if (bytes_read != 4) {
-        log_error("Failed to read SCRFD model header: %s", model_path);
-        return false;
-    }
-
-    if (magic[0] != 0x08 || magic[1] != 0x00 || magic[2] != 0x00 || magic[3] != 0x00) {
-        log_warning("SCRFD model has unexpected protobuf header: %s", model_path);
     }
 
     strncpy(det->input_name, "input.1", sizeof(det->input_name) - 1);
-    log_info("SCRFD model validated: %s (%.2f MB)", model_path, file_size / (1024.0f * 1024.0f));
 
-#ifdef HAS_ONNX_RUNTIME
     if (!ort_global_init()) {
-        log_warning("SCRFD: ONNX init failed, using heuristic fallback");
-        return true;
+        log_error("SCRFD: ORT runtime not initialized");
+        return false;
     }
 
-    det->session = ort_create_session(model_path, 4, false);
+    det->session = ort_create_session(model_path, 4, true);
     if (!det->session) {
-        log_warning("SCRFD: CreateSession failed, using heuristic fallback");
-        return true;
+        log_error("SCRFD: ONNX session creation failed for %s", model_path);
+        return false;
     }
 
-    log_info("SCRFD model loaded with ONNX Runtime: %s (%.2f MB)", model_path, file_size / (1024.0f * 1024.0f));
-#else
-    log_info("SCRFD model validated: %s (%.2f MB) [build with HAS_ONNX_RUNTIME]", model_path, file_size / (1024.0f * 1024.0f));
-#endif
+    log_info("SCRFD model loaded: %s (%.2f MB)", model_path, file_size / (1024.0f * 1024.0f));
     return true;
-}
-
-static float compute_skin_color_score(const uint8_t* image_data, int width, int height,
-                                       int cx, int cy, int w, int h) {
-    int x1 = UTILS_MAX(0, cx - w/2);
-    int y1 = UTILS_MAX(0, cy - h/2);
-    int x2 = UTILS_MIN(width - 1, cx + w/2);
-    int y2 = UTILS_MIN(height - 1, cy + h/2);
-
-    int skin_pixels = 0;
-    int total_pixels = 0;
-
-    for (int y = y1; y < y2; y += 2) {
-        for (int x = x1; x < x2; x += 2) {
-            int idx = (y * width + x) * 3;
-            int r = image_data[idx + 2];
-            int g = image_data[idx + 1];
-            int b = image_data[idx + 0];
-
-            if (r > 95 && g > 40 && b > 20 &&
-                r > g && r > b &&
-                (r - g) > 15 &&
-                abs(r - g) > 15) {
-                skin_pixels++;
-            }
-            total_pixels++;
-        }
-    }
-
-    return total_pixels > 0 ? (float)skin_pixels / total_pixels : 0.0f;
-}
-
-static float compute_face_symmetry(const uint8_t* image_data, int width, int height,
-                                    int cx, int cy, int w, int h) {
-    int x1 = UTILS_MAX(0, cx - w/2);
-    int y1 = UTILS_MAX(0, cy - h/2);
-    int x2 = UTILS_MIN(width - 1, cx + w/2);
-    int y2 = UTILS_MIN(height - 1, cy + h/2);
-
-    float diff_sum = 0.0f;
-    int count = 0;
-
-    for (int y = y1; y < y2; y += 4) {
-        for (int x = 0; x < w/2; x += 4) {
-            int left_x = cx - x;
-            int right_x = cx + x;
-
-            if (left_x >= x1 && right_x < x2 && y >= y1 && y < y2) {
-                int left_idx = (y * width + left_x) * 3;
-                int right_idx = (y * width + right_x) * 3;
-
-                for (int c = 0; c < 3; c++) {
-                    float diff = (float)image_data[left_idx + c] - image_data[right_idx + c];
-                    diff_sum += diff * diff;
-                    count++;
-                }
-            }
-        }
-    }
-
-    if (count == 0) return 0.0f;
-    float mse = diff_sum / count;
-    return UTILS_MAX(0.0f, 1.0f - mse / 1000.0f);
-}
-
-static int detect_face_candidates(const uint8_t* image_data, int width, int height,
-                                   RawFaceDetection* faces, int max_faces, float conf_thresh) {
-    int num_faces = 0;
-
-    int step_x = UTILS_MAX(1, width / 15);
-    int step_y = UTILS_MAX(1, height / 15);
-    int face_w = UTILS_MIN(width, height) / 8;
-    int face_h = face_w;
-
-    for (int cy = face_h / 2; cy < height - face_h / 2 && num_faces < max_faces; cy += step_y) {
-        for (int cx = face_w / 2; cx < width - face_w / 2 && num_faces < max_faces; cx += step_x) {
-            float skin_score = compute_skin_color_score(image_data, width, height, cx, cy, face_w, face_h);
-            if (skin_score < 0.2f) continue;
-
-            float symmetry = compute_face_symmetry(image_data, width, height, cx, cy, face_w, face_h);
-            if (symmetry < 0.3f) continue;
-
-            float conf = (skin_score * 0.6f + symmetry * 0.4f);
-            if (conf < conf_thresh) continue;
-
-            RawFaceDetection* face = &faces[num_faces++];
-            face->bbox.x_min = UTILS_MAX(0.0f, (float)(cx - face_w / 2));
-            face->bbox.y_min = UTILS_MAX(0.0f, (float)(cy - face_h / 2));
-            face->bbox.x_max = UTILS_MIN((float)width - 1, (float)(cx + face_w / 2));
-            face->bbox.y_max = UTILS_MIN((float)height - 1, (float)(cy + face_h / 2));
-            face->confidence = conf;
-
-            float bw = bbox_width(&face->bbox);
-            float bh = bbox_height(&face->bbox);
-            float face_kp_offsets[SCRFD_NUM_KEYPOINTS][2] = {
-                {-0.25f, -0.30f},
-                {0.25f, -0.30f},
-                {0.0f, -0.10f},
-                {-0.20f, 0.15f},
-                {0.20f, 0.15f}
-            };
-
-            for (int k = 0; k < SCRFD_NUM_KEYPOINTS; k++) {
-                face->keypoints[k][0] = UTILS_CLAMP(bbox_center_x(&face->bbox) + face_kp_offsets[k][0] * bw, 0.0f, (float)width - 1);
-                face->keypoints[k][1] = UTILS_CLAMP(bbox_center_y(&face->bbox) + face_kp_offsets[k][1] * bh, 0.0f, (float)height - 1);
-            }
-        }
-    }
-
-    return num_faces;
 }
 
 static int nms_faces(RawFaceDetection* faces, int num_faces, float iou_threshold) {
@@ -249,115 +112,251 @@ static int nms_faces(RawFaceDetection* faces, int num_faces, float iou_threshold
     return keep_count;
 }
 
-int scrfd_detector_detect_faces(SCRFDDetector* det, const uint8_t* image_data, int width, int height,
-                                  FaceIdentity* out_faces, int max_faces) {
-    if (!det || !image_data || !out_faces) return 0;
+static void distance2bbox(float cx, float cy, const float* distance,
+                          BoundingBox* out) {
+    out->x_min = cx - distance[0];
+    out->y_min = cy - distance[1];
+    out->x_max = cx + distance[2];
+    out->y_max = cy + distance[3];
+}
 
-    RawFaceDetection raw_faces[SCRFD_MAX_FACES];
+static int decode_scrfd_multi_output(const OrtApi* ort, OrtValue** outputs, size_t num_outputs,
+                                     int input_w, int input_h, int img_w, int img_h,
+                                     float scale, int pad_x, int pad_y,
+                                     float conf_thresh,
+                                     RawFaceDetection* raw_faces, int max_faces) {
     int num_raw = 0;
+    if (num_outputs < 9) {
+        log_warning("SCRFD: unexpected num_outputs=%zu (expected 9 for kps variant)", num_outputs);
+    }
 
-#ifdef HAS_ONNX_RUNTIME
-    const OrtApi* ort = ort_get_api();
-    if (det->session && ort) {
-        int input_w = det->input_width > 0 ? det->input_width : 640;
-        int input_h = det->input_height > 0 ? det->input_height : 640;
-        int pixels = input_w * input_h;
-        size_t input_size = pixels * 3 * sizeof(float);
+    for (int stride_idx = 0; stride_idx < 3 && num_raw < max_faces; stride_idx++) {
+        int stride = SCRFD_STRIDES[stride_idx];
+        int fm_w = input_w / stride;
+        int fm_h = input_h / stride;
+        int num_anchors_total = fm_w * fm_h * SCRFD_NUM_ANCHORS;
 
-        float* input_tensor = (float*)malloc(input_size);
-        if (input_tensor) {
-            float scale = 0.0f;
-            int pad_x = 0, pad_y = 0;
-            uint8_t* resized = (uint8_t*)malloc(pixels * 3);
-            if (resized) {
-                utils_letterbox(image_data, width, height, resized, input_w, input_h, 3, &scale, &pad_x, &pad_y);
+        size_t score_idx = (size_t)stride_idx;
+        size_t bbox_idx  = (size_t)stride_idx + 3;
+        size_t kps_idx   = (size_t)stride_idx + 6;
+        if (score_idx >= num_outputs || bbox_idx >= num_outputs) continue;
 
-                for (int y = 0; y < input_h; y++) {
-                    for (int x = 0; x < input_w; x++) {
-                        int src_idx = (y * input_w + x) * 3;
-                        input_tensor[0 * pixels + y * input_w + x] = resized[src_idx] / 255.0f;
-                        input_tensor[1 * pixels + y * input_w + x] = resized[src_idx + 1] / 255.0f;
-                        input_tensor[2 * pixels + y * input_w + x] = resized[src_idx + 2] / 255.0f;
-                    }
-                }
-                free(resized);
-            }
-
-            int64_t input_shape[] = {1, 3, input_h, input_w};
-            OrtMemoryInfo* memory_info;
-            ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
-
-            OrtValue* input_tensor_val;
-            ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
-                                                  input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
-            ort->ReleaseMemoryInfo(memory_info);
-
-            const char* input_names[] = {det->input_name};
-            OrtValue* input_values[] = {input_tensor_val};
-            OrtValue* output_values[1] = {NULL};
-
-            OrtStatus* status = ort->Run(det->session, NULL,
-                                           input_names, (const OrtValue* const*)input_values, 1,
-                                           NULL, 0, output_values, 1);
-            ort->ReleaseValue(input_tensor_val);
-
-            if (status == NULL && output_values[0]) {
-                OrtTensorTypeAndShapeInfo* shape_info;
-                ort->GetTensorTypeAndShape(output_values[0], &shape_info);
-                size_t num_elements;
-                ort->GetTensorShapeElementCount(shape_info, &num_elements);
-                ort->ReleaseTensorTypeAndShapeInfo(shape_info);
-
-                float* output_data;
-                ort->GetTensorMutableData(output_values[0], (void**)&output_data);
-
-                int stride = 15;
-                int num_proposals = (int)(num_elements / stride);
-
-                for (int i = 0; i < num_proposals && num_raw < SCRFD_MAX_FACES; i++) {
-                    float* row = output_data + i * stride;
-                    float score = row[4];
-
-                    if (score < det->confidence_threshold) continue;
-
-                    float x1 = (row[0] - pad_x) / scale;
-                    float y1 = (row[1] - pad_y) / scale;
-                    float x2 = (row[2] - pad_x) / scale;
-                    float y2 = (row[3] - pad_y) / scale;
-
-                    raw_faces[num_raw].bbox.x_min = UTILS_CLAMP(x1, 0.0f, (float)width - 1);
-                    raw_faces[num_raw].bbox.y_min = UTILS_CLAMP(y1, 0.0f, (float)height - 1);
-                    raw_faces[num_raw].bbox.x_max = UTILS_CLAMP(x2, 0.0f, (float)width - 1);
-                    raw_faces[num_raw].bbox.y_max = UTILS_CLAMP(y2, 0.0f, (float)height - 1);
-                    raw_faces[num_raw].confidence = score;
-
-                    for (int k = 0; k < SCRFD_NUM_KEYPOINTS && k < 5; k++) {
-                        raw_faces[num_raw].keypoints[k][0] = UTILS_CLAMP((row[5 + k * 2] - pad_x) / scale, 0.0f, (float)width - 1);
-                        raw_faces[num_raw].keypoints[k][1] = UTILS_CLAMP((row[5 + k * 2 + 1] - pad_y) / scale, 0.0f, (float)height - 1);
-                    }
-
-                    num_raw++;
-                }
-
-                ort->ReleaseValue(output_values[0]);
-            }
-            free(input_tensor);
+        float* score_data = NULL;
+        float* bbox_data = NULL;
+        float* kps_data = NULL;
+        OrtStatus* status = ort->GetTensorMutableData(outputs[score_idx], (void**)&score_data);
+        if (status) { ort->ReleaseStatus(status); continue; }
+        status = ort->GetTensorMutableData(outputs[bbox_idx], (void**)&bbox_data);
+        if (status) { ort->ReleaseStatus(status); continue; }
+        if (kps_idx < num_outputs && outputs[kps_idx]) {
+            status = ort->GetTensorMutableData(outputs[kps_idx], (void**)&kps_data);
+            if (status) { ort->ReleaseStatus(status); kps_data = NULL; }
         }
 
-        if (num_raw > 0) {
-            num_raw = nms_faces(raw_faces, num_raw, det->nms_threshold);
-            goto output_results;
+        for (int anchor_idx = 0; anchor_idx < num_anchors_total && num_raw < max_faces; anchor_idx++) {
+            float score = score_data[anchor_idx];
+            if (score < conf_thresh) continue;
+
+            int spatial = anchor_idx / SCRFD_NUM_ANCHORS;
+            int row = spatial / fm_w;
+            int col = spatial % fm_w;
+            float anchor_cx = (col + 0.5f) * stride;
+            float anchor_cy = (row + 0.5f) * stride;
+
+            float dist[4];
+            for (int k = 0; k < 4; k++) {
+                dist[k] = bbox_data[anchor_idx * 4 + k] * stride;
+            }
+            BoundingBox box_lb;
+            distance2bbox(anchor_cx, anchor_cy, dist, &box_lb);
+
+            box_lb.x_min = (box_lb.x_min - pad_x) / scale;
+            box_lb.y_min = (box_lb.y_min - pad_y) / scale;
+            box_lb.x_max = (box_lb.x_max - pad_x) / scale;
+            box_lb.y_max = (box_lb.y_max - pad_y) / scale;
+
+            box_lb.x_min = UTILS_CLAMP(box_lb.x_min, 0.0f, (float)img_w - 1);
+            box_lb.y_min = UTILS_CLAMP(box_lb.y_min, 0.0f, (float)img_h - 1);
+            box_lb.x_max = UTILS_CLAMP(box_lb.x_max, 0.0f, (float)img_w - 1);
+            box_lb.y_max = UTILS_CLAMP(box_lb.y_max, 0.0f, (float)img_h - 1);
+
+            if (box_lb.x_max - box_lb.x_min < 8.0f || box_lb.y_max - box_lb.y_min < 8.0f) continue;
+
+            RawFaceDetection* face = &raw_faces[num_raw++];
+            face->bbox = box_lb;
+            face->confidence = score;
+
+            if (kps_data) {
+                for (int k = 0; k < SCRFD_NUM_KEYPOINTS; k++) {
+                    float kx = anchor_cx + kps_data[anchor_idx * 10 + k * 2 + 0] * stride;
+                    float ky = anchor_cy + kps_data[anchor_idx * 10 + k * 2 + 1] * stride;
+                    kx = (kx - pad_x) / scale;
+                    ky = (ky - pad_y) / scale;
+                    face->keypoints[k][0] = UTILS_CLAMP(kx, 0.0f, (float)img_w - 1);
+                    face->keypoints[k][1] = UTILS_CLAMP(ky, 0.0f, (float)img_h - 1);
+                }
+            } else {
+                float cx = (face->bbox.x_min + face->bbox.x_max) * 0.5f;
+                float cy = (face->bbox.y_min + face->bbox.y_max) * 0.5f;
+                for (int k = 0; k < SCRFD_NUM_KEYPOINTS; k++) {
+                    face->keypoints[k][0] = cx;
+                    face->keypoints[k][1] = cy;
+                }
+            }
         }
     }
-#endif
 
-    num_raw = detect_face_candidates(image_data, width, height, raw_faces, SCRFD_MAX_FACES, det->confidence_threshold);
+    return num_raw;
+}
+
+int scrfd_detector_detect_faces(SCRFDDetector* det, const uint8_t* image_data, int width, int height,
+                                  FaceIdentity* out_faces, int max_faces) {
+    if (!det || !image_data || !out_faces || !det->session) return 0;
+    if (width <= 0 || height <= 0 || max_faces <= 0) return 0;
+
+    const OrtApi* ort = ort_get_api();
+    if (!ort) return 0;
+
+    int input_w = det->input_width > 0 ? det->input_width : 640;
+    int input_h = det->input_height > 0 ? det->input_height : 640;
+    size_t pixels = (size_t)input_w * (size_t)input_h;
+    size_t input_size = pixels * 3 * sizeof(float);
+    if (input_size == 0 || input_size > SCRFD_MAX_INPUT_BYTES) {
+        log_error("SCRFD: refused unreasonable input tensor size %zu bytes", input_size);
+        return 0;
+    }
+
+    float* input_tensor = (float*)malloc(input_size);
+    if (!input_tensor) return 0;
+
+    uint8_t* resized = (uint8_t*)malloc(pixels * 3);
+    if (!resized) { free(input_tensor); return 0; }
+
+    float scale = 1.0f;
+    int pad_x = 0, pad_y = 0;
+    utils_letterbox(image_data, width, height, resized, input_w, input_h, 3, &scale, &pad_x, &pad_y);
+
+    for (int y = 0; y < input_h; y++) {
+        for (int x = 0; x < input_w; x++) {
+            int src_idx = (y * input_w + x) * 3;
+            input_tensor[0 * (int)pixels + y * input_w + x] = (resized[src_idx + 0] - 127.5f) / 128.0f;
+            input_tensor[1 * (int)pixels + y * input_w + x] = (resized[src_idx + 1] - 127.5f) / 128.0f;
+            input_tensor[2 * (int)pixels + y * input_w + x] = (resized[src_idx + 2] - 127.5f) / 128.0f;
+        }
+    }
+    free(resized);
+
+    int64_t input_shape[4] = {1, 3, input_h, input_w};
+    OrtMemoryInfo* memory_info = NULL;
+    OrtStatus* status = ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("SCRFD: CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        free(input_tensor);
+        return 0;
+    }
+
+    OrtValue* input_tensor_val = NULL;
+    status = ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
+                                                  input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
+    ort->ReleaseMemoryInfo(memory_info);
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("SCRFD: CreateTensor failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        free(input_tensor);
+        return 0;
+    }
+
+    size_t num_outputs_meta = 0;
+    OrtStatus* st_oc = ort->SessionGetOutputCount(det->session, &num_outputs_meta);
+    if (st_oc) ort->ReleaseStatus(st_oc);
+    if (num_outputs_meta == 0) num_outputs_meta = 9;
+
+    OrtAllocator* allocator = NULL;
+    OrtStatus* st_alloc = ort->GetAllocatorWithDefaultOptions(&allocator);
+    if (st_alloc) ort->ReleaseStatus(st_alloc);
+
+    char** output_names_buf = (char**)calloc(num_outputs_meta, sizeof(char*));
+    OrtValue** output_values = (OrtValue**)calloc(num_outputs_meta, sizeof(OrtValue*));
+    if (!output_names_buf || !output_values) {
+        free(output_names_buf); free(output_values);
+        ort->ReleaseValue(input_tensor_val);
+        free(input_tensor);
+        return 0;
+    }
+
+    bool name_ok = true;
+    for (size_t oi = 0; oi < num_outputs_meta; oi++) {
+        char* name_ptr = NULL;
+        OrtStatus* s = ort->SessionGetOutputName(det->session, oi, allocator, &name_ptr);
+        if (s || !name_ptr) {
+            if (s) ort->ReleaseStatus(s);
+            name_ok = false;
+            break;
+        }
+        output_names_buf[oi] = name_ptr;
+    }
+
+    if (!name_ok) {
+        for (size_t oi = 0; oi < num_outputs_meta; oi++) {
+            if (output_names_buf[oi]) {
+                OrtStatus* st_f = ort->AllocatorFree(allocator, output_names_buf[oi]);
+                if (st_f) ort->ReleaseStatus(st_f);
+            }
+        }
+        free(output_names_buf);
+        free(output_values);
+        ort->ReleaseValue(input_tensor_val);
+        free(input_tensor);
+        log_error("SCRFD: SessionGetOutputName failed");
+        return 0;
+    }
+
+    const char* input_names[] = {det->input_name};
+    OrtValue* input_values[] = {input_tensor_val};
+
+    status = ort->Run(det->session, NULL,
+                      input_names, (const OrtValue* const*)input_values, 1,
+                      (const char* const*)output_names_buf, num_outputs_meta, output_values);
+    ort->ReleaseValue(input_tensor_val);
+    free(input_tensor);
+
+    for (size_t oi = 0; oi < num_outputs_meta; oi++) {
+        if (output_names_buf[oi]) {
+            OrtStatus* st_f = ort->AllocatorFree(allocator, output_names_buf[oi]);
+            if (st_f) ort->ReleaseStatus(st_f);
+        }
+    }
+    free(output_names_buf);
+
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("SCRFD inference failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        for (size_t oi = 0; oi < num_outputs_meta; oi++) {
+            if (output_values[oi]) ort->ReleaseValue(output_values[oi]);
+        }
+        free(output_values);
+        return 0;
+    }
+
+    RawFaceDetection raw_faces[SCRFD_MAX_FACES];
+    int num_raw = decode_scrfd_multi_output(ort, output_values, num_outputs_meta,
+                                            input_w, input_h, width, height,
+                                            scale, pad_x, pad_y,
+                                            det->confidence_threshold,
+                                            raw_faces, SCRFD_MAX_FACES);
+
+    for (size_t oi = 0; oi < num_outputs_meta; oi++) {
+        if (output_values[oi]) ort->ReleaseValue(output_values[oi]);
+    }
+    free(output_values);
 
     if (num_raw <= 0) return 0;
 
     num_raw = nms_faces(raw_faces, num_raw, det->nms_threshold);
-
-output_results:
     int num_faces = UTILS_MIN(num_raw, max_faces);
     for (int i = 0; i < num_faces; i++) {
         FaceIdentity* face = &out_faces[i];
@@ -377,7 +376,7 @@ output_results:
         }
     }
 
-    log_debug("Detected %d faces", num_faces);
+    log_debug("SCRFD: detected %d faces", num_faces);
     return num_faces;
 }
 
@@ -396,11 +395,11 @@ int scrfd_detector_crop_face(const SCRFDDetector* det, const uint8_t* image_data
     int crop_h = y2 - y1;
 
     if (crop_w <= 0 || crop_h <= 0) {
-        memset(out_crop, 0, target_w * target_h * 3);
+        memset(out_crop, 0, (size_t)target_w * target_h * 3);
         return 0;
     }
 
-    uint8_t* temp_crop = (uint8_t*)malloc(crop_w * crop_h * 3);
+    uint8_t* temp_crop = (uint8_t*)malloc((size_t)crop_w * crop_h * 3);
     if (!temp_crop) return -1;
 
     for (int y = 0; y < crop_h; y++) {

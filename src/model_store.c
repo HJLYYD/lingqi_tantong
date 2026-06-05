@@ -15,13 +15,11 @@ static const struct {
     const char* name;
     const char* path;
 } MODEL_REGISTRY[] = {
-    {"yolov8n_person", "Human Recognition/yolov8n.onnx"},
-    {"yolov8n_pose", "Action Prediction/Skeleton Recognition/yolov8n-pose.onnx"},
-    {"scrfd_face", "Face Recognition/scrfd_10g_bnkps.onnx"},
-    {"arcface", "Face Recognition/glintr100.onnx"},
-    {"scrfd_alt", "Face Recognition/1k3d68.onnx"},
-    {"scrfd_alt2", "Face Recognition/2d106det.onnx"},
-    {"scrfd_gender", "Face Recognition/genderage.onnx"},
+    {"yolo11n_person", "Human Recognition/yolo11n.q.onnx"},
+    {"yolov8n_pose", "Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"},
+    {"stgcn_action", "Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx"},
+    {"yolov5_face", "Face Recognition/yolov5n-face_cut.q.onnx"},
+    {"arcface", "Face Recognition/arcface_mobilefacenet_cut.q.onnx"},
     {NULL, NULL}
 };
 
@@ -38,7 +36,7 @@ static size_t get_file_size_mb(const char* path) {
     return 0;
 }
 
-ModelStore* model_store_create(const char* base_path, bool use_onnx) {
+ModelStore* model_store_create(const char* base_path) {
     ModelStore* store = (ModelStore*)calloc(1, sizeof(ModelStore));
     if (!store) return NULL;
 
@@ -48,7 +46,6 @@ ModelStore* model_store_create(const char* base_path, bool use_onnx) {
         strncpy(store->base_path, "models", MAX_PATH_LEN - 1);
     }
     store->base_path[MAX_PATH_LEN - 1] = '\0';
-    store->use_onnx = use_onnx;
 
     for (int i = 0; MODEL_REGISTRY[i].name != NULL && store->num_models < MAX_MODELS; i++) {
         ModelInfo* info = &store->models[store->num_models++];
@@ -128,42 +125,14 @@ OrtSession* model_store_load_onnx(ModelStore* store, const char* model_name) {
         return NULL;
     }
 
-    const OrtApi* ort = ort_get_api();
-    OrtEnv* env = ort_get_env();
-    if (!ort || !env) {
-        log_warning("ModelStore: ONNX environment not initialized, cannot load %s", model_name);
-        return NULL;
-    }
-
-    OrtSessionOptions* session_opts;
-    OrtStatus* status = ort->CreateSessionOptions(&session_opts);
-    if (status) {
-        log_warning("ModelStore: CreateSessionOptions failed for %s", model_name);
-        ort->ReleaseStatus(status);
-        return NULL;
-    }
-
-    ort->SetSessionGraphOptimizationLevel(session_opts, ORT_ENABLE_ALL);
-    ort->SetIntraOpNumThreads(session_opts, 4);
-    ort->SetInterOpNumThreads(session_opts, 2);
-
-#ifdef HAS_SPACEMIT_EP
-    int ret = spacemit_ort_session_options_init(session_opts);
-    if (ret == 0) {
-        log_debug("ModelStore: SpacemiT EP registered for %s", model_name);
-    } else {
-        log_debug("ModelStore: SpacemiT EP unavailable for %s (CPU only)", model_name);
-    }
-#endif
-
-    OrtSession* session = NULL;
-    status = ort->CreateSession(env, model_path, session_opts, &session);
-    ort->ReleaseSessionOptions(session_opts);
-
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_warning("ModelStore: CreateSession failed for %s: %s", model_name, msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
+    /*
+     * Delegate to ort_create_session() so both load paths share the
+     * same per-model fork-probe / EP-gating / CPU-fallback logic.
+     * Avoids drift between two near-identical session creation flows.
+     */
+    OrtSession* session = ort_create_session(model_path, 4, true);
+    if (!session) {
+        log_warning("ModelStore: ort_create_session failed for %s", model_name);
         return NULL;
     }
 

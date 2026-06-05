@@ -98,29 +98,21 @@ K1Platform* k1_platform_init(void) {
 
     detect_k1_capabilities(plat);
 
-    if (plat->is_k1 && (plat->capabilities & K1_CAP_TCM)) {
-        plat->tcm_fd = open("/dev/tcm", O_RDWR | O_SYNC);
-        if (plat->tcm_fd >= 0) {
-            plat->tcm_mapped = mmap(NULL, plat->tcm_size,
-                                    PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, plat->tcm_fd, 0);
-            if (plat->tcm_mapped == MAP_FAILED) {
-                log_warning("TCM mmap failed, TCM disabled");
-                plat->tcm_mapped = NULL;
-                plat->capabilities &= ~K1_CAP_TCM;
-                close(plat->tcm_fd);
-                plat->tcm_fd = -1;
-            } else {
-                plat->tcm_mapped_size = plat->tcm_size;
-                log_info("K1 TCM mapped: %dKB at %p", plat->tcm_size / 1024, plat->tcm_mapped);
-            }
-        } else {
-            log_warning("Cannot open /dev/tcm, TCM disabled");
-            plat->capabilities &= ~K1_CAP_TCM;
-        }
-    }
-
     g_k1_plat = plat;
+
+    /*
+     * IMPORTANT: do NOT mmap /dev/tcm here.
+     *
+     * SpacemiT EP (libspacemit_ep.so) needs exclusive access to /dev/tcm to
+     * allocate per-core TCM buffers internally. If we mmap the whole TCM
+     * region first, SpacemiT EP throws std::runtime_error("tcm buffer alloc
+     * failed for core id N") from inside its worker threads, which can't be
+     * caught across the C-API boundary and aborts the process.
+     *
+     * We still expose K1_CAP_TCM capability so K1 hardware is recognized
+     * (SpacemiT EP itself uses TCM under the hood), but only as a flag —
+     * the actual TCM lifecycle is owned by libspacemit_ep.so.
+     */
 
     const char* caps_str[9] = {"RVV1.0", "AI-IME", "TCM", "VPU", "JPU", "GPU", "MPP", "Spacengine", "SpacemiT_EP"};
     log_info("K1 Platform: %s, %d CPUs, Capabilities:", plat->is_k1 ? "DETECTED" : "NOT DETECTED", plat->cpu_count);
@@ -166,6 +158,7 @@ int k1_platform_cpu_count(void) {
 }
 
 int k1_platform_cluster_core_count(K1ClusterType cluster) {
+    (void)cluster;
     if (!g_k1_plat || !g_k1_plat->is_k1) return 0;
     return K1_CLUSTER0_CORES;
 }

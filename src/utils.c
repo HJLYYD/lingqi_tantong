@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 199309L
 
 #include "utils.h"
+#include "logger.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -11,6 +13,14 @@
 #else
 #include <unistd.h>
 #include <sys/time.h>
+#endif
+
+#ifdef HAS_LIBJPEG_TURBO
+#include <turbojpeg.h>
+#endif
+
+#ifdef HAS_OPENMP
+#include <omp.h>
 #endif
 
 void utils_rgb_to_bgr(const uint8_t* rgb, uint8_t* bgr, int width, int height) {
@@ -37,6 +47,9 @@ void utils_resize_image(const uint8_t* src, int src_w, int src_h,
     float x_ratio = (float)src_w / dst_w;
     float y_ratio = (float)src_h / dst_h;
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int y = 0; y < dst_h; y++) {
         for (int x = 0; x < dst_w; x++) {
             int src_x = (int)(x * x_ratio);
@@ -63,8 +76,11 @@ void utils_letterbox(const uint8_t* src, int src_w, int src_h,
     int pad_x = (dst_w - new_w) / 2;
     int pad_y = (dst_h - new_h) / 2;
 
-    memset(dst, 114, dst_w * dst_h * channels);
+    memset(dst, 114, (size_t)dst_w * dst_h * channels);
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int y = 0; y < new_h; y++) {
         for (int x = 0; x < new_w; x++) {
             int src_x = (int)(x / scale);
@@ -89,6 +105,9 @@ void utils_letterbox(const uint8_t* src, int src_w, int src_h,
 void utils_normalize_chw(const uint8_t* src, int width, int height,
                          float* dst, float scale, float mean, float std) {
     int pixels = width * height;
+#ifdef HAS_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int c = 0; c < 3; c++) {
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
@@ -232,44 +251,67 @@ void utils_sleep_ms(int ms) {
 
 int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
                             uint8_t* rgb_out, int out_w, int out_h) {
-    if (!jpeg_data || !rgb_out || jpeg_len < 4) {
-        memset(rgb_out, 0, (size_t)out_w * out_h * 3);
+    if (!jpeg_data || !rgb_out || out_w <= 0 || out_h <= 0) {
         return -1;
     }
-
-#ifdef HAS_LIBJPEG
-    struct jpeg_decompress_struct cinfo;
-    struct jpeg_error_mgr jerr;
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, jpeg_data, jpeg_len);
-    jpeg_read_header(&cinfo, TRUE);
-    cinfo.out_color_space = JCS_RGB;
-    jpeg_start_decompress(&cinfo);
-
-    int row_stride = (int)cinfo.output_width * (int)cinfo.output_components;
-    JSAMPROW row_ptr[1];
-    int y = 0;
-    while (cinfo.output_scanline < cinfo.output_height && y < out_h) {
-        row_ptr[0] = rgb_out + (size_t)y * row_stride;
-        jpeg_read_scanlines(&cinfo, row_ptr, 1);
-        y++;
-    }
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    return 0;
-#else
-    if (jpeg_data[0] == 0xFF && jpeg_data[1] == 0xD8) {
-        memset(rgb_out, 64, (size_t)out_w * out_h * 3);
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-        }
+    if (jpeg_len < 4 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
+        log_warning("JPEG decode: invalid SOI marker (len=%zu, b0=%02X b1=%02X)",
+                    jpeg_len, jpeg_len > 0 ? jpeg_data[0] : 0,
+                    jpeg_len > 1 ? jpeg_data[1] : 0);
         return -2;
     }
 
-    memset(rgb_out, 0, (size_t)out_w * out_h * 3);
-    return -3;
+#ifdef HAS_LIBJPEG_TURBO
+    tjhandle handle = tjInitDecompress();
+    if (!handle) {
+        log_error("tjInitDecompress failed: %s", tjGetErrorStr());
+        return -3;
+    }
+
+    int src_w = 0, src_h = 0, src_subsamp = 0, src_colorspace = 0;
+    if (tjDecompressHeader3(handle, jpeg_data, (unsigned long)jpeg_len,
+                            &src_w, &src_h, &src_subsamp, &src_colorspace) != 0) {
+        log_error("tjDecompressHeader3 failed: %s", tjGetErrorStr2(handle));
+        tjDestroy(handle);
+        return -4;
+    }
+
+    if (src_w == out_w && src_h == out_h) {
+        int ret = tjDecompress2(handle, jpeg_data, (unsigned long)jpeg_len,
+                                rgb_out, out_w, 0 /* pitch=0 → tight */,
+                                out_h, TJPF_RGB, TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
+        tjDestroy(handle);
+        if (ret != 0) {
+            log_error("tjDecompress2 failed: %s", tjGetErrorStr2(handle));
+            return -5;
+        }
+        return 0;
+    }
+
+    uint8_t* tmp_rgb = (uint8_t*)malloc((size_t)src_w * src_h * 3);
+    if (!tmp_rgb) {
+        tjDestroy(handle);
+        log_error("JPEG decode: failed to allocate %dx%d intermediate buffer",
+                  src_w, src_h);
+        return -6;
+    }
+
+    if (tjDecompress2(handle, jpeg_data, (unsigned long)jpeg_len,
+                      tmp_rgb, src_w, 0, src_h,
+                      TJPF_RGB, TJFLAG_FASTDCT | TJFLAG_NOREALLOC) != 0) {
+        log_error("tjDecompress2 (scaled) failed: %s", tjGetErrorStr2(handle));
+        free(tmp_rgb);
+        tjDestroy(handle);
+        return -7;
+    }
+    tjDestroy(handle);
+
+    utils_resize_image(tmp_rgb, src_w, src_h, rgb_out, out_w, out_h, 3);
+    free(tmp_rgb);
+    return 0;
+#else
+    log_error("JPEG decode requested but HAS_LIBJPEG_TURBO not defined at build time");
+    return -8;
 #endif
 }
 

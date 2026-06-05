@@ -9,21 +9,26 @@
 #ifdef HAS_ONNX_RUNTIME
 #include <onnxruntime_c_api.h>
 #include "ort_common.h"
+#else
+#error "arcface_recognizer requires HAS_ONNX_RUNTIME (real inference only - no heuristic fallback)"
 #endif
 
+#define ARCFACE_MAX_INPUT_BYTES (16UL * 1024UL * 1024UL)
+
 ArcFaceRecognizer* arcface_recognizer_create(const char* model_path, int input_w, int input_h,
-                                              float sim_thresh, bool use_onnx) {
+                                              float sim_thresh) {
     ArcFaceRecognizer* rec = (ArcFaceRecognizer*)calloc(1, sizeof(ArcFaceRecognizer));
     if (!rec) return NULL;
 
     rec->input_width = input_w > 0 ? input_w : 112;
     rec->input_height = input_h > 0 ? input_h : 112;
     rec->similarity_threshold = sim_thresh;
-    rec->use_onnx = use_onnx;
     rec->num_entries = 0;
 
-    if (model_path) {
-        arcface_recognizer_load_model(rec, model_path);
+    if (!model_path || !arcface_recognizer_load_model(rec, model_path)) {
+        log_error("ArcFaceRecognizer: failed to load model %s", model_path ? model_path : "(null)");
+        free(rec);
+        return NULL;
     }
 
     return rec;
@@ -31,244 +36,210 @@ ArcFaceRecognizer* arcface_recognizer_create(const char* model_path, int input_w
 
 void arcface_recognizer_destroy(ArcFaceRecognizer* rec) {
     if (!rec) return;
-#ifdef HAS_ONNX_RUNTIME
     const OrtApi* ort = ort_get_api();
     if (rec->session && ort) {
         ort->ReleaseSession(rec->session);
     }
-#endif
     free(rec);
 }
 
 bool arcface_recognizer_load_model(ArcFaceRecognizer* rec, const char* model_path) {
-    if (!rec || !model_path) {
-        log_error("Model path is NULL");
+    if (!rec || !model_path) return false;
+
+    size_t file_size = 0;
+    if (ort_validate_onnx_file(model_path, &file_size) != 0) {
         return false;
     }
 
-    FILE* f = fopen(model_path, "rb");
-    if (!f) {
-        log_error("Cannot open ArcFace model file: %s", model_path);
-        return false;
-    }
+    strncpy(rec->input_name, "data", sizeof(rec->input_name) - 1);  /* default fallback */
 
-    fseek(f, 0, SEEK_END);
-    size_t file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (file_size < 1024) {
-        fclose(f);
-        log_error("ArcFace model file too small: %s", model_path);
-        return false;
-    }
-
-    uint8_t magic[4];
-    size_t bytes_read = fread(magic, 1, 4, f);
-    fclose(f);
-
-    if (bytes_read != 4) {
-        log_error("Failed to read ArcFace model header: %s", model_path);
-        return false;
-    }
-
-    if (magic[0] != 0x08 || magic[1] != 0x00 || magic[2] != 0x00 || magic[3] != 0x00) {
-        log_warning("ArcFace model has unexpected protobuf header: %s", model_path);
-    }
-
-    strncpy(rec->input_name, "data", sizeof(rec->input_name) - 1);
-    log_info("ArcFace model validated: %s (%.2f MB)", model_path, file_size / (1024.0f * 1024.0f));
-
-#ifdef HAS_ONNX_RUNTIME
     if (!ort_global_init()) {
-        log_warning("ArcFace: ONNX init failed, using heuristic fallback");
-        return true;
+        log_error("ArcFace: ORT runtime not initialized");
+        return false;
     }
 
-    rec->session = ort_create_session(model_path, 2, false);
+    rec->session = ort_create_session(model_path, 2, true);
     if (!rec->session) {
-        log_warning("ArcFace: CreateSession failed, using heuristic fallback");
-        return true;
+        log_error("ArcFace: ONNX session creation failed for %s", model_path);
+        return false;
     }
 
-    log_info("ArcFace model loaded with ONNX Runtime: %s (%.2f MB)", model_path, file_size / (1024.0f * 1024.0f));
-#else
-    log_info("ArcFace model validated: %s (%.2f MB) [build with HAS_ONNX_RUNTIME]", model_path, file_size / (1024.0f * 1024.0f));
-#endif
+    /* ── Query real input name from model ── */
+    {
+        const OrtApi* ort = ort_get_api();
+        OrtAllocator* allocator = NULL;
+        OrtStatus* st_a = ort->GetAllocatorWithDefaultOptions(&allocator);
+        if (st_a) ort->ReleaseStatus(st_a);
+        if (allocator) {
+            char* real_name = NULL;
+            OrtStatus* s = ort->SessionGetInputName(rec->session, 0, allocator, &real_name);
+            if (s == NULL && real_name) {
+                strncpy(rec->input_name, real_name, sizeof(rec->input_name) - 1);
+                rec->input_name[sizeof(rec->input_name) - 1] = '\0';
+                OrtStatus* sf = ort->AllocatorFree(allocator, real_name);
+                if (sf) ort->ReleaseStatus(sf);
+            } else {
+                if (s) ort->ReleaseStatus(s);
+            }
+        }
+    }
+
+    int dims[8] = {0};
+    int rank = ort_get_input_shape(rec->session, dims, 8);
+    if (rank == 4 && dims[2] > 0 && dims[3] > 0) {
+        if (rec->input_width != dims[3] || rec->input_height != dims[2]) {
+            log_info("ArcFace: overriding requested %dx%d with model's actual input %dx%d",
+                     rec->input_width, rec->input_height, dims[3], dims[2]);
+        }
+        rec->input_width = dims[3];
+        rec->input_height = dims[2];
+    }
+
+    log_info("ArcFace model loaded: %s (%.2f MB) input=%dx%d",
+             model_path, file_size / (1024.0f * 1024.0f), rec->input_width, rec->input_height);
     return true;
 }
 
 static void preprocess_arcface(const uint8_t* face_image, int width, int height,
                                float* out_tensor, int target_w, int target_h) {
-    uint8_t* resized = (uint8_t*)malloc(target_w * target_h * 3);
+    uint8_t* resized = (uint8_t*)malloc((size_t)target_w * target_h * 3);
     if (!resized) return;
 
     utils_resize_image(face_image, width, height, resized, target_w, target_h, 3);
 
+    int pixels = target_w * target_h;
     for (int y = 0; y < target_h; y++) {
         for (int x = 0; x < target_w; x++) {
             int src_idx = (y * target_w + x) * 3;
-            int dst_r = 0 * target_w * target_h + y * target_w + x;
-            int dst_g = 1 * target_w * target_h + y * target_w + x;
-            int dst_b = 2 * target_w * target_h + y * target_w + x;
+            int dst_r = 0 * pixels + y * target_w + x;
+            int dst_g = 1 * pixels + y * target_w + x;
+            int dst_b = 2 * pixels + y * target_w + x;
 
-            out_tensor[dst_r] = (resized[src_idx + 2] - 127.5f) / 127.5f;
+            out_tensor[dst_r] = (resized[src_idx + 0] - 127.5f) / 127.5f;
             out_tensor[dst_g] = (resized[src_idx + 1] - 127.5f) / 127.5f;
-            out_tensor[dst_b] = (resized[src_idx + 0] - 127.5f) / 127.5f;
+            out_tensor[dst_b] = (resized[src_idx + 2] - 127.5f) / 127.5f;
         }
     }
 
     free(resized);
 }
 
-static void compute_face_features(const float* face_image, int width, int height, float* out_features) {
-    for (int i = 0; i < ARCFACE_FEATURE_DIM; i++) {
-        out_features[i] = 0.0f;
+int arcface_recognizer_extract_feature(ArcFaceRecognizer* rec, const uint8_t* face_image, int width, int height,
+                                        float* out_feature) {
+    if (!rec || !face_image || !out_feature || !rec->session) return -1;
+    if (width <= 0 || height <= 0) return -1;
+
+    const OrtApi* ort = ort_get_api();
+    if (!ort) return -1;
+
+    int input_w = rec->input_width > 0 ? rec->input_width : 112;
+    int input_h = rec->input_height > 0 ? rec->input_height : 112;
+    size_t pixels = (size_t)input_w * (size_t)input_h;
+    size_t input_size = pixels * 3 * sizeof(float);
+    if (input_size == 0 || input_size > ARCFACE_MAX_INPUT_BYTES) {
+        log_error("ArcFace: refused unreasonable input tensor size %zu bytes", input_size);
+        return -1;
     }
 
-    int patch_size = 8;
-    int num_patches_x = width / patch_size;
-    int num_patches_y = height / patch_size;
+    float* input_tensor = (float*)malloc(input_size);
+    if (!input_tensor) return -1;
 
-    for (int py = 0; py < num_patches_y && py < 14; py++) {
-        for (int px = 0; px < num_patches_x && px < 7; px++) {
-            int patch_idx = py * 7 + px;
-            float patch_mean[3] = {0, 0, 0};
-            float patch_var[3] = {0, 0, 0};
+    preprocess_arcface(face_image, width, height, input_tensor, input_w, input_h);
 
-            for (int y = py * patch_size; y < (py + 1) * patch_size && y < height; y++) {
-                for (int x = px * patch_size; x < (px + 1) * patch_size && x < width; x++) {
-                    int idx = (y * width + x) * 3;
-                    for (int c = 0; c < 3; c++) {
-                        patch_mean[c] += face_image[idx + c];
-                    }
-                }
-            }
-
-            int pixels = patch_size * patch_size;
-            for (int c = 0; c < 3; c++) {
-                patch_mean[c] /= pixels;
-            }
-
-            for (int y = py * patch_size; y < (py + 1) * patch_size && y < height; y++) {
-                for (int x = px * patch_size; x < (px + 1) * patch_size && x < width; x++) {
-                    int idx = (y * width + x) * 3;
-                    for (int c = 0; c < 3; c++) {
-                        float diff = face_image[idx + c] - patch_mean[c];
-                        patch_var[c] += diff * diff;
-                    }
-                }
-            }
-
-            for (int c = 0; c < 3; c++) {
-                patch_var[c] = sqrtf(patch_var[c] / pixels) / 255.0f;
-            }
-
-            if (patch_idx < ARCFACE_FEATURE_DIM) {
-                out_features[patch_idx] = (patch_mean[0] / 255.0f - 0.5f) * 2.0f;
-                out_features[98 + patch_idx] = patch_var[0];
-            }
-            if (patch_idx * 2 + 1 < ARCFACE_FEATURE_DIM) {
-                out_features[patch_idx * 2 + 1] = (patch_mean[1] / 255.0f - 0.5f) * 2.0f;
-                out_features[99 + patch_idx * 2 + 1] = patch_var[1];
-            }
-        }
+    int64_t input_shape[4] = {1, 3, input_h, input_w};
+    OrtMemoryInfo* memory_info = NULL;
+    OrtStatus* status = ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("ArcFace: CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        free(input_tensor);
+        return -1;
     }
 
-    for (int i = 0; i < ARCFACE_FEATURE_DIM; i++) {
-        float x = out_features[i];
-        out_features[i] = tanhf(x);
+    OrtValue* input_tensor_val = NULL;
+    status = ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
+                                                 input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
+    ort->ReleaseMemoryInfo(memory_info);
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("ArcFace: CreateTensor failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        free(input_tensor);
+        return -1;
+    }
+
+    const char* input_names[] = {rec->input_name};
+    OrtValue* input_values[] = {input_tensor_val};
+    OrtValue* output_values[1] = {NULL};
+    const char* output_names[1] = {"fc1"};
+
+    OrtAllocator* allocator = NULL;
+    OrtStatus* st_alloc = ort->GetAllocatorWithDefaultOptions(&allocator);
+    if (st_alloc) ort->ReleaseStatus(st_alloc);
+    char* dynamic_out_name = NULL;
+    if (allocator) {
+        OrtStatus* s = ort->SessionGetOutputName(rec->session, 0, allocator, &dynamic_out_name);
+        if (s) { ort->ReleaseStatus(s); dynamic_out_name = NULL; }
+        else if (dynamic_out_name) output_names[0] = dynamic_out_name;
+    }
+
+    status = ort->Run(rec->session, NULL,
+                      input_names, (const OrtValue* const*)input_values, 1,
+                      output_names, 1, output_values);
+    ort->ReleaseValue(input_tensor_val);
+    free(input_tensor);
+    if (dynamic_out_name && allocator) {
+        OrtStatus* st_f = ort->AllocatorFree(allocator, dynamic_out_name);
+        if (st_f) ort->ReleaseStatus(st_f);
+    }
+
+    if (status) {
+        const char* msg = ort->GetErrorMessage(status);
+        log_error("ArcFace inference failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(status);
+        return -1;
+    }
+    if (!output_values[0]) return -1;
+
+    OrtTensorTypeAndShapeInfo* shape_info = NULL;
+    OrtStatus* st_shape = ort->GetTensorTypeAndShape(output_values[0], &shape_info);
+    if (st_shape) ort->ReleaseStatus(st_shape);
+    size_t num_elements = 0;
+    if (shape_info) {
+        OrtStatus* st_ec = ort->GetTensorShapeElementCount(shape_info, &num_elements);
+        if (st_ec) ort->ReleaseStatus(st_ec);
+        ort->ReleaseTensorTypeAndShapeInfo(shape_info);
+    }
+
+    float* output_data = NULL;
+    status = ort->GetTensorMutableData(output_values[0], (void**)&output_data);
+    if (status || !output_data) {
+        if (status) ort->ReleaseStatus(status);
+        ort->ReleaseValue(output_values[0]);
+        return -1;
+    }
+
+    int feat_dim = (int)num_elements;
+    if (feat_dim > ARCFACE_FEATURE_DIM) feat_dim = ARCFACE_FEATURE_DIM;
+    if (feat_dim < ARCFACE_FEATURE_DIM) {
+        for (int i = feat_dim; i < ARCFACE_FEATURE_DIM; i++) out_feature[i] = 0.0f;
     }
 
     float norm = 0.0f;
-    for (int i = 0; i < ARCFACE_FEATURE_DIM; i++) {
-        norm += out_features[i] * out_features[i];
+    for (int i = 0; i < feat_dim; i++) {
+        out_feature[i] = output_data[i];
+        norm += out_feature[i] * out_feature[i];
     }
     norm = sqrtf(norm);
-
-    if (norm > 0.0f) {
+    if (norm > 1e-8f) {
         float inv_norm = 1.0f / norm;
-        for (int i = 0; i < ARCFACE_FEATURE_DIM; i++) {
-            out_features[i] *= inv_norm;
+        for (int i = 0; i < feat_dim; i++) {
+            out_feature[i] *= inv_norm;
         }
     }
-}
 
-int arcface_recognizer_extract_feature(ArcFaceRecognizer* rec, const uint8_t* face_image, int width, int height,
-                                        float* out_feature) {
-    if (!rec || !face_image || !out_feature) return -1;
-
-#ifdef HAS_ONNX_RUNTIME
-    const OrtApi* ort = ort_get_api();
-    if (rec->session && ort) {
-        int input_w = rec->input_width > 0 ? rec->input_width : 112;
-        int input_h = rec->input_height > 0 ? rec->input_height : 112;
-        int pixels = input_w * input_h;
-        size_t input_size = pixels * 3 * sizeof(float);
-
-        float* input_tensor = (float*)malloc(input_size);
-        if (!input_tensor) return -1;
-
-        preprocess_arcface(face_image, width, height, input_tensor, input_w, input_h);
-
-        int64_t input_shape[] = {1, 3, input_h, input_w};
-        OrtMemoryInfo* memory_info;
-        ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
-
-        OrtValue* input_tensor_val;
-        ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
-                                              input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
-        ort->ReleaseMemoryInfo(memory_info);
-
-        const char* input_names[] = {rec->input_name};
-        OrtValue* input_values[] = {input_tensor_val};
-        OrtValue* output_values[1] = {NULL};
-
-        OrtStatus* status = ort->Run(rec->session, NULL,
-                                       input_names, (const OrtValue* const*)input_values, 1,
-                                       NULL, 0, output_values, 1);
-        ort->ReleaseValue(input_tensor_val);
-        free(input_tensor);
-
-        if (status == NULL && output_values[0]) {
-            OrtTensorTypeAndShapeInfo* shape_info;
-            ort->GetTensorTypeAndShape(output_values[0], &shape_info);
-            size_t num_elements;
-            ort->GetTensorShapeElementCount(shape_info, &num_elements);
-            ort->ReleaseTensorTypeAndShapeInfo(shape_info);
-
-            float* output_data;
-            ort->GetTensorMutableData(output_values[0], (void**)&output_data);
-
-            int feat_dim = UTILS_MIN((int)num_elements, ARCFACE_FEATURE_DIM);
-            float norm = 0.0f;
-            for (int i = 0; i < feat_dim; i++) {
-                out_feature[i] = output_data[i];
-                norm += out_feature[i] * out_feature[i];
-            }
-            norm = sqrtf(norm);
-            if (norm > 0.0f) {
-                float inv_norm = 1.0f / norm;
-                for (int i = 0; i < feat_dim; i++) {
-                    out_feature[i] *= inv_norm;
-                }
-            }
-
-            ort->ReleaseValue(output_values[0]);
-            return 0;
-        }
-
-        log_debug("ArcFace ONNX inference failed, using heuristic fallback");
-    }
-#endif
-
-    float* input_tensor = (float*)malloc(rec->input_width * rec->input_height * 3 * sizeof(float));
-    if (!input_tensor) return -1;
-
-    preprocess_arcface(face_image, width, height, input_tensor, rec->input_width, rec->input_height);
-
-    compute_face_features(input_tensor, rec->input_width, rec->input_height, out_feature);
-
-    free(input_tensor);
+    ort->ReleaseValue(output_values[0]);
     return 0;
 }
 

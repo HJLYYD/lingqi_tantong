@@ -6,80 +6,104 @@
 #include <stdio.h>
 
 /*
- * YAML 配置子集说明:
+ * YAML Configuration Subset Notes:
  *
- * 本模块实现了一个极简 YAML 解析器,仅支持以下特性子集:
- *   - 顶层 key: value 键值对
- *   - 嵌套对象 (缩进 >= 2 空格)
- *   - 字符串值 (支持引号和裸字符串)
- *   - 整数值和浮点数值
- *   - 布尔值 (true/false/yes/no)
- *   - 单行注释 (#)
+ * This module implements a minimal YAML parser supporting only the following subset:
+ *   - Top-level key: value pairs
+ *   - Nested objects (indent >= 2 spaces)
+ *   - String values (quoted and bare strings)
+ *   - Integer and floating-point values
+ *   - Boolean values (true/false/yes/no)
+ *   - Single-line comments (#)
  *
- * 不支持的标准 YAML 特性:
- *   - 锚点 (anchors & aliases): &name, *name, << merge
- *   - 多行字符串: |, >, |-, >-
- *   - 复杂嵌套结构: 深层 map-of-map (>2 层)
- *   - 列表缩进: - item 下的子结构
- *   - Flow style: {} 内联 map, [] 内联列表
- *   - 数据类型标签: !!str, !!int 等
- *   - 多文档: --- 分隔符
+ * Unsupported standard YAML features:
+ *   - Anchors & aliases: &name, *name, << merge
+ *   - Multi-line strings: |, >, |-, >-
+ *   - Deep nesting: map-of-map (>2 levels)
+ *   - List indentation: sub-structures under - item
+ *   - Flow style: {} inline maps, [] inline lists
+ *   - Type tags: !!str, !!int, etc.
+ *   - Multi-document: --- separator
  *
- * 如需完整 YAML 支持,建议集成 libyaml (https://github.com/yaml/libyaml)
- * 当前子集满足本项目 default.yaml 的配置需求。
+ * For full YAML support, consider integrating libyaml (https://github.com/yaml/libyaml).
+ * The current subset satisfies the configuration needs of this project's default.yaml.
  */
 
 static void config_set_defaults(ConfigManager* cm) {
-    config_set_bool(cm, "system.use_onnx", false);
+    config_set_bool(cm, "system.use_onnx", true);
+    config_set_bool(cm, "system.use_spacemit_ep", true);
+    config_set_int(cm, "system.spacemit_ep_intra_threads", 3);
     config_set_int(cm, "system.max_frames", 0);
+    config_set_int(cm, "system.worker_threads", 4);
     config_set_string(cm, "system.log_level", "INFO");
 
-    config_set_string(cm, "detection.model", "models/Human Recognition/yolov8n.onnx");
-    config_set_string(cm, "detection.model_path", "models/Human Recognition/yolov8n.onnx");
-    config_set_float(cm, "detection.confidence_threshold", 0.25f);
-    config_set_float(cm, "detection.iou_threshold", 0.45f);
+    config_set_string(cm, "detection.backend", "ai_accel");
+    config_set_string(cm, "detection.model_path", "models/Human Recognition/yolo11n.q.onnx");
+    config_set_float(cm, "detection.confidence_threshold", 0.20f);  /* DFL peakiness range: 0.18-0.70 */
+    config_set_float(cm, "detection.iou_threshold", 0.45f);         /* tighter NMS */
     config_set_int(cm, "detection.input_size", 640);
     config_set_int(cm, "detection.input_size.0", 640);
     config_set_int(cm, "detection.input_size.1", 640);
     config_set_int(cm, "detection.classes", 80);
 
-    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.onnx");
-    config_set_float(cm, "pose.confidence_threshold", 0.3f);
+    config_set_string(cm, "pose.backend", "ai_accel");
+    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
+    config_set_float(cm, "pose.confidence_threshold", 0.15f);
     config_set_float(cm, "pose.iou_threshold", 0.45f);
     config_set_int(cm, "pose.input_size.0", 640);
     config_set_int(cm, "pose.input_size.1", 640);
     config_set_int(cm, "pose.num_keypoints", 17);
 
-    config_set_string(cm, "face.detection_model_path", "models/Face Recognition/scrfd_10g_bnkps.onnx");
-    config_set_string(cm, "face.recognition_model_path", "models/Face Recognition/glintr100.onnx");
+    config_set_string(cm, "face.detection_backend", "ai_accel");
+    config_set_string(cm, "face.recognition_backend", "ai_accel");
+    config_set_string(cm, "face.detection_model_path", "models/Face Recognition/yolov5n-face_cut.q.onnx");
+    config_set_string(cm, "face.recognition_model_path", "models/Face Recognition/arcface_mobilefacenet_cut.q.onnx");
+    config_set_int(cm, "face.face_min_size", 24);
     config_set_float(cm, "face.confidence_threshold", 0.5f);
-    config_set_int(cm, "face.input_size.0", 112);
-    config_set_int(cm, "face.input_size.1", 112);
+    config_set_int(cm, "face.input_size.0", 320);
+    config_set_int(cm, "face.input_size.1", 320);
+    config_set_int(cm, "face.embedding_dim", 128);  /* ArcFace MobileFaceNet-cuted output [1,128] */
     config_set_float(cm, "face.similarity_threshold", 0.55f);
 
-    config_set_int(cm, "depth.input_size.0", 256);
-    config_set_int(cm, "depth.input_size.1", 256);
-    config_set_float(cm, "depth.focal_length", 460.0f);
-    config_set_float(cm, "depth.reference_width", 0.45f);
+    config_set_string(cm, "action.backend", "ai_accel");
+    config_set_string(cm, "action.model_path", "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx");
+    config_set_int(cm, "action.num_frames", 30);    /* ST-GCN temporal window; match default.yaml */
+    config_set_int(cm, "action.num_keypoints", 14); /* ST-GCN model joint count */
+    config_set_int(cm, "action.num_persons", 1);
+    config_set_int(cm, "action.num_classes", 7);    /* auto-detected at load time; 7-class NTU RGB+D subset */
+    config_set_float(cm, "action.confidence_threshold", 0.5f);
 
     config_set_int(cm, "tracking.max_lost", 30);
-    config_set_float(cm, "tracking.min_iou", 0.3f);
+    config_set_float(cm, "tracking.min_iou", 0.50f);
     config_set_float(cm, "tracking.max_distance", 5.0f);
     config_set_int(cm, "tracking.max_track_history", 300);
-    config_set_int(cm, "tracking.max_trajectory_length", 300);
     config_set_float(cm, "tracking.kalman_process_noise", 0.05f);
     config_set_float(cm, "tracking.kalman_measurement_noise", 0.1f);
 
-    config_set_float(cm, "spatial.fx", 500.0f);
-    config_set_float(cm, "spatial.default_focal_length", 500.0f);
+    config_set_float(cm, "spatial.fx", 960.0f);
+    config_set_float(cm, "spatial.fy", 960.0f);
+    config_set_float(cm, "spatial.cx", 960.0f);
+    config_set_float(cm, "spatial.cy", 540.0f);
     config_set_float(cm, "spatial.avg_human_height", 1.7f);
-    config_set_float(cm, "spatial.avg_person_height", 1.7f);
 
     config_set_bool(cm, "visualization.show_info_bar", true);
     config_set_bool(cm, "visualization.corner_markers", true);
     config_set_bool(cm, "visualization.crosshair", true);
     config_set_int(cm, "visualization.render_size.0", 1920);
     config_set_int(cm, "visualization.render_size.1", 1080);
+
+    config_set_int(cm, "video.camera_width", 1920);
+    config_set_int(cm, "video.camera_height", 1080);
+    config_set_float(cm, "video.camera_fps", 30.0f);
+    config_set_string(cm, "video.camera_device", "/dev/video0");
+    config_set_string(cm, "video.camera_format", "MJPEG");
+
+    config_set_string(cm, "arrow.uart_device_A", "/dev/ttyS0");
+    config_set_string(cm, "arrow.uart_device_C", "/dev/ttyS1");
+    config_set_int(cm, "arrow.baudrate", 3000000);
+
+    config_set_int(cm, "performance.openmp_threads", 6);
+    config_set_bool(cm, "performance.realtime_scheduling", true);
 }
 
 ConfigManager* config_manager_create(const char* config_path) {
@@ -359,13 +383,31 @@ int config_load_from_file(ConfigManager* cm, const char* path) {
 
         char full_key[MAX_KEY_LEN * 2];
         full_key[0] = '\0';
+        size_t fk_off = 0;
         for (int d = 0; d <= section_depth && d < MAX_CONFIG_DEPTH; d++) {
             if (section_stack[d][0] == '\0') continue;
-            if (full_key[0] != '\0') strncat(full_key, ".", sizeof(full_key) - strlen(full_key) - 1);
-            strncat(full_key, section_stack[d], sizeof(full_key) - strlen(full_key) - 1);
+            int written;
+            if (fk_off == 0) {
+                written = snprintf(full_key + fk_off, sizeof(full_key) - fk_off, "%s", section_stack[d]);
+            } else {
+                written = snprintf(full_key + fk_off, sizeof(full_key) - fk_off, ".%s", section_stack[d]);
+            }
+            if (written < 0 || (size_t)written >= sizeof(full_key) - fk_off) {
+                full_key[sizeof(full_key) - 1] = '\0';
+                fk_off = sizeof(full_key) - 1;
+                break;
+            }
+            fk_off += (size_t)written;
         }
-        if (full_key[0] != '\0') strncat(full_key, ".", sizeof(full_key) - strlen(full_key) - 1);
-        strncat(full_key, key_part, sizeof(full_key) - strlen(full_key) - 1);
+        if (fk_off > 0 && fk_off < sizeof(full_key) - 1) {
+            int written = snprintf(full_key + fk_off, sizeof(full_key) - fk_off, ".%s", key_part);
+            if (written < 0 || (size_t)written >= sizeof(full_key) - fk_off) {
+                full_key[sizeof(full_key) - 1] = '\0';
+            }
+        } else if (fk_off == 0) {
+            strncpy(full_key, key_part, sizeof(full_key) - 1);
+            full_key[sizeof(full_key) - 1] = '\0';
+        }
 
         if (full_key[0] == '\0') continue;
 

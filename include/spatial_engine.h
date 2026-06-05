@@ -64,6 +64,16 @@ void spatial_engine_update_trajectory(SpatialLocalizationEngine* engine, int tra
 const SpatialPosition* spatial_engine_get_trajectory(SpatialLocalizationEngine* engine, int track_id, int* out_count);
 bool spatial_engine_get_velocity(SpatialLocalizationEngine* engine, int track_id, float dt, float out_velocity[3]);
 
+/*
+ * Check if a new depth estimate is consistent with the tracked object's
+ * recent depth history.  Returns false for implausible depth jumps
+ * (e.g. z goes from 3m to 20m in one frame — likely a false detection
+ * on background or a different person).
+ */
+bool spatial_engine_check_depth_consistency(SpatialLocalizationEngine* engine,
+                                              int track_id, float new_depth,
+                                              float max_jump_ratio);
+
 void spatial_engine_clear_trajectories(SpatialLocalizationEngine* engine);
 int  spatial_engine_get_active_tracks(const SpatialLocalizationEngine* engine, int* out_ids, int max_count);
 

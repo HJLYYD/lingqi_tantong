@@ -2,30 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * KCP-lite 协议偏差说明 (相对于标准 IKCP/skywind3000/kcp):
- *
- * 1. 拥塞控制简化: 标准 KCP 实现基于 TCP BBR 的拥塞控制，包括 cwnd 增长/缩减策略。
- *    KCP-lite 仅保留了基础的滑动窗口流控，未实现完整的拥塞避免算法。
- *    在低丢包率局域网环境下运行良好，但跨广域网时吞吐量可能偏离预期。
- *
- * 2. 快速重传阈值: 标准 KCP 使用 fastresend (默认 2) 控制快速重传触发条件。
- *    KCP-lite 简化为此逻辑，重传判定基于固定 RTO 计算而非自适应。
- *
- * 3. 流控窗口更新: 标准 KCP 通过 IKCP_CMD_WASK/IKCP_CMD_WINS 命令
- *    动态通告远端窗口。KCP-lite 初始通告窗口后不再更新。
- *
- * 4. MTU 碎片化: 标准 KCP 支持超过 MTU 的数据分段(fragmentation),
- *    KCP-lite 当前版本不处理跨 MTU 数据分段。
- *
- * 兼容性: KCP-lite 数据包格式与标准 IKCP 基本兼容(使用相同的 cmd 编码),
- *         但在拥塞控制和流控行为上存在差异。如需与标准 KCP 实现对等通信,
- *         建议直接使用 https://github.com/skywind3000/kcp 完整实现。
- *
- * 适用场景: 本项目用于 Muse Pi Pro (K1) 与 ESP32P4 之间的本地 UART/串口
- *          可靠传输,局域网环境,延迟 <5ms,丢包率可忽略。此场景下 KCP-lite
- *          的简化实现足够使用。
- */
 
 #define IKCP_CMD_PUSH  81
 #define IKCP_CMD_ACK   82

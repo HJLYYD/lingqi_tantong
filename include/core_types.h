@@ -16,7 +16,8 @@ extern "C" {
 #define MAX_TRACKED_OBJECTS     100
 #define MAX_FACES_PER_FRAME     20
 #define MAX_POSES_PER_FRAME     20
-#define FEATURE_VECTOR_DIM      512
+#define MAX_ACTIONS_PER_FRAME   5
+#define FEATURE_VECTOR_DIM      128  /* ArcFace MobileFaceNet-cuted model output (validated via analyze_models.py) */
 #define MAX_STRING_LEN          64
 #define MAX_PATH_LEN            256
 #define MAX_LABEL_LEN           128
@@ -149,6 +150,19 @@ typedef struct {
 } FaceIdentity;
 
 typedef struct {
+    int action_id;
+    char action_name[MAX_STRING_LEN];
+    float confidence;
+} ActionPrediction;
+
+typedef struct {
+    ActionPrediction actions[MAX_ACTIONS_PER_FRAME];
+    int num_actions;
+    int predicted_action_id;
+    float predicted_confidence;
+} ActionResult;
+
+typedef struct {
     SpatialPosition positions[MAX_TRAJECTORY_LEN];
     int count;
 } TrajectoryBuffer;
@@ -202,6 +216,8 @@ typedef struct {
     int num_poses;
     FaceIdentity faces[MAX_FACES_PER_FRAME];
     int num_faces;
+    ActionResult action;
+    bool has_action;
     float* depth_map;
     bool has_depth_map;
     int depth_width;

@@ -7,10 +7,16 @@
 #include <math.h>
 
 static const uint8_t COLORS[VIS_MAX_COLORS][3] = {
-    {0, 255, 0}, {255, 0, 0}, {0, 0, 255}, {255, 255, 0},
-    {255, 0, 255}, {0, 255, 255}, {128, 255, 0}, {255, 128, 0},
-    {128, 0, 255}, {0, 128, 255}, {255, 128, 128}, {128, 255, 128},
-    {255, 255, 128}, {128, 128, 255}, {128, 255, 255}, {255, 128, 255}
+    /* Single green palette — all person detections use the same color
+     * because the INT8-quantized YOLOv8 model cannot distinguish classes.
+     * Every detection is forced to class_id=0 (person).  Using one color
+     * avoids the "rainbow chaos" visual and clearly communicates that
+     * all boxes are person detections.  Different people are identified
+     * by the "Person#N" label text, not by color. */
+    {0, 255, 0}, {0, 240, 0}, {0, 225, 0}, {0, 210, 0},
+    {0, 195, 0}, {0, 180, 0}, {0, 165, 0}, {0, 150, 0},
+    {30, 255, 30}, {30, 240, 30}, {30, 225, 30}, {30, 210, 30},
+    {60, 255, 60}, {60, 240, 60}, {60, 225, 60}, {60, 210, 60}
 };
 
 static const uint8_t SKELETON_COLORS[8][3] = {
@@ -276,7 +282,7 @@ static void draw_text(uint8_t* img, int width, int height, int x, int y,
 static void draw_label(uint8_t* img, int width, int height, const TrackedObject* obj,
                        int x1, int y1, const uint8_t color[3]) {
     char label[MAX_LABEL_LEN];
-    snprintf(label, sizeof(label), "ID:%d | %.1fm", obj->track_id, spatial_distance_from_origin(&obj->spatial_pos));
+    snprintf(label, sizeof(label), "Person#%d | %.1fm", obj->track_id, spatial_distance_from_origin(&obj->spatial_pos));
 
     if (obj->has_height) {
         char height_str[32];

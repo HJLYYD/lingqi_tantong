@@ -298,6 +298,7 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
 
     if (!tracker) return result;
 
+    /* ── Step 1: Kalman predict all existing tracks ── */
     BoundingBox predicted_bboxes[TRACKING_MAX_TRACKS];
     int predicted_ids[TRACKING_MAX_TRACKS];
     int num_predicted = 0;
@@ -317,64 +318,108 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
         }
     }
 
+    /* ── Step 2: Split detections into high/low confidence ──
+     * ByteTrack insight: HIGH-confidence detections create/update tracks;
+     * LOW-confidence detections only RECOVER temporarily lost tracks
+     * (e.g. occluded people). This prevents false positives from
+     * spawning new tracks while still recovering real tracks. */
+    int det_high_idx[MAX_DETECTIONS_PER_FRAME];
+    int det_low_idx[MAX_DETECTIONS_PER_FRAME];
+    int num_high = 0, num_low = 0;
+
+    for (int d = 0; d < num_detections; d++) {
+        if (detections[d].confidence >= TRACKING_CONFIDENCE_HIGH) {
+            det_high_idx[num_high++] = d;
+        } else if (detections[d].confidence >= TRACKING_CONFIDENCE_LOW) {
+            det_low_idx[num_low++] = d;
+        }
+    }
+
     bool det_matched[MAX_DETECTIONS_PER_FRAME];
     memset(det_matched, 0, sizeof(det_matched));
     bool track_matched[TRACKING_MAX_TRACKS];
     memset(track_matched, 0, sizeof(track_matched));
 
-    for (int stage = 0; stage < 3; stage++) {
-        float iou_thresh = (stage == 1) ? TRACKING_IOU_THRESHOLD_LOW : TRACKING_IOU_THRESHOLD_HIGH;
+    /* ── Step 3: Stage 1 — match HIGH-confidence dets with ALL tracks ── */
+    for (int t = 0; t < num_predicted; t++) {
+        if (track_matched[t]) continue;
 
-        for (int t = 0; t < num_predicted; t++) {
-            if (track_matched[t]) continue;
+        float best_iou = TRACKING_IOU_THRESHOLD;
+        int best_det = -1;
 
+        for (int h = 0; h < num_high; h++) {
+            int d = det_high_idx[h];
+            if (det_matched[d]) continue;
+
+            float iou = bbox_iou(&predicted_bboxes[t], &detections[d].bbox);
+            if (iou > best_iou) {
+                best_iou = iou;
+                best_det = d;
+            }
+        }
+
+        if (best_det >= 0) {
             int track_idx = predicted_ids[t];
-            if (stage == 0 && !tracker->tracks[track_idx].confirmed) continue;
-            if (stage == 2 && tracker->tracks[track_idx].confirmed) continue;
-
-            float best_iou = 0.0f;
-            int best_det = -1;
-
-            for (int d = 0; d < num_detections; d++) {
-                if (det_matched[d]) continue;
-                if (stage == 0 && detections[d].confidence < TRACKING_CONFIDENCE_HIGH) continue;
-                if (stage == 1 && detections[d].confidence >= TRACKING_CONFIDENCE_HIGH) continue;
-
-                float iou = bbox_iou(&predicted_bboxes[t], &detections[d].bbox);
-                if (iou > best_iou && iou > iou_thresh) {
-                    best_iou = iou;
-                    best_det = d;
-                }
-            }
-
-            if (best_det >= 0) {
-                const SpatialPosition* pos = (num_positions > best_det) ? &positions[best_det] : NULL;
-                update_track_match(tracker, track_idx, &detections[best_det], pos, frame_num);
-                det_matched[best_det] = true;
-                track_matched[t] = true;
-            }
+            const SpatialPosition* pos = (num_positions > best_det) ? &positions[best_det] : NULL;
+            update_track_match(tracker, track_idx, &detections[best_det], pos, frame_num);
+            det_matched[best_det] = true;
+            track_matched[t] = true;
         }
     }
 
+    /* ── Step 4: Stage 2 — match LOW-confidence dets with REMAINING tracks ──
+     * This recovers tracks that were temporarily lost (occlusion, motion blur).
+     * Low-confidence dets do NOT create new tracks. */
+    for (int t = 0; t < num_predicted; t++) {
+        if (track_matched[t]) continue;
+
+        float best_iou = TRACKING_IOU_THRESHOLD;
+        int best_det = -1;
+
+        for (int l = 0; l < num_low; l++) {
+            int d = det_low_idx[l];
+            if (det_matched[d]) continue;
+
+            float iou = bbox_iou(&predicted_bboxes[t], &detections[d].bbox);
+            if (iou > best_iou) {
+                best_iou = iou;
+                best_det = d;
+            }
+        }
+
+        if (best_det >= 0) {
+            int track_idx = predicted_ids[t];
+            const SpatialPosition* pos = (num_positions > best_det) ? &positions[best_det] : NULL;
+            update_track_match(tracker, track_idx, &detections[best_det], pos, frame_num);
+            det_matched[best_det] = true;
+            track_matched[t] = true;
+        }
+    }
+
+    /* ── Step 5: Mark unmatched tracks as lost ── */
     for (int t = 0; t < num_predicted; t++) {
         if (track_matched[t]) continue;
         int track_idx = predicted_ids[t];
         tracker->tracks[track_idx].lost_count++;
         tracker->tracks[track_idx].object.is_occluded = true;
         tracker->tracks[track_idx].object.occluded_frames = tracker->tracks[track_idx].lost_count;
+        /* Keep predicted bbox for visualization of lost tracks */
         tracker->tracks[track_idx].object.detection.bbox = predicted_bboxes[t];
-        tracker->tracks[track_idx].object.detection.confidence = 0.3f;
+        tracker->tracks[track_idx].object.detection.confidence *= 0.9f;  /* decay confidence */
     }
 
-    for (int d = 0; d < num_detections; d++) {
+    /* ── Step 6: Create NEW tracks from unmatched HIGH-confidence dets ONLY ── */
+    for (int h = 0; h < num_high; h++) {
+        int d = det_high_idx[h];
         if (det_matched[d]) continue;
-        if (detections[d].confidence < TRACKING_CONFIDENCE_HIGH) continue;
 
         const SpatialPosition* pos = (num_positions > d) ? &positions[d] : NULL;
         create_track(tracker, &detections[d], pos, frame_num);
         result.new_tracks++;
     }
+    /* Low-confidence unmatched dets are DISCARDED — they don't create tracks. */
 
+    /* ── Step 7: Remove tracks lost for too long ── */
     for (int i = tracker->num_tracks - 1; i >= 0; i--) {
         if (tracker->tracks[i].lost_count > tracker->max_lost) {
             remove_track(tracker, i);
@@ -382,6 +427,7 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
         }
     }
 
+    /* ── Step 8: Output only CONFIRMED tracks ── */
     for (int i = 0; i < tracker->num_tracks; i++) {
         if (tracker->tracks[i].confirmed) {
             if (result.num_tracked < MAX_TRACKED_OBJECTS) {

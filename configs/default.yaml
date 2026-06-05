@@ -1,23 +1,41 @@
 system:
-  use_onnx: false
+  use_onnx: true
+  # SpacemiT EP (RVV 1.0 + IME 2.0 TOPS hardware accel via libspacemit_ep.so).
+  # IMPORTANT: SpacemiT EP only supports INT8-quantized models (.q.onnx
+  # produced by xquant, per Bianbu 4.3 / 7.1 docs). Feeding FP32 models
+  # causes worker-thread std::runtime_error("tcm buffer alloc failed").
+  # The bridge auto-detects quantization (scans for QuantizeLinear/
+  # QLinearConv ops) and only registers the EP for quantized models;
+  # FP32 models silently use CPU EP (still real ONNX, no acceleration).
+  # Quantize with SpacemiT's xquant tool:
+  #   https://bianbu.spacemit.com/en/brdk/Advanced_development/7.1_Model_Quantization/
+  use_spacemit_ep: true
+  # Per-session intra-op threads for SpacemiT EP. K1 has only ~512KB TCM
+  # per AI core (cluster 0).  Each thread needs its own TCM workspace.
+  #   intra=1: safe default (~170KB TCM)
+  #   intra=2: moderate (~340KB TCM, 2 cores)
+  #   intra=3: aggressive (~510KB TCM, near 512KB limit)
+  #   intra=4: may trigger "tcm buffer alloc failed" — test carefully
+  # With 2 EP sessions (detection + face), keep intra conservative.
+  spacemit_ep_intra_threads: 3
   log_level: INFO
   startup_mode: realtime
   max_frames: 0
   ring_buffer_size: 16
   target_fps: 15.0
-  worker_threads: 2
+  worker_threads: 4
 
 video:
   source: camera
   camera_device: "/dev/video0"
-  camera_width: 640
-  camera_height: 480
-  camera_fps: 15.0
+  camera_width: 1920
+  camera_height: 1080
+  camera_fps: 30.0
   camera_format: MJPEG
   camera_buffer_count: 4
   video_path: ""
   output_path: "output/result.mp4"
-  save_frame_interval: 15
+  save_frame_interval: 1
 
 arrow:
   uart_device_A: "/dev/ttyS0"
@@ -28,55 +46,70 @@ arrow:
   parity: none
   enable_fec: false
   dual_link: true
+  reconnect_max_delay_s: 16
+  reconnect_initial_delay_s: 1
 
 detection:
-  backend: cpu
-  fallback: heuristic
-  model: "models/Human Recognition/yolov8n.onnx"
-  model_path: "models/Human Recognition/yolov8n.onnx"
-  confidence_threshold: 0.25
-  iou_threshold: 0.45
-  input_size: 640
+  # SECONDARY person detector (YOLO11n INT8-quantized xquant-split).
+  # PRIMARY person detection is done by the pose model (yolov8n-pose).
+  # INT8 quantization breaks cls/obj heads (~0.5 sigmoid for ALL classes),
+  # so detection relies on DFL peakiness + person geometry filtering.
+  # DFL signal: uniform=0.0625, weak=0.10, clear=0.25+, peak=0.70+.
+  # Use this as the secondary detector to supplement pose detections.
+  # Model from: https://archive.spacemit.com/spacemit-ai/model_zoo/vision/yolo11/yolo11n.q.onnx
+  backend: ai_accel
+  model_path: "models/Human Recognition/yolo11n.q.onnx"
+  confidence_threshold: 0.20   # DFL peakiness: uniform=0.0625, weak=0.10, clear=0.25+
+  iou_threshold: 0.45           # tighter NMS to suppress overlapping boxes
+  input_size: [640, 640]
   classes: 80
 
 pose:
-  backend: cpu
-  fallback: heuristic
-  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.onnx"
-  confidence_threshold: 0.30
+  # PRIMARY person detector + pose estimator (YOLOv8n-pose, xquant-split).
+  # This model detects people AND estimates 17 COCO keypoints in one pass.
+  # The cls head is broken by INT8 quantization (same as YOLO11 detector),
+  # so we use DFL peakiness as confidence. Keypoints may also be partially
+  # broken but bounding boxes from DFL are the primary output for tracking.
+  # DFL: uniform=0.0625, real signal=0.20-0.70.
+  backend: ai_accel
+  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
+  confidence_threshold: 0.15   # DFL peakiness for xquant-split models
   iou_threshold: 0.45
   input_size: [640, 640]
   num_keypoints: 17
   skeleton_type: coco
 
 face:
-  detection_backend: cpu
-  detection_fallback: color_symmetry
-  recognition_backend: cpu
-  detection_model_path: "models/Face Recognition/scrfd_10g_bnkps.onnx"
-  recognition_model_path: "models/Face Recognition/glintr100.onnx"
+  # SUPPLEMENTARY face detection + recognition (optional, reduced frequency).
+  # Face detection runs every 5 frames when people are detected,
+  # every 60 frames otherwise. Not critical for the primary task of
+  # person detection + pose estimation + action recognition.
+  detection_backend: ai_accel
+  recognition_backend: ai_accel
+  detection_model_path: "models/Face Recognition/yolov5n-face_cut.q.onnx"
+  recognition_model_path: "models/Face Recognition/arcface_mobilefacenet_cut.q.onnx"
   face_min_size: 24
   confidence_threshold: 0.50
   similarity_threshold: 0.55
-  input_size: [112, 112]
-  embedding_dim: 512
+  input_size: [320, 320]
+  embedding_dim: 128   # ArcFace MobileFaceNet-cuted outputs [1,128]; must match FEATURE_VECTOR_DIM
   liveness_detection: false
 
-depth:
-  enabled: false
-  backend: cpu
-  model: "models/Depth/midas_v2.onnx"
-  method: pinhole_with_imu
-  input_size: [256, 256]
-  focal_length: 460.0
-  reference_width: 0.45
+action:
+  enabled: true
+  backend: ai_accel
+  model_path: "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx"
+  num_frames: 30
+  num_keypoints: 14
+  num_persons: 1
+  num_classes: 7    # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
+  confidence_threshold: 0.50
 
 tracking:
   max_lost: 30
-  min_iou: 0.30
+  min_iou: 0.50
   max_distance: 5.0
   max_track_history: 300
-  max_trajectory_length: 300
   kalman_process_noise: 0.05
   kalman_measurement_noise: 0.10
   init_state:
@@ -89,13 +122,11 @@ tracking:
   ema_alpha: 0.25
 
 spatial:
-  fx: 500.0
-  fy: 500.0
-  cx: 320.0
-  cy: 240.0
-  default_focal_length: 500.0
+  fx: 960.0
+  fy: 960.0
+  cx: 960.0
+  cy: 540.0
   avg_human_height: 1.70
-  avg_person_height: 1.70
   min_depth: 0.3
   max_depth: 120.0
   imu_pitch_correction: true
@@ -173,23 +204,25 @@ visualization:
     - [128, 0, 255]
 
 ai_acceleration:
-  platform: onnx_runtime
+  platform: onnx_runtime_spacemit_ep
   precision: fp32
   power_mode: balanced
   ddr_bw_limit_mbps: 5400
-  model_cache_dir: "/tmp/lingqi_ai_cache"
+  model_cache_dir: "/var/lib/lingqi_ai_cache"
   preload_models: true
   warmup_runs: 3
 
 performance:
   rvv_enabled: true
   rvv_vlen: 256
-  openmp_threads: 2
+  openmp_threads: 6
   pipeline_pin_to_core: true
   imu_core: 0
   inference_core: 1
   visualization_core: 2
   l1_cache_optimize: true
+  realtime_scheduling: true
+  rt_priority: 50
 
 k1_hardware:
   enabled: true
@@ -226,8 +259,8 @@ k1_hardware:
     imu_thread_cpu: 0
   power:
     cpu_freq_max_mhz: 1600
-    governor: "ondemand"
-    dvfs_enabled: true
+    governor: "performance"
+    dvfs_enabled: false
   ddr:
     bandwidth_limit_mbps: 5400
     optimize_access_pattern: true

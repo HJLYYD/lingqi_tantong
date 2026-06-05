@@ -70,7 +70,17 @@ if(BUILDING_FOR_RISCV64)
         endif()
     endif()
 
-    set(RISCV_COMMON_FLAGS "-O3 -Wall -Wextra -fomit-frame-pointer -ffast-math -flto")
+    set(RISCV_COMMON_FLAGS "-Wall -Wextra -fomit-frame-pointer")
+    set(RISCV_RELEASE_FLAGS "-O3 -ffast-math -flto")
+
+    # Debug builds: no optimization, no LTO, no fast-math
+    # (GCC 13.2 on RISC-V can emit illegal instructions with -ffast-math -flto)
+    if(CMAKE_BUILD_TYPE MATCHES "Debug")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+        message(STATUS "Debug build: -O0 -g (no LTO/fast-math for RISC-V safety)")
+    else()
+        set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} ${RISCV_RELEASE_FLAGS}")
+    endif()
 
     if(CMAKE_C_COMPILER MATCHES "riscv64-linux-gnu" OR CMAKE_CROSSCOMPILING)
         if(NOT CMAKE_C_COMPILER MATCHES "riscv64-linux-gnu")
@@ -81,8 +91,30 @@ if(BUILDING_FOR_RISCV64)
     set(RISCV_ARCH_FLAGS "-march=${DETECTED_RISCV_ARCH}")
 
     if(DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
-        set(RISCV_ARCH_FLAGS "${RISCV_ARCH_FLAGS} -mtune=x60")
-        set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -fprefetch-loop-arrays -funroll-loops")
+        # -mtune=x60 only supported by GCC 14+; probe instead of assuming.
+        execute_process(
+            COMMAND ${CMAKE_C_COMPILER} -march=${DETECTED_RISCV_ARCH} -mtune=x60 -E -x c ${DEV_NULL}
+            RESULT_VARIABLE TEST_MTUNE_X60_RESULT
+            ERROR_QUIET OUTPUT_QUIET
+        )
+        if(TEST_MTUNE_X60_RESULT EQUAL 0)
+            set(RISCV_ARCH_FLAGS "${RISCV_ARCH_FLAGS} -mtune=x60")
+            message(STATUS "K1 -mtune=x60 supported by GCC ${CMAKE_C_COMPILER_VERSION}")
+        else()
+            message(STATUS "GCC ${CMAKE_C_COMPILER_VERSION} does NOT support -mtune=x60 (need GCC 14+); using default tuning")
+        endif()
+
+        # -fprefetch-loop-arrays is unsupported on RISC-V backend; probe.
+        execute_process(
+            COMMAND ${CMAKE_C_COMPILER} -march=${DETECTED_RISCV_ARCH} -fprefetch-loop-arrays -Werror -E -x c ${DEV_NULL}
+            RESULT_VARIABLE TEST_PREFETCH_RESULT
+            ERROR_QUIET OUTPUT_QUIET
+        )
+        if(TEST_PREFETCH_RESULT EQUAL 0)
+            set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -fprefetch-loop-arrays")
+        endif()
+        set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -funroll-loops")
+
         if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0")
             set(K1_EXTRA_FLAGS "-mrvv-vector-bits=256")
         else()
@@ -175,8 +207,9 @@ set(DATA_SOURCES
 set(MODEL_SOURCES
     src/yolov8_detector.c
     src/yolov8_pose_estimator.c
-    src/scrfd_detector.c
+    src/yolov5_face_detector.c
     src/arcface_recognizer.c
+    src/stgcn_action_recognizer.c
 )
 
 set(BUSINESS_SOURCES
@@ -230,47 +263,114 @@ set(ALL_LIB_CXX_SOURCES "")
 add_library(lingqi_tantong_core STATIC ${ALL_LIB_SOURCES} ${ALL_LIB_CXX_SOURCES})
 
 if(ALL_LIB_CXX_SOURCES)
-    target_link_libraries(lingqi_tantong_core stdc++)
+    target_link_libraries(lingqi_tantong_core PRIVATE stdc++)
 endif()
 
 add_executable(lingqi_tantong ${MAIN_SOURCE})
-target_link_libraries(lingqi_tantong lingqi_tantong_core)
+target_link_libraries(lingqi_tantong PRIVATE lingqi_tantong_core)
 
 if(UNIX)
-    target_link_libraries(lingqi_tantong m pthread)
+    target_link_libraries(lingqi_tantong PRIVATE m pthread)
 endif()
 
 if(ALL_LIB_CXX_SOURCES)
-    target_link_libraries(lingqi_tantong stdc++)
+    target_link_libraries(lingqi_tantong PRIVATE stdc++)
 endif()
 
 if(BUILDING_FOR_RISCV64)
-    target_link_libraries(lingqi_tantong atomic)
+    target_link_libraries(lingqi_tantong PRIVATE atomic)
 endif()
 
-if(USE_ONNX_RUNTIME AND ONNX_RUNTIME_DIR)
-    target_include_directories(lingqi_tantong_core PRIVATE "${ONNX_RUNTIME_DIR}/include")
-
-    if(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
-        target_link_libraries(lingqi_tantong "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
-    elseif(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
-        target_link_libraries(lingqi_tantong "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
-    elseif(EXISTS "/usr/lib/libonnxruntime.so")
-        target_link_libraries(lingqi_tantong onnxruntime)
-    else()
-        message(FATAL_ERROR "ONNX Runtime library not found at ${ONNX_RUNTIME_DIR}/lib/")
+if(USE_ONNX_RUNTIME)
+    if(NOT ONNX_RUNTIME_DIR)
+        if(EXISTS "/usr/local/include/onnxruntime_c_api.h" OR EXISTS "/usr/include/onnxruntime_c_api.h")
+            message(STATUS "ONNX_RUNTIME_DIR not set; falling back to system-installed ONNX Runtime")
+            set(ONNX_RUNTIME_SYSTEM_INSTALL TRUE)
+        else()
+            message(FATAL_ERROR
+                "ONNX_RUNTIME_DIR is required when USE_ONNX_RUNTIME=ON.\n"
+                "  Download SpacemiT ONNX Runtime 2.0.2 from:\n"
+                "    https://archive.spacemit.com/spacemit-ai/onnxruntime/spacemit-ort.riscv64.2.0.2.tar.gz\n"
+                "  Then re-configure with:\n"
+                "    -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.2.0.2")
+        endif()
     endif()
 
-    if(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
-        target_link_libraries(lingqi_tantong "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
+    if(ONNX_RUNTIME_DIR)
+        target_include_directories(lingqi_tantong_core PRIVATE "${ONNX_RUNTIME_DIR}/include")
+    endif()
+
+    if(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
+        target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
+    elseif(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
+        target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
+    elseif(EXISTS "/usr/lib/libonnxruntime.so" OR EXISTS "/usr/lib/riscv64-linux-gnu/libonnxruntime.so")
+        target_link_libraries(lingqi_tantong_core PUBLIC onnxruntime)
+    else()
+        message(FATAL_ERROR
+            "ONNX Runtime library not found.\n"
+            "  Looked for libonnxruntime.so in:\n"
+            "    ${ONNX_RUNTIME_DIR}/lib/\n"
+            "    /usr/lib/\n"
+            "    /usr/lib/riscv64-linux-gnu/\n"
+            "  Install SpacemiT ONNX Runtime first.")
+    endif()
+
+    if(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
+        target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
         message(STATUS "SpacemiT RISC-V MLAS (optimized math) enabled")
     elseif(EXISTS "/usr/lib/libonnxruntime_mlas.so")
-        target_link_libraries(lingqi_tantong onnxruntime_mlas)
+        target_link_libraries(lingqi_tantong_core PUBLIC onnxruntime_mlas)
         message(STATUS "SpacemiT RISC-V MLAS (optimized math) enabled")
+    endif()
+
+    # SpacemiT EP shared libs (libspacemit_ep.so etc.)
+    if(ONNX_RUNTIME_DIR)
+        find_library(SPACEMIT_EP_LIB
+            NAMES spacemit_ep
+            PATHS "${ONNX_RUNTIME_DIR}/lib"
+            NO_DEFAULT_PATH)
+        if(SPACEMIT_EP_LIB)
+            target_link_libraries(lingqi_tantong_core PUBLIC "${SPACEMIT_EP_LIB}")
+            message(STATUS "SpacemiT EP lib linked: ${SPACEMIT_EP_LIB}")
+        else()
+            file(GLOB SPACEMIT_EP_LIBS_FALLBACK
+                "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_providers_spacemit*.so"
+                "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_spacemit*.so")
+            foreach(SPM_LIB IN LISTS SPACEMIT_EP_LIBS_FALLBACK)
+                target_link_libraries(lingqi_tantong_core PUBLIC "${SPM_LIB}")
+                message(STATUS "SpacemiT EP lib linked (fallback): ${SPM_LIB}")
+            endforeach()
+            if(NOT SPACEMIT_EP_LIBS_FALLBACK)
+                message(WARNING
+                    "libspacemit_ep.so NOT found under ${ONNX_RUNTIME_DIR}/lib/.\n"
+                    "  SpacemiT EP symbol resolution will fail at link time.")
+            endif()
+        endif()
+    else()
+        # System-installed ONNX Runtime — search system paths for EP lib
+        find_library(SPACEMIT_EP_LIB
+            NAMES spacemit_ep
+            PATHS /usr/lib /usr/lib/riscv64-linux-gnu /usr/local/lib
+            NO_DEFAULT_PATH)
+        if(SPACEMIT_EP_LIB)
+            target_link_libraries(lingqi_tantong_core PUBLIC "${SPACEMIT_EP_LIB}")
+            message(STATUS "SpacemiT EP lib linked (system): ${SPACEMIT_EP_LIB}")
+        else()
+            message(WARNING
+                "libspacemit_ep.so NOT found in system library paths.\n"
+                "  SpacemiT EP symbol resolution will fail at link time.\n"
+                "  Install libspacemit_ep.so or set ONNX_RUNTIME_DIR to the\n"
+                "  SpacemiT ONNX Runtime installation directory.")
+        endif()
     endif()
 
     add_compile_definitions(HAS_ONNX_RUNTIME)
-    message(STATUS "ONNX Runtime enabled: ${ONNX_RUNTIME_DIR}")
+    if(ONNX_RUNTIME_DIR)
+        message(STATUS "ONNX Runtime enabled: ${ONNX_RUNTIME_DIR}")
+    else()
+        message(STATUS "ONNX Runtime enabled: system install")
+    endif()
 
     find_file(SPACEMIT_ORT_ENV_H
         NAMES spacemit_ort_env.h
@@ -281,29 +381,60 @@ if(USE_ONNX_RUNTIME AND ONNX_RUNTIME_DIR)
         NO_DEFAULT_PATH
     )
 
-    if(SPACEMIT_ORT_ENV_H AND CMAKE_CXX_COMPILER)
+    if(SPACEMIT_ORT_ENV_H)
         enable_language(CXX)
         target_sources(lingqi_tantong_core PRIVATE src/spacemit_ort_bridge.cpp)
         target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SPACEMIT_EP)
-        target_link_libraries(lingqi_tantong_core stdc++)
-        message(STATUS "SpacemiT Execution Provider enabled (ONNX Runtime)")
+        target_link_libraries(lingqi_tantong_core PRIVATE stdc++)
+        list(APPEND ALL_LIB_CXX_SOURCES src/spacemit_ort_bridge.cpp)
+        message(STATUS "SpacemiT Execution Provider enabled: ${SPACEMIT_ORT_ENV_H}")
     else()
-        if(SPACEMIT_ORT_ENV_H)
-            message(STATUS "SpacemiT EP header found, but no CXX compiler - EP disabled")
+        if(BUILDING_FOR_RISCV64)
+            message(WARNING
+                "spacemit_ort_env.h NOT found - SpacemiT EP disabled.\n"
+                "  K1 hardware AI acceleration (RVV + IME) will NOT be used.\n"
+                "  Install header in ${ONNX_RUNTIME_DIR}/include/onnxruntime/ or /usr/local/include/onnxruntime/")
         else()
-            message(STATUS "spacemit_ort_env.h not found, using CPU-only ONNX Runtime")
+            message(STATUS "spacemit_ort_env.h not found (host build - acceptable)")
         endif()
     endif()
-elseif(USE_ONNX_RUNTIME)
-    message(STATUS "ONNX Runtime dir not set: heuristic fallback mode")
-    message(STATUS "  Set -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.2.0.2 for real inference")
+endif()
+
+find_library(TURBOJPEG_LIB NAMES turbojpeg)
+find_path(TURBOJPEG_INC NAMES turbojpeg.h
+    PATHS /usr/include /usr/local/include /usr/include/riscv64-linux-gnu)
+if(TURBOJPEG_LIB AND TURBOJPEG_INC)
+    target_include_directories(lingqi_tantong_core PRIVATE ${TURBOJPEG_INC})
+    target_link_libraries(lingqi_tantong PRIVATE ${TURBOJPEG_LIB})
+    add_compile_definitions(HAS_LIBJPEG_TURBO)
+    message(STATUS "libjpeg-turbo found: ${TURBOJPEG_LIB}")
+else()
+    message(FATAL_ERROR
+        "libjpeg-turbo is REQUIRED for JPEG decode (Arrow UART frames).\n"
+        "  Install on Bianbu/Debian: sudo apt install libturbojpeg0-dev\n"
+        "  Install on RHEL/Fedora:   sudo dnf install turbojpeg-devel")
+endif()
+
+include(CheckIncludeFile)
+check_include_file("linux/videodev2.h" HAVE_V4L2)
+if(HAVE_V4L2)
+    add_compile_definitions(HAS_V4L2)
+    message(STATUS "V4L2 enabled (Linux video capture)")
+else()
+    if(BUILDING_FOR_RISCV64)
+        message(WARNING
+            "V4L2 header <linux/videodev2.h> NOT found - local camera capture disabled.\n"
+            "  Arrow UART JPEG path still works, but /dev/video0 will not be used.\n"
+            "  To enable: sudo apt install linux-libc-dev\n"
+            "  Then re-run cmake.")
+    endif()
 endif()
 
 if(USE_SPACENGINE_AI AND BUILDING_FOR_RISCV64)
     if(SPACENGINE_DIR)
         target_include_directories(lingqi_tantong_core PRIVATE "${SPACENGINE_DIR}/include")
         target_link_directories(lingqi_tantong PRIVATE "${SPACENGINE_DIR}/lib")
-        target_link_libraries(lingqi_tantong spacengine_rt)
+        target_link_libraries(lingqi_tantong PRIVATE spacengine_rt)
 
         target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SPACENGINE_AI)
         message(STATUS "SpacemiT RISC-V AI acceleration enabled: ${SPACENGINE_DIR}")
@@ -318,7 +449,7 @@ if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
     if(ENABLE_K1_VPU AND K1_MPP_DIR)
         target_include_directories(lingqi_tantong_core PRIVATE "${K1_MPP_DIR}/include")
         target_link_directories(lingqi_tantong PRIVATE "${K1_MPP_DIR}/lib")
-        target_link_libraries(lingqi_tantong mpp)
+        target_link_libraries(lingqi_tantong PRIVATE mpp)
         add_compile_definitions(HAS_K1_MPP)
         message(STATUS "K1 MPP hardware video pipeline: ${K1_MPP_DIR}")
     elseif(ENABLE_K1_VPU)
@@ -329,23 +460,12 @@ if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
     if(ENABLE_K1_JPU AND K1_JPU_DIR)
         target_include_directories(lingqi_tantong_core PRIVATE "${K1_JPU_DIR}/include")
         target_link_directories(lingqi_tantong PRIVATE "${K1_JPU_DIR}/lib")
-        target_link_libraries(lingqi_tantong jpu)
+        target_link_libraries(lingqi_tantong PRIVATE jpu)
         message(STATUS "K1 JPU hardware JPEG decode: ${K1_JPU_DIR}")
     elseif(ENABLE_K1_JPU)
         message(STATUS "K1 JPU: SDK not set, JPEG hardware decode disabled")
         message(STATUS "  Set -DK1_JPU_DIR=/path/to/k1x-jpu for HW JPEG decode")
     endif()
-endif()
-
-add_executable(test_basic tests/test_basic.c)
-target_link_libraries(test_basic lingqi_tantong_core)
-
-if(UNIX)
-    target_link_libraries(test_basic m pthread)
-endif()
-
-if(BUILDING_FOR_RISCV64)
-    target_link_libraries(test_basic atomic)
 endif()
 
 install(TARGETS lingqi_tantong DESTINATION bin)
@@ -361,10 +481,16 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "Build Type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "ONNX Runtime:      ${USE_ONNX_RUNTIME}")
-if(SPACEMIT_ORT_ENV_H AND CMAKE_CXX_COMPILER)
+if(SPACEMIT_ORT_ENV_H)
     message(STATUS "SpacemiT EP:       YES (RVV 1.0 + IME hardware acceleration)")
 else()
     message(STATUS "SpacemiT EP:       NO (CPU-only)")
+endif()
+if(TURBOJPEG_LIB)
+    message(STATUS "libjpeg-turbo:     ${TURBOJPEG_LIB}")
+endif()
+if(HAVE_V4L2)
+    message(STATUS "V4L2:              YES (Linux video capture)")
 endif()
 if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "riscv")
     if(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")

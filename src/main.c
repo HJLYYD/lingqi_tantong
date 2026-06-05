@@ -8,10 +8,12 @@
 #include <stdatomic.h>
 
 static atomic_bool g_running = true;
+static SystemController* g_sc = NULL;
 
 static void signal_handler(int sig) {
     (void)sig;
     atomic_store(&g_running, false);
+    if (g_sc) g_sc->running = false;
     log_info("Signal received, shutting down...");
 }
 
@@ -40,12 +42,12 @@ static void print_usage(const char* program_name) {
 int main(int argc, char* argv[]) {
     const char* video_path = "test.mp4";
     const char* output_path = "output/results";
-    const char* config_path = NULL;
+    const char* config_path = "configs/default.yaml";
     const char* uart_a = "/dev/ttyS0";
     const char* uart_c = "/dev/ttyS1";
     const char* camera_dev = "/dev/video0";
     int max_frames = 0;
-    int save_frame_interval = 10;
+    int save_frame_interval = 0;  /* 0 = use config value */
     int baudrate = 3000000;
     bool realtime_mode = false;
 
@@ -106,6 +108,7 @@ int main(int argc, char* argv[]) {
         logger_close();
         return 1;
     }
+    g_sc = sc;
 
     if (realtime_mode) {
         sc->running = true;

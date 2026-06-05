@@ -25,12 +25,11 @@ typedef struct {
 
 typedef struct {
     char base_path[MAX_PATH_LEN];
-    bool use_onnx;
     ModelInfo models[MAX_MODELS];
     int num_models;
 } ModelStore;
 
-ModelStore* model_store_create(const char* base_path, bool use_onnx);
+ModelStore* model_store_create(const char* base_path);
 void model_store_destroy(ModelStore* store);
 
 const char* model_store_resolve_path(const ModelStore* store, const char* model_name);
