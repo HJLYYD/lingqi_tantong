@@ -12,9 +12,11 @@ extern "C" {
 #define YOLOV8_POSE_INPUT_SIZE      640
 
 typedef struct OrtSession OrtSession;
+typedef struct OrtInferenceContext OrtInferenceContext;
 
 typedef struct {
     OrtSession* session;
+    OrtInferenceContext* ctx;
     char input_name[MAX_STRING_LEN];
     int input_width;
     int input_height;
@@ -23,6 +25,12 @@ typedef struct {
     float scale;
     int pad_x;
     int pad_y;
+
+    int  cached_num_outputs;
+    bool format_cached;
+    bool is_xquant_split;
+    int  pose_split_groups[3][3];
+    int  num_pose_groups;
 } YOLOv8PoseEstimator;
 
 YOLOv8PoseEstimator* yolov8_pose_estimator_create(const char* model_path, int input_w, int input_h,

@@ -12,12 +12,13 @@ system:
   use_spacemit_ep: true
   # Per-session intra-op threads for SpacemiT EP. K1 has only ~512KB TCM
   # per AI core (cluster 0).  Each thread needs its own TCM workspace.
-  #   intra=1: safe default (~170KB TCM)
-  #   intra=2: moderate (~340KB TCM, 2 cores)
-  #   intra=3: aggressive (~510KB TCM, near 512KB limit)
-  #   intra=4: may trigger "tcm buffer alloc failed" — test carefully
-  # With 2 EP sessions (detection + face), keep intra conservative.
-  spacemit_ep_intra_threads: 3
+  #   intra=1: ~170KB TCM per session — allows up to 3 EP sessions (510KB/512KB)
+  #   intra=2: ~340KB TCM — allows 1 EP session safely, 2 risky (680KB > 512KB)
+  #   intra=3: ~510KB TCM — 1 EP session only
+  #   intra=4: may trigger "tcm buffer alloc failed" — do not use
+  # K1 Cluster0: 512KB shared TCM across 4 AI cores.
+  # intra=1 maximizes EP coverage: YOLO11 + YOLOv8-Pose + Face (3 EP sessions).
+  spacemit_ep_intra_threads: 1  # intra=1 only - Bianbu 2.3.3 K1 crashes at intra>=2 (tcm buffer alloc failed core 2)
   log_level: INFO
   startup_mode: realtime
   max_frames: 0
@@ -59,8 +60,8 @@ detection:
   # Model from: https://archive.spacemit.com/spacemit-ai/model_zoo/vision/yolo11/yolo11n.q.onnx
   backend: ai_accel
   model_path: "models/Human Recognition/yolo11n.q.onnx"
-  confidence_threshold: 0.20   # DFL peakiness: uniform=0.0625, weak=0.10, clear=0.25+
-  iou_threshold: 0.45           # tighter NMS to suppress overlapping boxes
+  confidence_threshold: 0.12   # DFL peakiness: uniform=0.0625, weak=0.10, clear=0.25+, peak=0.70+
+  iou_threshold: 0.40           # tighter NMS to suppress overlapping boxes on same person
   input_size: [640, 640]
   classes: 80
 
@@ -73,8 +74,8 @@ pose:
   # DFL: uniform=0.0625, real signal=0.20-0.70.
   backend: ai_accel
   model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
-  confidence_threshold: 0.15   # DFL peakiness for xquant-split models
-  iou_threshold: 0.45
+  confidence_threshold: 0.10   # DFL peakiness for xquant-split models (uniform=0.0625)
+  iou_threshold: 0.40
   input_size: [640, 640]
   num_keypoints: 17
   skeleton_type: coco

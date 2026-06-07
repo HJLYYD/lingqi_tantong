@@ -13,9 +13,11 @@ extern "C" {
 #define YOLO11_INPUT_SIZE       320
 
 typedef struct OrtSession OrtSession;
+typedef struct OrtInferenceContext OrtInferenceContext;
 
 typedef struct {
     OrtSession* session;
+    OrtInferenceContext* ctx;
     char input_name[MAX_STRING_LEN];
     int input_width;
     int input_height;

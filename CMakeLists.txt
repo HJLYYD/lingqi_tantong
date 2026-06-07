@@ -193,8 +193,10 @@ set(CORE_SOURCES
     src/utils.c
     src/config_manager.c
     src/ort_common.c
+    src/ort_inference_context.c
     src/core_types.c
     src/k1_platform.c
+    src/yolo_postprocess.c
 )
 
 set(DATA_SOURCES

@@ -11,6 +11,7 @@ extern "C" {
 #define ARCFACE_MAX_FACES       256
 
 typedef struct OrtSession OrtSession;
+typedef struct OrtInferenceContext OrtInferenceContext;
 
 typedef struct {
     char identity[MAX_STRING_LEN];
@@ -20,6 +21,7 @@ typedef struct {
 
 typedef struct {
     OrtSession* session;
+    OrtInferenceContext* ctx;
     char input_name[MAX_STRING_LEN];
     int input_width;
     int input_height;

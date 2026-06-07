@@ -17,9 +17,18 @@ extern "C" {
  * to this range so existing tracks don't get starved by threshold.
  * HIGH=0.20: first-stage matching (new tracks need modest DFL signal).
  * LOW=0.12:  second-stage recovery for momentarily-weak existing tracks. */
-#define TRACKING_IOU_THRESHOLD          0.5f
-#define TRACKING_CONFIDENCE_HIGH        0.20f  /* was 0.30 — too strict for DFL range */
-#define TRACKING_CONFIDENCE_LOW         0.12f  /* was 0.20 — too strict for recovery matching */
+#define TRACKING_IOU_THRESHOLD          0.35f  /* lowered from 0.50: ByteTrack paper uses 0.30-0.40.
+                                                    At 0.35, tracks must overlap moderately well to match.
+                                                    Combined with tighter detector NMS (0.30), this creates
+                                                    a clean filter chain: detector-NMS 0.30 → merge 0.35 →
+                                                    final-NMS 0.35 → track-IoU 0.35. */
+#define TRACKING_CONFIDENCE_HIGH        0.18f  /* raised from 0.20 but calibrated to DFL range.
+                                                    DFL scores range 0.15-0.70 (mean≈0.25 at 0.15 threshold).
+                                                    High=0.18: first-stage matching (new tracks need
+                                                    modest DFL signal + geometry pass). */
+#define TRACKING_CONFIDENCE_LOW         0.12f  /* unchanged: second-stage recovery for existing tracks.
+                                                    Low-confidence dets only recover lost tracks, never
+                                                    create new ones. */
 #define TRACKING_EMA_ALPHA              0.3f
 
 typedef struct {

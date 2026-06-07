@@ -1,6 +1,7 @@
 #include "arcface_recognizer.h"
 #include "logger.h"
 #include "utils.h"
+#include "ort_inference_context.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -36,6 +37,9 @@ ArcFaceRecognizer* arcface_recognizer_create(const char* model_path, int input_w
 
 void arcface_recognizer_destroy(ArcFaceRecognizer* rec) {
     if (!rec) return;
+    if (rec->ctx) {
+        ort_ctx_destroy(rec->ctx);
+    }
     const OrtApi* ort = ort_get_api();
     if (rec->session && ort) {
         ort->ReleaseSession(rec->session);
@@ -95,6 +99,16 @@ bool arcface_recognizer_load_model(ArcFaceRecognizer* rec, const char* model_pat
         rec->input_height = dims[2];
     }
 
+    rec->ctx = ort_ctx_create(rec->session, rec->input_width, rec->input_height, 3);
+    if (!rec->ctx) {
+        log_error("ArcFace: failed to create inference context");
+        const OrtApi* o2 = ort_get_api();
+        if (o2) o2->ReleaseSession(rec->session);
+        rec->session = NULL;
+        return false;
+    }
+    strncpy(rec->ctx->input_name, rec->input_name, sizeof(rec->ctx->input_name) - 1);
+
     log_info("ArcFace model loaded: %s (%.2f MB) input=%dx%d",
              model_path, file_size / (1024.0f * 1024.0f), rec->input_width, rec->input_height);
     return true;
@@ -126,11 +140,8 @@ static void preprocess_arcface(const uint8_t* face_image, int width, int height,
 
 int arcface_recognizer_extract_feature(ArcFaceRecognizer* rec, const uint8_t* face_image, int width, int height,
                                         float* out_feature) {
-    if (!rec || !face_image || !out_feature || !rec->session) return -1;
+    if (!rec || !face_image || !out_feature || !rec->session || !rec->ctx) return -1;
     if (width <= 0 || height <= 0) return -1;
-
-    const OrtApi* ort = ort_get_api();
-    if (!ort) return -1;
 
     int input_w = rec->input_width > 0 ? rec->input_width : 112;
     int input_h = rec->input_height > 0 ? rec->input_height : 112;
@@ -146,85 +157,24 @@ int arcface_recognizer_extract_feature(ArcFaceRecognizer* rec, const uint8_t* fa
 
     preprocess_arcface(face_image, width, height, input_tensor, input_w, input_h);
 
-    int64_t input_shape[4] = {1, 3, input_h, input_w};
-    OrtMemoryInfo* memory_info = NULL;
-    OrtStatus* status = ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("ArcFace: CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
+    if (!ort_ctx_prepare_input(rec->ctx, input_tensor, input_size)) {
         free(input_tensor);
         return -1;
     }
-
-    OrtValue* input_tensor_val = NULL;
-    status = ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
-                                                 input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
-    ort->ReleaseMemoryInfo(memory_info);
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("ArcFace: CreateTensor failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
-        free(input_tensor);
-        return -1;
-    }
-
-    const char* input_names[] = {rec->input_name};
-    OrtValue* input_values[] = {input_tensor_val};
-    OrtValue* output_values[1] = {NULL};
-    const char* output_names[1] = {"fc1"};
-
-    OrtAllocator* allocator = NULL;
-    OrtStatus* st_alloc = ort->GetAllocatorWithDefaultOptions(&allocator);
-    if (st_alloc) ort->ReleaseStatus(st_alloc);
-    char* dynamic_out_name = NULL;
-    if (allocator) {
-        OrtStatus* s = ort->SessionGetOutputName(rec->session, 0, allocator, &dynamic_out_name);
-        if (s) { ort->ReleaseStatus(s); dynamic_out_name = NULL; }
-        else if (dynamic_out_name) output_names[0] = dynamic_out_name;
-    }
-
-    status = ort->Run(rec->session, NULL,
-                      input_names, (const OrtValue* const*)input_values, 1,
-                      output_names, 1, output_values);
-    ort->ReleaseValue(input_tensor_val);
     free(input_tensor);
-    if (dynamic_out_name && allocator) {
-        OrtStatus* st_f = ort->AllocatorFree(allocator, dynamic_out_name);
-        if (st_f) ort->ReleaseStatus(st_f);
-    }
 
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("ArcFace inference failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
-        return -1;
-    }
-    if (!output_values[0]) return -1;
-
-    OrtTensorTypeAndShapeInfo* shape_info = NULL;
-    OrtStatus* st_shape = ort->GetTensorTypeAndShape(output_values[0], &shape_info);
-    if (st_shape) ort->ReleaseStatus(st_shape);
-    size_t num_elements = 0;
-    if (shape_info) {
-        OrtStatus* st_ec = ort->GetTensorShapeElementCount(shape_info, &num_elements);
-        if (st_ec) ort->ReleaseStatus(st_ec);
-        ort->ReleaseTensorTypeAndShapeInfo(shape_info);
-    }
-
-    float* output_data = NULL;
-    status = ort->GetTensorMutableData(output_values[0], (void**)&output_data);
-    if (status || !output_data) {
-        if (status) ort->ReleaseStatus(status);
-        ort->ReleaseValue(output_values[0]);
+    OrtValue* output_values[1] = {NULL};
+    if (ort_ctx_run(rec->ctx, output_values) != 0) {
         return -1;
     }
 
-    int feat_dim = (int)num_elements;
-    if (feat_dim > ARCFACE_FEATURE_DIM) feat_dim = ARCFACE_FEATURE_DIM;
-    if (feat_dim < ARCFACE_FEATURE_DIM) {
-        for (int i = feat_dim; i < ARCFACE_FEATURE_DIM; i++) out_feature[i] = 0.0f;
+    float* output_data = ort_ctx_get_output_data(rec->ctx, output_values[0]);
+    if (!output_data) {
+        ort_ctx_release_outputs(rec->ctx, output_values, 1);
+        return -1;
     }
+
+    int feat_dim = ARCFACE_FEATURE_DIM;
 
     float norm = 0.0f;
     for (int i = 0; i < feat_dim; i++) {
@@ -239,7 +189,7 @@ int arcface_recognizer_extract_feature(ArcFaceRecognizer* rec, const uint8_t* fa
         }
     }
 
-    ort->ReleaseValue(output_values[0]);
+    ort_ctx_release_outputs(rec->ctx, output_values, 1);
     return 0;
 }
 

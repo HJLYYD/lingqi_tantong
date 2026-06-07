@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
 
 /*
  * FFmpeg pipe-based video writer.
@@ -18,6 +19,7 @@ struct VideoWriter {
     int height;
     float fps;
     int frame_count;
+    bool pipe_broken;      /* set when ffmpeg pipe dies (SIGPIPE, write error) */
     char temp_path[512];
 };
 
@@ -30,6 +32,7 @@ VideoWriter* video_writer_create(const char* output_path, int width, int height,
     vw->width  = width;
     vw->height = height;
     vw->fps    = fps;
+    vw->pipe_broken = false;
 
     /*
      * Build ffmpeg command.  -y overwrites output.  -f rawvideo reads
@@ -41,17 +44,26 @@ VideoWriter* video_writer_create(const char* output_path, int width, int height,
      */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "ffmpeg -y -loglevel error "
+        "ffmpeg -y -loglevel quiet "
         "-f rawvideo -vcodec rawvideo "
         "-s %dx%d -pix_fmt rgb24 -r %.0f "
         "-i - "
         "-c:v libx264 -preset ultrafast -crf 23 "
         "-pix_fmt yuv420p "
-        "\"%s\"",
+        "\"%s\"",   /* stderr suppressed: -loglevel quiet already silences ffmpeg;
+                       no 2>/dev/null needed — that breaks pipe error reporting */
         vw->width, vw->height, vw->fps, output_path);
 
     log_info("VideoWriter: launching ffmpeg pipe -> %s", output_path);
+
+    /* Ignore SIGPIPE so we get EPIPE from fwrite() instead of being killed.
+     * Restore previous handler after popen() in case another library needs it. */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
     vw->pipe = popen(cmd, "w");
+
+    signal(SIGPIPE, old_sigpipe);
+
     if (!vw->pipe) {
         log_error("VideoWriter: failed to launch ffmpeg pipe");
         free(vw);
@@ -67,12 +79,22 @@ VideoWriter* video_writer_create(const char* output_path, int width, int height,
 
 int video_writer_write_frame(VideoWriter* vw, const uint8_t* frame_data) {
     if (!vw || !vw->pipe || !frame_data) return -1;
+    if (vw->pipe_broken) return -2;  /* silently skip; ffmpeg already dead */
 
     size_t frame_bytes = (size_t)vw->width * vw->height * 3;
+    clearerr(vw->pipe);
     size_t written = fwrite(frame_data, 1, frame_bytes, vw->pipe);
+
     if (written != frame_bytes) {
-        log_error("VideoWriter: fwrite frame %d failed (%zu/%zu bytes)",
-                  vw->frame_count, written, frame_bytes);
+        if (ferror(vw->pipe)) {
+            int err = ferror(vw->pipe);
+            log_warning("VideoWriter: fwrite frame %d failed (errno=%d), pipe broken — disabling output",
+                        vw->frame_count, err);
+            vw->pipe_broken = true;
+        } else {
+            log_error("VideoWriter: fwrite frame %d partial (%zu/%zu bytes)",
+                      vw->frame_count, written, frame_bytes);
+        }
         return -1;
     }
 
@@ -84,7 +106,7 @@ int video_writer_write_frame(VideoWriter* vw, const uint8_t* frame_data) {
 }
 
 int video_writer_flush(VideoWriter* vw) {
-    if (!vw || !vw->pipe) return -1;
+    if (!vw || !vw->pipe || vw->pipe_broken) return -1;
     fflush(vw->pipe);
     return 0;
 }
@@ -92,10 +114,26 @@ int video_writer_flush(VideoWriter* vw) {
 void video_writer_destroy(VideoWriter* vw) {
     if (!vw) return;
     if (vw->pipe) {
-        fflush(vw->pipe);
+        if (!vw->pipe_broken) {
+            fflush(vw->pipe);
+        }
+        /*
+         * pclose() closes stdin to ffmpeg, signals EOF, then waitpid()s.
+         * ffmpeg may return exit code 2 on SIGPIPE / broken pipe when
+         * stdin closes before it finishes writing the trailer — this is
+         * normal for pipe-based encoding and the output file is still valid.
+         */
         int rc = pclose(vw->pipe);
         if (rc != 0) {
-            log_warning("VideoWriter: ffmpeg exited with code %d", rc);
+            if (vw->pipe_broken) {
+                log_info("VideoWriter: ffmpeg pipe closed (was broken; exit code %d)", rc);
+            } else if (rc == 2) {
+                /* Exit code 2 = SIGPIPE / write error on close — normal
+                 * when stdin closes during trailer write. Output is valid. */
+                log_debug("VideoWriter: ffmpeg exited with code %d (normal pipe EOF)", rc);
+            } else {
+                log_warning("VideoWriter: ffmpeg exited with code %d", rc);
+            }
         } else {
             log_info("VideoWriter: finalized — %d frames", vw->frame_count);
         }

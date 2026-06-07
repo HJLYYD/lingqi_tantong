@@ -5,16 +5,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
-static atomic_bool g_running = true;
+static volatile sig_atomic_t g_running_flag = 1;
 static SystemController* g_sc = NULL;
 
+/*
+ * Signal handler with two-stage shutdown.
+ *
+ * First  signal (Ctrl+C):  set g_running_flag=0 for graceful shutdown.
+ *                          Main loop checks sc->running at top of each frame
+ *                          and will exit cleanly after current inference completes.
+ * Second signal:           _exit(1) immediately — no cleanup, no flushing.
+ *                          Use when ORT inference is stuck for 4+ seconds.
+ *
+ * All functions used are async-signal-safe: write(), _exit().
+ */
 static void signal_handler(int sig) {
     (void)sig;
-    atomic_store(&g_running, false);
-    if (g_sc) g_sc->running = false;
-    log_info("Signal received, shutting down...");
+    static volatile sig_atomic_t count = 0;
+    count++;
+
+    if (count == 1) {
+        const char msg[] = "\nShutting down... (Ctrl+C again to force quit)\n";
+        (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        g_running_flag = 0;
+        if (g_sc) g_sc->running = false;
+    } else {
+        _exit(1);
+    }
 }
 
 static void print_usage(const char* program_name) {
@@ -81,6 +102,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* Ensure logs/ directory exists (ignore failure — logger falls back to stderr) */
+    mkdir("logs", 0755);
     logger_init("logs/system.log", LOG_LEVEL_INFO);
 
     log_info("============================================================");

@@ -242,7 +242,7 @@ static const uint8_t FONT_5X7[96][7] = {
 };
 
 static void draw_text(uint8_t* img, int width, int height, int x, int y,
-                      const char* text, const uint8_t color[3]) __attribute__((unused));
+                      const char* text, const uint8_t color[3]);
 static void draw_text(uint8_t* img, int width, int height, int x, int y,
                       const char* text, const uint8_t color[3]) {
     if (!text || !img || width <= 0 || height <= 0) return;
@@ -282,7 +282,12 @@ static void draw_text(uint8_t* img, int width, int height, int x, int y,
 static void draw_label(uint8_t* img, int width, int height, const TrackedObject* obj,
                        int x1, int y1, const uint8_t color[3]) {
     char label[MAX_LABEL_LEN];
-    snprintf(label, sizeof(label), "Person#%d | %.1fm", obj->track_id, spatial_distance_from_origin(&obj->spatial_pos));
+    const char* class_name = obj->detection.class_name[0] != '\0'
+                             ? obj->detection.class_name : "person";
+    snprintf(label, sizeof(label), "%s#%d %.0f%% | %.1fm",
+             class_name, obj->track_id,
+             obj->detection.confidence * 100.0f,
+             spatial_distance_from_origin(&obj->spatial_pos));
 
     if (obj->has_height) {
         char height_str[32];
@@ -318,6 +323,12 @@ static void draw_label(uint8_t* img, int width, int height, const TrackedObject*
                 img[idx + 2] = color[0];
             }
         }
+    }
+
+    /* Draw text on top of label background in white for contrast */
+    {
+        uint8_t white[3] = {255, 255, 255};
+        draw_text(img, width, height, label_x + 3, label_y + 3, label, white);
     }
 }
 

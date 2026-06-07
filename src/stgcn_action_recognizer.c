@@ -9,6 +9,7 @@
 #ifdef HAS_ONNX_RUNTIME
 #include <onnxruntime_c_api.h>
 #include "ort_common.h"
+#include "ort_inference_context.h"
 #else
 #error "stgcn_action_recognizer requires HAS_ONNX_RUNTIME (real inference only - no heuristic fallback)"
 #endif
@@ -72,6 +73,7 @@ STGCNActionRecognizer* stgcn_action_recognizer_create(const char* model_path,
 
 void stgcn_action_recognizer_destroy(STGCNActionRecognizer* recognizer) {
     if (!recognizer) return;
+    ort_ctx_destroy(recognizer->ctx);
     const OrtApi* g_ort = ort_get_api();
     if (recognizer->session && g_ort) {
         g_ort->ReleaseSession(recognizer->session);
@@ -96,6 +98,14 @@ bool stgcn_action_recognizer_load_model(STGCNActionRecognizer* recognizer, const
     if (!recognizer->session) {
         log_error("STGCNActionRecognizer: failed to create ONNX session for %s", model_path);
         return false;
+    }
+
+    recognizer->ctx = ort_ctx_create(recognizer->session,
+                                      recognizer->num_frames,
+                                      recognizer->num_keypoints,
+                                      STGCN_NUM_CHANNELS);
+    if (recognizer->ctx) {
+        recognizer->ctx->input_name[0] = '\0';
     }
 
     const OrtApi* ort = ort_get_api();
@@ -253,21 +263,12 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     int64_t pts_shape[4] = {1, C, T, V};
     size_t pts_bytes = tensor_count * sizeof(float);
 
-    OrtMemoryInfo* mem_info = NULL;
-    OrtStatus* status = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
-    if (status) {
-        g_ort->ReleaseStatus(status);
-        free(pts_tensor);
-        return result;
-    }
-
     OrtValue* pts_ort = NULL;
-    status = g_ort->CreateTensorWithDataAsOrtValue(
-        mem_info, pts_tensor, pts_bytes,
+    OrtStatus* status = g_ort->CreateTensorWithDataAsOrtValue(
+        recognizer->ctx->memory_info, pts_tensor, pts_bytes,
         pts_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &pts_ort);
     if (status) {
         g_ort->ReleaseStatus(status);
-        g_ort->ReleaseMemoryInfo(mem_info);
         free(pts_tensor);
         return result;
     }
@@ -310,14 +311,13 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
 
         int64_t mot_shape[4] = {1, MOT_C, T, V};
         status = g_ort->CreateTensorWithDataAsOrtValue(
-            mem_info, mot_tensor, mot_count * sizeof(float),
+            recognizer->ctx->memory_info, mot_tensor, mot_count * sizeof(float),
             mot_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &mot_ort);
         if (status) {
             g_ort->ReleaseStatus(status);
             mot_ort = NULL;
         }
     }
-    g_ort->ReleaseMemoryInfo(mem_info);
     free(pts_tensor);
     free(mot_tensor);
 

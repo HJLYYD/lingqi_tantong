@@ -2,6 +2,7 @@
 #define YOLOV5_FACE_DETECTOR_H
 
 #include "core_types.h"
+#include "ort_inference_context.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,6 +14,7 @@ typedef struct OrtSession OrtSession;
 
 typedef struct {
     OrtSession* session;
+    OrtInferenceContext* ctx;
     char input_name[MAX_STRING_LEN];
     int input_width;
     int input_height;

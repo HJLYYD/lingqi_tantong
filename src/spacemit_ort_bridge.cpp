@@ -518,6 +518,27 @@ extern "C" int spacemit_ort_session_options_init(OrtSessionOptions* c_session_op
         Ort::SessionOptions opts(c_session_opts);
         std::unordered_map<std::string, std::string> provider_options;
         provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(g_ep_intra_threads);
+
+        /*
+         * ── Global intra-op thread pool (SHARED across all EP sessions) ──
+         *
+         * SpacemiT EP by default creates a SEPARATE intra-op thread pool
+         * per session, each with its own TCM workspace allocation.  With 4
+         * sessions, that's 4 independent pools fighting for 512KB shared
+         * TCM → "tcm buffer acquire failed" at Run().
+         *
+         * SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD=1 makes all EP sessions in
+         * the same process share ONE intra-op thread pool.  This works
+         * because our inference pipeline runs models SEQUENTIALLY (not
+         * concurrently) — only one model is ever running at a time.
+         * Threads + TCM workspace are reused, not duplicated.
+         *
+         * Result: 4 EP sessions × intra=N → 1 shared pool of N threads
+         *         TCM footprint per EP session ≈ 0 (reuses shared pool)
+         *         Total TCM: N × ~170KB instead of sessions × N × ~170KB
+         */
+        provider_options["SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD"] = "1";
+
         Ort::Status status = Ort::SessionOptionsSpaceMITEnvInit(opts, provider_options);
         opts.release();
         if (status.IsOK()) {

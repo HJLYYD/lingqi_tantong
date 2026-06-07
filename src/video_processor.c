@@ -495,7 +495,7 @@ int video_processor_open(VideoProcessor* vp, const char* input_path) {
      * encoding).  -an -sn skip audio/subtitle streams for speed. */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "ffmpeg -v error -i \"%s\" -an -sn -f rawvideo -pix_fmt rgb24 "
+        "ffmpeg -v quiet -i \"%s\" -an -sn -f rawvideo -pix_fmt rgb24 "
         "-vcodec rawvideo -",
         vp->input_path);
 
@@ -535,7 +535,8 @@ void video_processor_close(VideoProcessor* vp) {
     /* Close ffmpeg decode pipe (file source) */
     if (vp->decode_pipe) {
         int rc = pclose(vp->decode_pipe);
-        if (rc != 0) {
+        if (rc != 0 && rc != 2) {
+            /* Exit code 2 = SIGPIPE on close — normal for pipe decode */
             log_warning("VideoProcessor: ffmpeg decoder exited with code %d", rc);
         }
         vp->decode_pipe = NULL;

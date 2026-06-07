@@ -1,10 +1,13 @@
 #include "yolov8_pose_estimator.h"
 #include "logger.h"
 #include "utils.h"
+#include "ort_inference_context.h"
+#include "yolo_postprocess.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #ifdef HAS_ONNX_RUNTIME
 #include <onnxruntime_c_api.h>
@@ -62,6 +65,13 @@ YOLOv8PoseEstimator* yolov8_pose_estimator_create(const char* model_path, int in
     est->confidence_threshold = conf_thresh;
     est->iou_threshold = iou_thresh;
 
+    /* Cache invalid until first frame probes output format */
+    est->format_cached = false;
+    est->cached_num_outputs = 0;
+    est->is_xquant_split = false;
+    est->num_pose_groups = 0;
+    memset(est->pose_split_groups, -1, sizeof(est->pose_split_groups));
+
     if (!model_path || !yolov8_pose_estimator_load_model(est, model_path)) {
         log_error("YOLOv8PoseEstimator: failed to load model %s", model_path ? model_path : "(null)");
         free(est);
@@ -73,6 +83,7 @@ YOLOv8PoseEstimator* yolov8_pose_estimator_create(const char* model_path, int in
 
 void yolov8_pose_estimator_destroy(YOLOv8PoseEstimator* est) {
     if (!est) return;
+    ort_ctx_destroy(est->ctx);
     const OrtApi* ort = ort_get_api();
     if (est->session && ort) {
         ort->ReleaseSession(est->session);
@@ -119,77 +130,20 @@ bool yolov8_pose_estimator_load_model(YOLOv8PoseEstimator* est, const char* mode
 
     log_info("YOLOv8-Pose model loaded: %s (%.2f MB) input=%dx%d",
              model_path, file_size / (1024.0f * 1024.0f), est->input_width, est->input_height);
-    return true;
-}
 
-static void softmax_stable_pose(float* x, int n) {
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] > max_val) max_val = x[i];
+    est->ctx = ort_ctx_create(est->session, est->input_width, est->input_height, 3);
+    if (!est->ctx) {
+        log_error("YOLOv8Pose: failed to create inference context");
+        return false;
     }
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    float inv = (sum > 1e-12f) ? (1.0f / sum) : 1.0f;
-    for (int i = 0; i < n; i++) x[i] *= inv;
+    strncpy(est->ctx->input_name, est->input_name, sizeof(est->ctx->input_name) - 1);
+
+    return true;
 }
 
 static int detect_pose_xquant_split(size_t num_outputs, OrtValue** all_output_vals,
                                      int group_indices[3][3]) {
-    if (num_outputs < 3 || num_outputs % 3 != 0) return 0;
-    const OrtApi* ort = ort_get_api();
-    if (!ort) return 0;
-
-    int out_hw[12] = {0}, out_c[12] = {0};
-    int valid = 0;
-    for (size_t oi = 0; oi < num_outputs && oi < 12; oi++) {
-        OrtTensorTypeAndShapeInfo* si = NULL;
-        if (ort->GetTensorTypeAndShape(all_output_vals[oi], &si)) continue;
-        size_t nd = 0;
-        { OrtStatus* _s = ort->GetDimensionsCount(si, &nd); if (_s) ort->ReleaseStatus(_s); }
-        int64_t dims[4] = {0};
-        { OrtStatus* _s = ort->GetDimensions(si, dims, nd); if (_s) ort->ReleaseStatus(_s); }
-        ort->ReleaseTensorTypeAndShapeInfo(si);
-        if (nd < 3 || dims[0] != 1) continue;
-        out_c[oi] = (int)dims[1];
-        int h = (int)dims[2], w = (nd >= 4) ? (int)dims[3] : 1;
-        out_hw[oi] = h * w;
-        valid++;
-    }
-    if (valid != (int)num_outputs) return 0;
-
-    int num_groups = 0;
-    bool used[12] = {false};
-    for (size_t i = 0; i < num_outputs && num_groups < 3; i++) {
-        if (used[i]) continue;
-        int hw_i = out_hw[i];
-        int group[3] = {(int)i, -1, -1};
-        int found = 1;
-        for (size_t j = i + 1; j < num_outputs && found < 3; j++) {
-            if (used[j]) continue;
-            if (out_hw[j] == hw_i) { group[found++] = (int)j; used[j] = true; }
-        }
-        if (found == 3) {
-            used[i] = true;
-            int reg_idx = -1, cls_idx = -1, kpt_idx = -1;
-            for (int k = 0; k < 3; k++) {
-                int ch = out_c[group[k]];
-                if (ch >= 60 && ch <= 70) reg_idx = group[k];
-                else if (ch >= 40 && ch <= 60) kpt_idx = group[k];
-                else cls_idx = group[k];
-            }
-            if (reg_idx >= 0 && kpt_idx >= 0) {
-                group_indices[num_groups][0] = reg_idx;
-                group_indices[num_groups][1] = cls_idx >= 0 ? cls_idx : -1;
-                group_indices[num_groups][2] = kpt_idx;
-                num_groups++;
-            }
-        }
-    }
-    if (num_groups != (int)(num_outputs / 3)) return 0;
-    return num_groups;
+    return yolo_detect_xquant_split(num_outputs, all_output_vals, group_indices, 1);
 }
 
 /*
@@ -239,47 +193,13 @@ static float compute_oks(const PoseEstimation* a, const PoseEstimation* b) {
     return oks_sum / (float)valid;
 }
 
-static int nms_pose(PoseEstimation* poses, int num_poses, float iou_threshold) {
-    if (num_poses <= 0) return 0;
-
-    /* Sort by confidence descending */
-    for (int i = 0; i < num_poses - 1; i++) {
-        for (int j = i + 1; j < num_poses; j++) {
-            if (poses[i].confidence < poses[j].confidence) {
-                PoseEstimation tmp = poses[i];
-                poses[i] = poses[j];
-                poses[j] = tmp;
-            }
-        }
+static float pose_similarity(const void* a, const void* b) {
+    const PoseEstimation* pa = (const PoseEstimation*)a;
+    const PoseEstimation* pb = (const PoseEstimation*)b;
+    if (pa->has_bbox && pb->has_bbox) {
+        return compute_oks(pa, pb);
     }
-
-    bool* suppressed = (bool*)calloc((size_t)num_poses, sizeof(bool));
-    if (!suppressed) return num_poses;
-
-    int keep_count = 0;
-    for (int i = 0; i < num_poses; i++) {
-        if (suppressed[i]) continue;
-        poses[keep_count++] = poses[i];
-
-        for (int j = i + 1; j < num_poses; j++) {
-            if (suppressed[j]) continue;
-            /* Use OKS when both poses have valid bboxes, fall back to IoU */
-            float similarity;
-            if (poses[i].has_bbox && poses[j].has_bbox) {
-                similarity = compute_oks(&poses[i], &poses[j]);
-            } else {
-                similarity = poses[i].has_bbox && poses[j].has_bbox ?
-                             bbox_iou(&poses[i].bbox, &poses[j].bbox) : 0.0f;
-            }
-            /* OKS threshold: 0.65 is roughly equivalent to IoU 0.5 in density */
-            if (similarity > iou_threshold) {
-                suppressed[j] = true;
-            }
-        }
-    }
-
-    free(suppressed);
-    return keep_count;
+    return bbox_iou(&pa->bbox, &pb->bbox);
 }
 
 int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* image_data, int width, int height,
@@ -307,101 +227,46 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
 
     float scale = 1.0f;
     int pad_x = 0, pad_y = 0;
-    uint8_t* resized = (uint8_t*)malloc(pixels * 3);
-    if (!resized) {
-        free(input_tensor);
-        log_error("YOLOv8Pose: resize buffer malloc failed");
-        return 0;
-    }
-    utils_letterbox(image_data, width, height, resized, input_w, input_h, 3, &scale, &pad_x, &pad_y);
+    int crop_x = 0, crop_y = 0;
+    yolo_preprocess(image_data, width, height, input_tensor,
+                    input_w, input_h, &scale, &pad_x, &pad_y, &crop_x, &crop_y);
 
-    for (int y = 0; y < input_h; y++) {
-        for (int x = 0; x < input_w; x++) {
-            int src_idx = (y * input_w + x) * 3;
-            input_tensor[0 * (int)pixels + y * input_w + x] = resized[src_idx + 0] / 255.0f;
-            input_tensor[1 * (int)pixels + y * input_w + x] = resized[src_idx + 1] / 255.0f;
-            input_tensor[2 * (int)pixels + y * input_w + x] = resized[src_idx + 2] / 255.0f;
-        }
-    }
-    free(resized);
-
-    int64_t input_shape[4] = {1, 3, input_h, input_w};
-    OrtMemoryInfo* memory_info = NULL;
-    OrtStatus* status = ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("YOLOv8Pose: CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
+    if (!ort_ctx_prepare_input(est->ctx, input_tensor, input_size)) {
+        log_error("YOLOv8Pose: prepare input failed");
         free(input_tensor);
         return 0;
     }
-
-    OrtValue* input_tensor_val = NULL;
-    status = ort->CreateTensorWithDataAsOrtValue(memory_info, input_tensor, input_size,
-                                                 input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_val);
-    ort->ReleaseMemoryInfo(memory_info);
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("YOLOv8Pose: CreateTensor failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
-        free(input_tensor);
-        return 0;
-    }
-
-    /* ── Multi-output query (handles truncated xquant models) ── */
-    size_t num_outputs = 0;
-    OrtStatus* st_oc = ort->SessionGetOutputCount(est->session, &num_outputs);
-    if (st_oc) { ort->ReleaseStatus(st_oc); num_outputs = 1; }
-    if (num_outputs == 0) num_outputs = 1;
-
-    OrtAllocator* allocator = NULL;
-    OrtStatus* st_alloc = ort->GetAllocatorWithDefaultOptions(&allocator);
-    if (st_alloc) ort->ReleaseStatus(st_alloc);
-
-    const char** all_output_names = (const char**)calloc(num_outputs, sizeof(char*));
-    OrtValue**  all_output_vals   = (OrtValue**)calloc(num_outputs, sizeof(OrtValue*));
-    if (!all_output_names || !all_output_vals) {
-        free(all_output_names); free(all_output_vals);
-        ort->ReleaseValue(input_tensor_val);
-        free(input_tensor);
-        return 0;
-    }
-
-    bool names_ok = true;
-    for (size_t oi = 0; oi < num_outputs; oi++) {
-        char* name_ptr = NULL;
-        OrtStatus* s = ort->SessionGetOutputName(est->session, oi, allocator, &name_ptr);
-        if (s || !name_ptr) { if (s) ort->ReleaseStatus(s); names_ok = false; break; }
-        all_output_names[oi] = name_ptr;
-    }
-    if (!names_ok) {
-        for (size_t oi = 0; oi < num_outputs; oi++) {
-            if (all_output_names[oi]) { OrtStatus* sf = ort->AllocatorFree(allocator, (void*)all_output_names[oi]); if (sf) ort->ReleaseStatus(sf); }
-        }
-        free(all_output_names); free(all_output_vals);
-        ort->ReleaseValue(input_tensor_val);
-        free(input_tensor);
-        return 0;
-    }
-
-    const char* input_names[] = {est->input_name};
-    OrtValue*   input_vals[]  = {input_tensor_val};
-
-    status = ort->Run(est->session, NULL,
-                      input_names, (const OrtValue* const*)input_vals, 1,
-                      (const char* const*)all_output_names, num_outputs, all_output_vals);
-    ort->ReleaseValue(input_tensor_val);
     free(input_tensor);
 
-    for (size_t oi = 0; oi < num_outputs; oi++) {
-        if (all_output_names[oi]) { OrtStatus* sf = ort->AllocatorFree(allocator, (void*)all_output_names[oi]); if (sf) ort->ReleaseStatus(sf); }
-    }
-    free(all_output_names);
+    size_t num_outputs;
+    bool is_split;
+    int pose_split_groups[3][3];
+    int num_pose_groups;
 
-    if (status) {
-        const char* msg = ort->GetErrorMessage(status);
-        log_error("YOLOv8Pose inference failed: %s", msg ? msg : "unknown");
-        ort->ReleaseStatus(status);
+    if (est->format_cached) {
+        num_outputs     = (size_t)est->cached_num_outputs;
+        is_split        = est->is_xquant_split;
+        num_pose_groups = est->num_pose_groups;
+        memcpy(pose_split_groups, est->pose_split_groups, sizeof(pose_split_groups));
+    } else {
+        OrtStatus* st_oc = ort->SessionGetOutputCount(est->session, &num_outputs);
+        if (st_oc) { ort->ReleaseStatus(st_oc); num_outputs = 1; }
+        if (num_outputs == 0) num_outputs = 1;
+    }
+
+    OrtValue** all_output_vals = (OrtValue**)calloc(num_outputs, sizeof(OrtValue*));
+    if (!all_output_vals) {
+        return 0;
+    }
+
+    int64_t t_run_start = utils_get_time_ms();
+
+    int run_rc = ort_ctx_run(est->ctx, all_output_vals);
+
+    int64_t t_run_ms = utils_get_time_ms() - t_run_start;
+
+    if (run_rc != 0) {
+        log_error("YOLOv8Pose inference failed");
         for (size_t oi = 0; oi < num_outputs; oi++) {
             if (all_output_vals[oi]) ort->ReleaseValue(all_output_vals[oi]);
         }
@@ -410,47 +275,62 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
     }
 
     /*
+     * ── Format detection (first frame only) ──
+     *
      * Detect xquant-split format. For pose models, the split is:
      *   {[1,64,H,W], [1,1,H,W], [1,51,H,W]} × 3 strides
      * 64ch = DFL regression (4 coords × 16 bins)
-     * 1ch  = objectness (likely broken ~0.5, same as YOLO11 detector)
+     * 1ch  = objectness (likely broken ~0.5)
      * 51ch = keypoints (17 kpts × 3: x, y, conf)
      *
-     * As with the YOLO11 detector, the cls/obj heads are broken by INT8
-     * quantization. We use DFL peakiness as the confidence signal and
-     * decode keypoints from the 51ch output. The kpt head may also be
-     * partially broken; if keypoint confidences are all ~0.5, we still
-     * get valid bounding boxes from DFL.
+     * The cls/obj heads are broken by INT8 quantization. We use DFL
+     * peakiness as the confidence signal and decode keypoints from the
+     * 51ch output.
      */
-
-    /* Diagnostic: log output shapes to help debug format detection */
-    log_info("YOLOv8Pose: %zu outputs, probing shapes...", num_outputs);
-    for (size_t oi = 0; oi < num_outputs && oi < 12; oi++) {
-        if (!all_output_vals[oi]) { log_info("YOLOv8Pose output[%zu]: NULL", oi); continue; }
-        OrtTensorTypeAndShapeInfo* si = NULL;
-        OrtStatus* st = ort->GetTensorTypeAndShape(all_output_vals[oi], &si);
-        if (st || !si) {
-            if (st) ort->ReleaseStatus(st);
-            log_info("YOLOv8Pose output[%zu]: GetTensorTypeAndShape failed", oi);
-            continue;
+    if (!est->format_cached) {
+        /* First frame: probe and cache */
+        log_info("YOLOv8Pose: %zu outputs, probing shapes (frame 0)...", num_outputs);
+        for (size_t oi = 0; oi < num_outputs && oi < 12; oi++) {
+            if (!all_output_vals[oi]) continue;
+            OrtTensorTypeAndShapeInfo* si = NULL;
+            OrtStatus* st = ort->GetTensorTypeAndShape(all_output_vals[oi], &si);
+            if (st || !si) { if (st) ort->ReleaseStatus(st); continue; }
+            size_t nd = 0;
+            { OrtStatus* _s = ort->GetDimensionsCount(si, &nd); if (_s) ort->ReleaseStatus(_s); }
+            int64_t dims[4] = {0};
+            { OrtStatus* _s = ort->GetDimensions(si, dims, nd < 4 ? nd : 4); if (_s) ort->ReleaseStatus(_s); }
+            ONNXTensorElementDataType dt;
+            { OrtStatus* _s = ort->GetTensorElementType(si, &dt); if (_s) ort->ReleaseStatus(_s); }
+            ort->ReleaseTensorTypeAndShapeInfo(si);
+            log_debug("YOLOv8Pose output[%zu]: nd=%zu dims=[%lld,%lld,%lld,%lld] type=%d",
+                     oi, nd, (long long)dims[0], (long long)dims[1],
+                     (long long)dims[2], (long long)dims[3], (int)dt);
         }
-        size_t nd = 0;
-        { OrtStatus* _s = ort->GetDimensionsCount(si, &nd); if (_s) ort->ReleaseStatus(_s); }
-        int64_t dims[4] = {0};
-        { OrtStatus* _s = ort->GetDimensions(si, dims, nd < 4 ? nd : 4); if (_s) ort->ReleaseStatus(_s); }
-        ONNXTensorElementDataType dt;
-        { OrtStatus* _s = ort->GetTensorElementType(si, &dt); if (_s) ort->ReleaseStatus(_s); }
-        ort->ReleaseTensorTypeAndShapeInfo(si);
-        log_info("YOLOv8Pose output[%zu]: nd=%zu dims=[%lld,%lld,%lld,%lld] type=%d",
-                 oi, nd, (long long)dims[0], (long long)dims[1], (long long)dims[2], (long long)dims[3], (int)dt);
+
+        memset(pose_split_groups, -1, sizeof(pose_split_groups));
+        num_pose_groups = detect_pose_xquant_split(num_outputs, all_output_vals, pose_split_groups);
+
+        /* Cache for all subsequent frames */
+        est->cached_num_outputs = (int)num_outputs;
+        est->is_xquant_split    = (num_pose_groups > 0);
+        est->num_pose_groups    = num_pose_groups;
+        memcpy(est->pose_split_groups, pose_split_groups, sizeof(pose_split_groups));
+        est->format_cached      = true;
+
+        if (num_pose_groups > 0) {
+            log_info("YOLOv8Pose: detected xquant-split format with %d stride groups (cached)", num_pose_groups);
+        } else {
+            log_info("YOLOv8Pose: standard decode format (cached, %zu outputs)", num_outputs);
+        }
+
+        is_split = est->is_xquant_split;
+    } else {
+        is_split        = est->is_xquant_split;
+        num_pose_groups = est->num_pose_groups;
+        memcpy(pose_split_groups, est->pose_split_groups, sizeof(pose_split_groups));
     }
 
-    int pose_split_groups[3][3] = {{-1,-1,-1},{-1,-1,-1},{-1,-1,-1}};
-    int num_pose_groups = detect_pose_xquant_split(num_outputs, all_output_vals, pose_split_groups);
-
-    if (num_pose_groups > 0) {
-        log_info("YOLOv8Pose: detected xquant-split format with %d stride groups (DFL decode active)",
-                 num_pose_groups);
+    if (is_split) {
 
         PoseEstimation* temp_poses = (PoseEstimation*)calloc(POSE_MAX_PROPOSALS, sizeof(PoseEstimation));
         if (!temp_poses) {
@@ -512,25 +392,7 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
                     int pix = gy * reg_w + gx;
 
                     float dists[4];
-                    float dfl_peaks[4];
-                    for (int coord = 0; coord < 4; coord++) {
-                        float bins[16];
-                        int base = coord * 16;
-                        for (int b = 0; b < 16; b++) {
-                            bins[b] = reg_data[(base + b) * hw + pix];
-                        }
-                        softmax_stable_pose(bins, 16);
-                        float max_bin = bins[0];
-                        float val = 0.0f;
-                        for (int b = 0; b < 16; b++) {
-                            if (bins[b] > max_bin) max_bin = bins[b];
-                            val += bins[b] * (float)b;
-                        }
-                        dfl_peaks[coord] = max_bin;
-                        dists[coord] = val;
-                    }
-                    float dfl_conf = sqrtf(sqrtf(
-                        dfl_peaks[0] * dfl_peaks[1] * dfl_peaks[2] * dfl_peaks[3]));
+                    float dfl_conf = yolo_dfl_decode_position(reg_data, pix, hw, dists);
 
                     if (dfl_conf < est->confidence_threshold) continue;
 
@@ -539,15 +401,11 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
                     float x2_grid = ((float)gx + 0.5f) + dists[2];
                     float y2_grid = ((float)gy + 0.5f) + dists[3];
 
-                    float x1_model = x1_grid * (float)stride;
-                    float y1_model = y1_grid * (float)stride;
-                    float x2_model = x2_grid * (float)stride;
-                    float y2_model = y2_grid * (float)stride;
-
-                    float x1 = (x1_model - pad_x) / scale;
-                    float y1 = (y1_model - pad_y) / scale;
-                    float x2 = (x2_model - pad_x) / scale;
-                    float y2 = (y2_model - pad_y) / scale;
+                    float x1, y1, x2, y2;
+                    yolo_map_to_original(x1_grid * (float)stride, y1_grid * (float)stride,
+                                        scale, pad_x, pad_y, crop_x, crop_y, &x1, &y1);
+                    yolo_map_to_original(x2_grid * (float)stride, y2_grid * (float)stride,
+                                        scale, pad_x, pad_y, crop_x, crop_y, &x2, &y2);
 
                     x1 = UTILS_CLAMP(x1, 0.0f, (float)(width - 1));
                     y1 = UTILS_CLAMP(y1, 0.0f, (float)(height - 1));
@@ -573,13 +431,7 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
                         float kc = kpt_data[(k * 3 + 2) * hw + pix];
                         kc = 1.0f / (1.0f + expf(-kc));
 
-                        kx = (kx - pad_x) / scale;
-                        ky = (ky - pad_y) / scale;
-
-                        /* ── Keypoint visibility gating ──
-                         * Keypoints with confidence < 0.3 are typically
-                         * occluded or outside the frame.  Mark them as
-                         * invalid so downstream consumers skip them. */
+                        yolo_map_to_original(kx, ky, scale, pad_x, pad_y, crop_x, crop_y, &kx, &ky);
                         if (kc >= 0.3f) {
                             pose->keypoints[k].x = UTILS_CLAMP(kx, 0.0f, (float)(width - 1));
                             pose->keypoints[k].y = UTILS_CLAMP(ky, 0.0f, (float)(height - 1));
@@ -612,46 +464,20 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
 
         if (num_temp == 0) { free(temp_poses); return 0; }
 
-        for (int i = 0; i < num_temp - 1; i++) {
-            for (int j = i + 1; j < num_temp; j++) {
-                if (temp_poses[i].confidence < temp_poses[j].confidence) {
-                    PoseEstimation tmp = temp_poses[i];
-                    temp_poses[i] = temp_poses[j];
-                    temp_poses[j] = tmp;
-                }
-            }
-        }
-
-        if (num_temp > POSE_TOP_K_PROPOSALS) num_temp = POSE_TOP_K_PROPOSALS;
-
-        bool* suppressed = (bool*)calloc((size_t)num_temp, sizeof(bool));
-        int num_poses = 0;
-        if (suppressed) {
-            for (int i = 0; i < num_temp && num_poses < max_poses; i++) {
-                if (suppressed[i]) continue;
-                out_poses[num_poses++] = temp_poses[i];
-                for (int j = i + 1; j < num_temp; j++) {
-                    if (suppressed[j]) continue;
-                    if (temp_poses[i].has_bbox && temp_poses[j].has_bbox) {
-                        if (bbox_iou(&temp_poses[i].bbox, &temp_poses[j].bbox) > est->iou_threshold) {
-                            suppressed[j] = true;
-                        }
-                    }
-                }
-            }
-            free(suppressed);
-        } else {
-            num_poses = UTILS_MIN(num_temp, max_poses);
-            memcpy(out_poses, temp_poses, (size_t)num_poses * sizeof(PoseEstimation));
-        }
+        num_temp = yolo_nms_suppress(temp_poses, num_temp, sizeof(PoseEstimation),
+                                      est->confidence_threshold, est->iou_threshold,
+                                      max_poses, pose_similarity,
+                                      offsetof(PoseEstimation, confidence));
+        int num_poses = UTILS_MIN(num_temp, max_poses);
+        memcpy(out_poses, temp_poses, (size_t)num_poses * sizeof(PoseEstimation));
         free(temp_poses);
 
-        log_debug("YOLOv8Pose: %d poses after DFL+NMS", num_poses);
+        log_debug("YOLOv8Pose: %d poses after DFL+NMS (ORT Run: %lld ms)", num_poses, (long long)t_run_ms);
         return num_poses;
     }
 
     /* ── Standard decode path (non-xquant-split model) ── */
-    log_info("YOLOv8Pose: xquant-split not detected, falling back to standard decode (%zu outputs)", num_outputs);
+    log_debug("YOLOv8Pose: standard decode path (%zu outputs)", num_outputs);
     OrtValue* output_val = all_output_vals[0];
     for (size_t oi = 0; oi < num_outputs; oi++) {
         if (all_output_vals[oi]) { output_val = all_output_vals[oi]; break; }
@@ -697,9 +523,9 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
     }
 
     float* output_data = NULL;
-    status = ort->GetTensorMutableData(output_val, (void**)&output_data);
-    if (status || !output_data) {
-        if (status) ort->ReleaseStatus(status);
+    OrtStatus* st_data = ort->GetTensorMutableData(output_val, (void**)&output_data);
+    if (st_data || !output_data) {
+        if (st_data) ort->ReleaseStatus(st_data);
         ort->ReleaseValue(output_val);
         for (size_t oi = 0; oi < num_outputs; oi++) {
             if (all_output_vals[oi] && all_output_vals[oi] != output_val) {
@@ -737,17 +563,70 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
         return 0;
     }
 
+    /*
+     * ── Top-K pre-filter for standard decode ──
+     *
+     * Standard YOLO output has 8400 proposals (80×80+40×40+20×20).
+     * Most are background.  We build a sorted index of confidences,
+     * keep only the top K, then decode and NMS.  This reduces NMS
+     * complexity from O(8400²) to O(K²) — a 70× speedup at K=100.
+     */
+    #define POSE_STANDARD_TOP_K 150
+    typedef struct { float conf; int idx; } PoseCandidate;
+    PoseCandidate* candidates = NULL;
+    int* top_indices = NULL;
+    int orig_num_proposals = num_proposals;  /* save before Top-K truncation for transposed index math */
+
+    if (num_proposals > POSE_STANDARD_TOP_K) {
+        candidates = (PoseCandidate*)calloc((size_t)num_proposals, sizeof(PoseCandidate));
+        if (candidates) {
+            for (int i = 0; i < num_proposals; i++) {
+                float conf;
+                if (transposed_layout) {
+                    conf = output_data[4 * num_proposals + i];  /* 5th attr: objectness */
+                } else {
+                    conf = output_data[i * expected_stride + 4];
+                }
+                candidates[i].conf = conf;
+                candidates[i].idx = i;
+            }
+            /* Partial sort: top K bubble to front */
+            for (int i = 0; i < POSE_STANDARD_TOP_K && i < num_proposals; i++) {
+                int best = i;
+                for (int j = i + 1; j < num_proposals; j++) {
+                    if (candidates[j].conf > candidates[best].conf) best = j;
+                }
+                if (best != i) {
+                    PoseCandidate tmp = candidates[i];
+                    candidates[i] = candidates[best];
+                    candidates[best] = tmp;
+                }
+            }
+            top_indices = (int*)calloc(POSE_STANDARD_TOP_K, sizeof(int));
+            if (top_indices) {
+                for (int i = 0; i < POSE_STANDARD_TOP_K; i++) {
+                    top_indices[i] = candidates[i].idx;
+                }
+            }
+            num_proposals = POSE_STANDARD_TOP_K;
+            free(candidates);
+            candidates = NULL;
+        }
+    }
+
     int num_poses = 0;
-    for (int i = 0; i < num_proposals && num_poses < max_poses; i++) {
+    for (int pi = 0; pi < num_proposals && num_poses < max_poses; pi++) {
+        int idx = (top_indices) ? top_indices[pi] : pi;
         float cx, cy, bw_box, bh_box, conf;
         if (transposed_layout) {
-            cx = output_data[0 * num_proposals + i];
-            cy = output_data[1 * num_proposals + i];
-            bw_box = output_data[2 * num_proposals + i];
-            bh_box = output_data[3 * num_proposals + i];
-            conf = output_data[4 * num_proposals + i];
+            /* transposed: each attribute is a row of orig_num_proposals elements */
+            cx = output_data[0 * orig_num_proposals + idx];
+            cy = output_data[1 * orig_num_proposals + idx];
+            bw_box = output_data[2 * orig_num_proposals + idx];
+            bh_box = output_data[3 * orig_num_proposals + idx];
+            conf = output_data[4 * orig_num_proposals + idx];
         } else {
-            const float* row = output_data + i * expected_stride;
+            const float* row = output_data + idx * expected_stride;
             cx = row[0];
             cy = row[1];
             bw_box = row[2];
@@ -757,8 +636,8 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
 
         if (conf < est->confidence_threshold) continue;
 
-        float x_center = (cx - pad_x) / scale;
-        float y_center = (cy - pad_y) / scale;
+        float x_center, y_center;
+        yolo_map_to_original(cx, cy, scale, pad_x, pad_y, crop_x, crop_y, &x_center, &y_center);
         float box_w = bw_box / scale;
         float box_h = bh_box / scale;
 
@@ -774,18 +653,17 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
         for (int k = 0; k < YOLOV8_POSE_NUM_KEYPOINTS; k++) {
             float kx, ky, kc;
             if (transposed_layout) {
-                kx = output_data[(5 + k * 3 + 0) * num_proposals + i];
-                ky = output_data[(5 + k * 3 + 1) * num_proposals + i];
-                kc = output_data[(5 + k * 3 + 2) * num_proposals + i];
+                kx = output_data[(5 + k * 3 + 0) * orig_num_proposals + idx];
+                ky = output_data[(5 + k * 3 + 1) * orig_num_proposals + idx];
+                kc = output_data[(5 + k * 3 + 2) * orig_num_proposals + idx];
             } else {
-                const float* row = output_data + i * expected_stride;
+                const float* row = output_data + idx * expected_stride;
                 kx = row[5 + k * 3];
                 ky = row[5 + k * 3 + 1];
                 kc = row[5 + k * 3 + 2];
             }
 
-            kx = (kx - pad_x) / scale;
-            ky = (ky - pad_y) / scale;
+            yolo_map_to_original(kx, ky, scale, pad_x, pad_y, crop_x, crop_y, &kx, &ky);
 
             if (kc >= 0.3f) {
                 pose->keypoints[k].x = UTILS_CLAMP(kx, 0.0f, (float)width - 1);
@@ -809,12 +687,20 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
         }
     }
     free(all_output_vals);
+    free(top_indices);
 
     if (num_poses > 1) {
-        num_poses = nms_pose(out_poses, num_poses, est->iou_threshold);
+        num_poses = yolo_nms_suppress(out_poses, num_poses, sizeof(PoseEstimation),
+                                       0.0f, est->iou_threshold,
+                                       max_poses, pose_similarity,
+                                       offsetof(PoseEstimation, confidence));
     }
 
-    log_debug("YOLOv8-Pose: %d poses (layout=%s)", num_poses, transposed_layout ? "CHW" : "NHW");
+    #undef POSE_STANDARD_TOP_K
+
+    log_debug("YOLOv8-Pose: %d poses (layout=%s, Top-K=%s, ORT Run: %lld ms)",
+              num_poses, transposed_layout ? "CHW" : "NHW",
+              top_indices ? "yes" : "no", (long long)t_run_ms);
     return num_poses;
 }
 

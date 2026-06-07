@@ -16,9 +16,11 @@ extern "C" {
 #define STGCN_MAX_ACTIONS       MAX_ACTIONS_PER_FRAME
 
 typedef struct OrtSession OrtSession;
+typedef struct OrtInferenceContext OrtInferenceContext;
 
 typedef struct {
     OrtSession* session;
+    OrtInferenceContext* ctx;
     char input_name_pts[MAX_STRING_LEN];   /* primary input: skeleton keypoints [1, 3, T, V, M] */
     char input_name_mot[MAX_STRING_LEN];   /* secondary input: motion vectors [1, 2, T, V, M] */
     int num_frames;

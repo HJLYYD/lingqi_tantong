@@ -14,9 +14,13 @@ static OrtEnv* g_ort_env = NULL;
 static bool g_ort_ready = false;
 static bool g_spacemit_ep_active = false;
 static int g_ep_session_count = 0;
-#define MAX_EP_SESSIONS 4  /* K1 cluster-0 has 4 AI cores; 4 EP sessions for detection+pose+face+arcface */
+#define MAX_EP_SESSIONS 4  /* With SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD=1, all EP sessions share
+                             * one intra-op thread pool.  Models run sequentially → TCM footprint
+                             * is N_threads × ~170KB (not sessions × threads × ~170KB).
+                             * 4 quantized models: YOLOv8-Pose + YOLO11 + FaceDet + ArcFace */
 #ifdef HAS_SPACEMIT_EP
 static bool g_ep_enabled_pref = true;
+static bool g_ep_tcm_permanently_failed = false;  /* Set on first TCM alloc failure; skip EP for all subsequent models */
 #else
 static bool g_ep_enabled_pref = false;
 #endif
@@ -176,6 +180,12 @@ OrtSession* ort_create_session(const char* model_path, int num_threads, bool use
     bool want_ep = false;
 #ifdef HAS_SPACEMIT_EP
     if (use_ep && g_ep_enabled_pref) {
+        /* ── Gate 0 (fastest): previous TCM failure = skip EP for all subsequent models ── */
+        if (g_ep_tcm_permanently_failed) {
+            log_debug("EP previously failed (TCM alloc), skipping EP for %s", model_path);
+            goto use_cpu;
+        }
+
         /* ── Gate 1: model file accessible ── */
         if (spacemit_ort_check_model_accessible(model_path) != 0) {
             log_error("Model file not accessible: %s (skipping EP)", model_path);
@@ -239,11 +249,16 @@ use_cpu:  /* fallthrough label for EP skip */
     int intra;
     int inter;
     if (want_ep) {
-#ifdef HAS_SPACEMIT_EP
-        intra = spacemit_ort_get_ep_intra_threads();
-#else
+        /*
+         * SpacemiT EP manages its OWN intra-op thread pool via the
+         * SPACEMIT_EP_INTRA_THREAD_NUM provider option.  Setting ORT's
+         * global intra_threads > 1 creates a SECOND competing thread pool
+         * that fights with EP for CPU cores → worse performance.
+         *
+         * Per sherpa-onnx official recommendation:
+         *   ORT global intra = 1, EP controls parallelism internally.
+         */
         intra = 1;
-#endif
         inter = 1;
     } else {
         /* CPU EP: use all available cores for maximum throughput.
@@ -283,6 +298,7 @@ use_cpu:  /* fallthrough label for EP skip */
             want_ep = false;
             /* Adjust thread counts for CPU fallback */
             intra = num_threads > 0 ? num_threads : (n_online >= 8 ? 6 : (n_online >= 4 ? 4 : n_online));
+            if (intra == 4 && n_online >= 8) intra = 6;
             inter = intra > 2 ? 2 : 1;
             st_opt = g_ort_api->SetIntraOpNumThreads(session_opts, intra);
             if (st_opt) g_ort_api->ReleaseStatus(st_opt);
@@ -304,6 +320,18 @@ use_cpu:  /* fallthrough label for EP skip */
             /* EP failed cleanly (not a crash) — fall back to CPU for THIS model */
             log_error("SpacemiT EP CreateSession failed for %s (rc=%d): %s",
                       model_path, rc, ep_err[0] ? ep_err : "no error message");
+
+            /* Check for TCM allocation failures — if TCM allocs fail,
+             * the K1 kernel driver is broken and ALL subsequent EP
+             * attempts will also fail.  Set permanent flag to skip
+             * expensive EP registration for remaining models. */
+            if (ep_err[0] && strstr(ep_err, "tcm buffer alloc failed")) {
+                g_ep_tcm_permanently_failed = true;
+                log_warning("SpacemiT EP: TCM permanently unavailable on this board — "
+                            "disabling EP for all remaining models (kernel driver issue, "
+                            "try: sudo rmmod tcm && sudo modprobe tcm)");
+            }
+
             log_info("  -> Retrying with CPU EP (this model only, EP remains enabled for others)");
 
             /* Retry with CPU EP session options */
@@ -311,7 +339,12 @@ use_cpu:  /* fallthrough label for EP skip */
             OrtStatus* st2 = g_ort_api->CreateSessionOptions(&cpu_opts);
             if (st2) { g_ort_api->ReleaseStatus(st2); return NULL; }
 
+            /* ── CPU EP thread count ──
+             * K1 has 8 cores.  Reserve 2 for system + pipeline threads,
+             * use 6 for intra-op parallelism.  For INT8-quantized models
+             * the CPU EP can use RVV (if ORT was compiled with it). */
             int cpu_intra = num_threads > 0 ? num_threads : (n_online >= 8 ? 6 : (n_online >= 4 ? 4 : n_online));
+            if (cpu_intra == 4 && n_online >= 8) cpu_intra = 6;  /* bump from 4→6 on 8-core K1 */
             int cpu_inter = cpu_intra > 2 ? 2 : 1;
             OrtStatus* st_c;
             st_c = g_ort_api->SetSessionGraphOptimizationLevel(cpu_opts, ORT_ENABLE_ALL);

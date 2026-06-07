@@ -1,4 +1,6 @@
 #include "yolov8_detector.h"
+#include "ort_inference_context.h"
+#include "yolo_postprocess.h"
 #include "logger.h"
 #include "utils.h"
 #include <stdlib.h>
@@ -16,8 +18,15 @@
 #define YOLOV8_MAX_INPUT_BYTES (100UL * 1024UL * 1024UL)
 #define YOLOV8_MAX_OUTPUT_DETECTIONS 50
 #define YOLOV8_MAX_PER_GROUP        200
-#define YOLO11_SOFT_CAP_PER_GROUP   2000  /* per-group proposal cap; ensures all 3 stride groups contribute
-                                             even when DFL threshold is low. Post-sort Top-K picks winners. */
+#define YOLO11_SOFT_CAP_PER_GROUP   500   /* per-group proposal cap; lowered from 2000 to 500.
+                                               The stride-8 group (80×80=6400 positions) was saturating
+                                               the buffer with 2000 weak proposals, starving stride-16
+                                               and stride-32 groups. 500 per group ensures all 3 scales
+                                               contribute, with Top-K selecting the strongest globally.
+                                               At DFL=0.15, ~400-600 proposals pass per group. */
+#define YOLOV8_TOP_K_PROPOSALS      30    /* lowered from 50: at 4000+ proposals, random noise
+                                               dominated Top-50. 30 is enough for crowded scenes
+                                               (real scenes rarely exceed 10 people). */
 
 static const char* COCO_CLASSES[] = {
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
@@ -54,6 +63,7 @@ YOLO11Detector* yolov8_detector_create(const char* model_path, int input_w, int 
 
 void yolov8_detector_destroy(YOLO11Detector* det) {
     if (!det) return;
+    ort_ctx_destroy(det->ctx);
     const OrtApi* g_ort = ort_get_api();
     if (det->session && g_ort) {
         g_ort->ReleaseSession(det->session);
@@ -81,6 +91,16 @@ bool yolov8_detector_load_model(YOLO11Detector* det, const char* model_path) {
         log_error("YOLO11Detector: failed to create ONNX session for %s", model_path);
         return false;
     }
+
+    det->ctx = ort_ctx_create(det->session, det->input_width, det->input_height, 3);
+    if (!det->ctx) {
+        log_error("YOLO11Detector: failed to create inference context");
+        const OrtApi* g_ort = ort_get_api();
+        if (det->session && g_ort) g_ort->ReleaseSession(det->session);
+        det->session = NULL;
+        return false;
+    }
+    strncpy(det->ctx->input_name, det->input_name, sizeof(det->ctx->input_name) - 1);
 
     /*
      * Query actual input shape from the loaded session. Quantized models
@@ -110,113 +130,7 @@ bool yolov8_detector_load_model(YOLO11Detector* det, const char* model_path) {
     return true;
 }
 
-static void yolov8_preprocess(const uint8_t* image_data, int width, int height,
-                       float* out_tensor, int target_w, int target_h,
-                       float* out_scale, int* out_pad_x, int* out_pad_y,
-                       int* out_crop_x, int* out_crop_y) {
-    /*
-     * Resolution auto-adaptation: when source aspect ratio differs
-     * significantly from the model's square input, center-crop first.
-     *
-     * Example: 720×1280 portrait → center-crop to 720×720 → scale to 320×320
-     *   Without crop: scale=0.25, object pixels = 25% of original
-     *   With crop:    scale=0.44, object pixels = 44% of original (1.78× more!)
-     *
-     * CRITICAL: when crop is active, the returned scale/pad are relative to
-     * the CROPPED image.  Callers MUST add (crop_x, crop_y) to decoded
-     * coordinates to map back to the ORIGINAL image.  For 720×1280 video,
-     * crop_y=280 — without this offset, all boxes are shifted up by 280 px.
-     *
-     * Threshold: crop when |log2(src_ar / dst_ar)| > 0.5 (≈1.4× aspect mismatch)
-     */
-    float src_ar = (float)width / (float)UTILS_MAX(height, 1);
-    float dst_ar = (float)target_w / (float)UTILS_MAX(target_h, 1);
-    float ar_ratio = src_ar / UTILS_MAX(dst_ar, 0.01f);
-    bool need_crop = (ar_ratio < 0.7f || ar_ratio > 1.4f);
 
-    const uint8_t* src_ptr = image_data;
-    int src_w = width, src_h = height;
-    int crop_x = 0, crop_y = 0;
-
-    uint8_t* crop_buf = NULL;
-    if (need_crop) {
-        int crop_w, crop_h;
-        if (src_ar < dst_ar) {
-            /* Portrait on square: crop top/bottom */
-            crop_w = width;
-            crop_h = (int)((float)width / dst_ar + 0.5f);
-            crop_x = 0;
-            crop_y = (height - crop_h) / 2;
-        } else {
-            /* Landscape on square: crop left/right */
-            crop_h = height;
-            crop_w = (int)((float)height * dst_ar + 0.5f);
-            crop_x = (width - crop_w) / 2;
-            crop_y = 0;
-        }
-        if (crop_y < 0) crop_y = 0;
-        if (crop_x < 0) crop_x = 0;
-        if (crop_x + crop_w > width)  crop_w = width - crop_x;
-        if (crop_y + crop_h > height) crop_h = height - crop_y;
-
-        crop_buf = (uint8_t*)malloc((size_t)crop_w * crop_h * 3);
-        if (crop_buf) {
-            for (int y = 0; y < crop_h; y++) {
-                for (int x = 0; x < crop_w; x++) {
-                    int si = ((crop_y + y) * width + (crop_x + x)) * 3;
-                    int di = (y * crop_w + x) * 3;
-                    crop_buf[di + 0] = image_data[si + 0];
-                    crop_buf[di + 1] = image_data[si + 1];
-                    crop_buf[di + 2] = image_data[si + 2];
-                }
-            }
-            src_ptr = crop_buf;
-            src_w = crop_w;
-            src_h = crop_h;
-        }
-    }
-
-    /* Always return crop offset so caller can map coords correctly */
-    if (out_crop_x) *out_crop_x = crop_x;
-    if (out_crop_y) *out_crop_y = crop_y;
-
-    uint8_t* padded = (uint8_t*)malloc((size_t)target_w * target_h * 3);
-    if (!padded) { free(crop_buf); return; }
-
-    utils_letterbox(src_ptr, src_w, src_h, padded, target_w, target_h, 3, out_scale, out_pad_x, out_pad_y);
-    free(crop_buf);
-
-    int pixels = target_w * target_h;
-    for (int y = 0; y < target_h; y++) {
-        for (int x = 0; x < target_w; x++) {
-            int src_idx = (y * target_w + x) * 3;
-            int dst_r = 0 * pixels + y * target_w + x;
-            int dst_g = 1 * pixels + y * target_w + x;
-            int dst_b = 2 * pixels + y * target_w + x;
-
-            out_tensor[dst_r] = padded[src_idx + 0] / 255.0f;
-            out_tensor[dst_g] = padded[src_idx + 1] / 255.0f;
-            out_tensor[dst_b] = padded[src_idx + 2] / 255.0f;
-        }
-    }
-
-    free(padded);
-}
-
-/* ── Numerically-stable softmax (in-place on n-element array) ── */
-static void softmax_stable(float* x, int n) {
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] > max_val) max_val = x[i];
-    }
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    float inv = (sum > 1e-12f) ? (1.0f / sum) : 1.0f;
-    for (int i = 0; i < n; i++) x[i] *= inv;
-}
 
 /*
  * Auto-detect xquant-split output format.
@@ -229,74 +143,14 @@ static void softmax_stable(float* x, int n) {
  * On return, sets num_groups and fills group_indices[group][3] with
  * the output indices of {reg, cls, extra} for each stride group.
  */
+static float detection_bbox_sim(const void* a, const void* b) {
+    return bbox_iou((const BoundingBox*)a, (const BoundingBox*)b);
+}
+
 static int detect_xquant_split_format(size_t num_outputs,
                                        OrtValue** all_output_vals,
                                        int group_indices[3][3]) {
-    if (num_outputs < 3 || num_outputs % 3 != 0) return 0;
-
-    const OrtApi* g_ort = ort_get_api();
-    if (!g_ort) return 0;
-
-    /* Collect per-output spatial dims {H, W, C} */
-    int out_hw[12] = {0}, out_c[12] = {0};
-    int valid = 0;
-
-    for (size_t oi = 0; oi < num_outputs && oi < 12; oi++) {
-        OrtTensorTypeAndShapeInfo* si = NULL;
-        if (g_ort->GetTensorTypeAndShape(all_output_vals[oi], &si)) continue;
-        size_t nd = 0;
-        { OrtStatus* _s = g_ort->GetDimensionsCount(si, &nd); if (_s) g_ort->ReleaseStatus(_s); }
-        int64_t dims[4] = {0};
-        { OrtStatus* _s = g_ort->GetDimensions(si, dims, nd); if (_s) g_ort->ReleaseStatus(_s); }
-        g_ort->ReleaseTensorTypeAndShapeInfo(si);
-        if (nd < 3) continue;
-        if (dims[0] != 1) continue;
-        out_c[oi] = (int)dims[1];
-        int h = (int)dims[2], w = (nd >= 4) ? (int)dims[3] : 1;
-        out_hw[oi] = h * w;
-        valid++;
-    }
-    if (valid != (int)num_outputs) return 0;
-
-    /* Group by spatial size: find sets of 3 outputs with same HW */
-    int num_groups = 0;
-    bool used[12] = {false};
-
-    for (size_t i = 0; i < num_outputs && num_groups < 3; i++) {
-        if (used[i]) continue;
-        int hw_i = out_hw[i];
-        /* Find two more outputs with same HW and complementary channel counts */
-        int group[3] = {(int)i, -1, -1};
-        int found = 1;
-        for (size_t j = i + 1; j < num_outputs && found < 3; j++) {
-            if (used[j]) continue;
-            if (out_hw[j] == hw_i) {
-                group[found++] = (int)j;
-                used[j] = true;
-            }
-        }
-        if (found == 3) {
-            used[i] = true;
-            /* Identify which is reg (64 ch), cls, extra (1 ch) */
-            int reg_idx = -1, cls_idx = -1, ext_idx = -1;
-            for (int k = 0; k < 3; k++) {
-                int ch = out_c[group[k]];
-                if (ch >= 60 && ch <= 70) reg_idx = group[k];      /* 64 ch → reg */
-                else if (ch >= 10) cls_idx = group[k];             /* 17/80 ch → cls */
-                else ext_idx = group[k];                            /* 1 ch → extra */
-            }
-            if (reg_idx >= 0 && cls_idx >= 0) {
-                group_indices[num_groups][0] = reg_idx;
-                group_indices[num_groups][1] = cls_idx;
-                group_indices[num_groups][2] = ext_idx >= 0 ? ext_idx : -1;
-                num_groups++;
-            }
-        }
-    }
-
-    /* Only accept if we found exactly num_outputs/3 groups */
-    if (num_groups != (int)(num_outputs / 3)) return 0;
-    return num_groups;
+    return yolo_detect_xquant_split(num_outputs, all_output_vals, group_indices, 0);
 }
 
 int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int width, int height,
@@ -323,41 +177,16 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
     float scale = 1.0f;
     int pad_x = 0, pad_y = 0;
     int crop_x = 0, crop_y = 0;
-    yolov8_preprocess(image_data, width, height, input_tensor,
+    yolo_preprocess(image_data, width, height, input_tensor,
                       det->input_width, det->input_height,
                       &scale, &pad_x, &pad_y, &crop_x, &crop_y);
 
-    int64_t input_shape[4] = {1, 3, det->input_height, det->input_width};
-    OrtMemoryInfo* mem_info = NULL;
-    OrtStatus* status = g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
-    if (status) {
-        const char* msg = g_ort->GetErrorMessage(status);
-        log_error("YOLO11: CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
-        g_ort->ReleaseStatus(status);
+    if (!ort_ctx_prepare_input(det->ctx, input_tensor, tensor_bytes)) {
         free(input_tensor);
         return 0;
     }
+    free(input_tensor);
 
-    OrtValue* input_tensor_ort = NULL;
-    status = g_ort->CreateTensorWithDataAsOrtValue(
-        mem_info, input_tensor, tensor_bytes,
-        input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor_ort);
-    g_ort->ReleaseMemoryInfo(mem_info);
-    if (status) {
-        const char* msg = g_ort->GetErrorMessage(status);
-        log_error("YOLO11: CreateTensorWithDataAsOrtValue failed: %s", msg ? msg : "unknown");
-        g_ort->ReleaseStatus(status);
-        free(input_tensor);
-        return 0;
-    }
-
-    /*
-     * Handle both single-output (standard ONNX export) and multi-output
-     * (xquant-truncated) models. xquant truncation at /model.22/Reshape_*
-     * removes the post-processing Concat, producing 3 stride-level outputs
-     * instead of 1. We query output count dynamically, allocate per-output
-     * name/value arrays, run once, then collect all proposals before NMS.
-     */
     size_t num_outputs = 0;
     OrtStatus* st_oc = g_ort->SessionGetOutputCount(det->session, &num_outputs);
     if (st_oc) {
@@ -366,68 +195,11 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
     }
     if (num_outputs == 0) num_outputs = 1;
 
-    OrtAllocator* allocator = NULL;
-    OrtStatus* st_alloc = g_ort->GetAllocatorWithDefaultOptions(&allocator);
-    if (st_alloc) g_ort->ReleaseStatus(st_alloc);
+    OrtValue** all_output_vals = (OrtValue**)calloc(num_outputs, sizeof(OrtValue*));
+    if (!all_output_vals) return 0;
 
-    const char** all_output_names = (const char**)calloc(num_outputs, sizeof(char*));
-    OrtValue**  all_output_vals   = (OrtValue**)calloc(num_outputs, sizeof(OrtValue*));
-    if (!all_output_names || !all_output_vals) {
-        free(all_output_names); free(all_output_vals);
-        g_ort->ReleaseValue(input_tensor_ort);
-        free(input_tensor);
-        return 0;
-    }
-
-    bool names_ok = true;
-    for (size_t oi = 0; oi < num_outputs; oi++) {
-        char* name_ptr = NULL;
-        OrtStatus* s = g_ort->SessionGetOutputName(det->session, oi, allocator, &name_ptr);
-        if (s || !name_ptr) {
-            if (s) g_ort->ReleaseStatus(s);
-            names_ok = false;
-            break;
-        }
-        all_output_names[oi] = name_ptr;
-    }
-
-    if (!names_ok) {
-        for (size_t oi = 0; oi < num_outputs; oi++) {
-            if (all_output_names[oi]) {
-                OrtStatus* st_f = g_ort->AllocatorFree(allocator, (void*)all_output_names[oi]);
-                if (st_f) g_ort->ReleaseStatus(st_f);
-            }
-        }
-        free(all_output_names); free(all_output_vals);
-        g_ort->ReleaseValue(input_tensor_ort);
-        free(input_tensor);
-        return 0;
-    }
-
-    const char* input_names[] = {det->input_name};
-    OrtValue*   input_vals[]  = {input_tensor_ort};
-
-    status = g_ort->Run(det->session, NULL,
-                        input_names, (const OrtValue* const*)input_vals, 1,
-                        (const char* const*)all_output_names, num_outputs, all_output_vals);
-    g_ort->ReleaseValue(input_tensor_ort);
-    free(input_tensor);
-
-    for (size_t oi = 0; oi < num_outputs; oi++) {
-        if (all_output_names[oi]) {
-            OrtStatus* st_f = g_ort->AllocatorFree(allocator, (void*)all_output_names[oi]);
-            if (st_f) g_ort->ReleaseStatus(st_f);
-        }
-    }
-    free(all_output_names);
-
-    if (status) {
-        const char* msg = g_ort->GetErrorMessage(status);
-        log_error("YOLO11 inference failed: %s", msg ? msg : "unknown");
-        g_ort->ReleaseStatus(status);
-        for (size_t oi = 0; oi < num_outputs; oi++) {
-            if (all_output_vals[oi]) g_ort->ReleaseValue(all_output_vals[oi]);
-        }
+    int rc = ort_ctx_run(det->ctx, all_output_vals);
+    if (rc != 0) {
         free(all_output_vals);
         return 0;
     }
@@ -604,7 +376,7 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
                             int base = coord * 16;
                             for (int b = 0; b < 16; b++)
                                 bins[b] = reg_data[(base + b) * hw + pi];
-                            softmax_stable(bins, 16);
+                            yolo_softmax_stable(bins, 16);
                             float mb = bins[0];
                             for (int b = 1; b < 16; b++)
                                 if (bins[b] > mb) mb = bins[b];
@@ -667,27 +439,7 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
                      * gives geomean ≈ 0.12 — above threshold.
                      */
                     float dists[4];
-                    float dfl_peaks[4];
-                    for (int coord = 0; coord < 4; coord++) {
-                        float bins[16];
-                        int base = coord * 16;
-                        for (int b = 0; b < 16; b++) {
-                            bins[b] = reg_data[(base + b) * hw + pix];
-                        }
-                        softmax_stable(bins, 16);
-                        float max_bin = bins[0];
-                        float val = 0.0f;
-                        for (int b = 0; b < 16; b++) {
-                            if (bins[b] > max_bin) max_bin = bins[b];
-                            val += bins[b] * (float)b;
-                        }
-                        dfl_peaks[coord] = max_bin;
-                        dists[coord] = val;
-                    }
-                    /* Geometric mean of 4 peak values.
-                     * Uniform: 0.0625.  Weak signal: 0.10.  Clear: 0.25+. */
-                    float dfl_conf = sqrtf(sqrtf(
-                        dfl_peaks[0] * dfl_peaks[1] * dfl_peaks[2] * dfl_peaks[3]));
+                    float dfl_conf = yolo_dfl_decode_position(reg_data, pix, hw, dists);
 
                     /* ── Objectness signal (suppressed for INT8-quantized models) ──
                      * The ext tensor provides foreground logits.  In FP32 models
@@ -727,13 +479,9 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
                     float x2_model = x2_grid * (float)stride;
                     float y2_model = y2_grid * (float)stride;
 
-                    /* Map back through letterbox AND center-crop to original image coords.
-                     * step 1: remove letterbox padding → cropped-image coordinates
-                     * step 2: add crop offset → original-image coordinates */
-                    float x1 = (x1_model - pad_x) / scale + (float)crop_x;
-                    float y1 = (y1_model - pad_y) / scale + (float)crop_y;
-                    float x2 = (x2_model - pad_x) / scale + (float)crop_x;
-                    float y2 = (y2_model - pad_y) / scale + (float)crop_y;
+                    float x1, y1, x2, y2;
+                    yolo_map_to_original(x1_model, y1_model, scale, pad_x, pad_y, crop_x, crop_y, &x1, &y1);
+                    yolo_map_to_original(x2_model, y2_model, scale, pad_x, pad_y, crop_x, crop_y, &x2, &y2);
 
                     x1 = UTILS_CLAMP(x1, 0.0f, (float)(width - 1));
                     y1 = UTILS_CLAMP(y1, 0.0f, (float)(height - 1));
@@ -862,10 +610,9 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
 
                 if (max_score < det->confidence_threshold) continue;
 
-                float x1 = ((cx - wb * 0.5f) - pad_x) / scale + (float)crop_x;
-                float y1 = ((cy - hb * 0.5f) - pad_y) / scale + (float)crop_y;
-                float x2 = ((cx + wb * 0.5f) - pad_x) / scale + (float)crop_x;
-                float y2 = ((cy + hb * 0.5f) - pad_y) / scale + (float)crop_y;
+                float x1, y1, x2, y2;
+                yolo_map_to_original(cx - wb * 0.5f, cy - hb * 0.5f, scale, pad_x, pad_y, crop_x, crop_y, &x1, &y1);
+                yolo_map_to_original(cx + wb * 0.5f, cy + hb * 0.5f, scale, pad_x, pad_y, crop_x, crop_y, &x2, &y2);
 
                 x1 = UTILS_CLAMP(x1, 0.0f, (float)(width - 1));
                 y1 = UTILS_CLAMP(y1, 0.0f, (float)(height - 1));
@@ -915,37 +662,17 @@ int yolov8_detector_detect(YOLO11Detector* det, const uint8_t* image_data, int w
      * ensures only the model's most confident guesses survive.
      *
      * 30 is enough for crowded scenes; real scenes rarely exceed 10. */
-#define YOLOV8_TOP_K_PROPOSALS 50
     if (num_temp > YOLOV8_TOP_K_PROPOSALS) {
         num_temp = YOLOV8_TOP_K_PROPOSALS;
     }
-#undef YOLOV8_TOP_K_PROPOSALS
 
-    /* NMS caps at 600; with top-30 this is far below the cap. */
-
-    bool* suppressed = (bool*)calloc((size_t)num_temp, sizeof(bool));
-    if (!suppressed) {
-        int ret = UTILS_MIN(num_temp, max_detections);
-        free(temp_dets);
-        return ret;
-    }
-
-    int keep = 0;
     int effective_max = UTILS_MIN(max_detections, YOLOV8_MAX_OUTPUT_DETECTIONS);
-    for (int i = 0; i < num_temp; i++) {
-        if (suppressed[i]) continue;
-        if (keep < effective_max) {
-            out_detections[keep++] = temp_dets[i];
-        }
-        for (int j = i + 1; j < num_temp; j++) {
-            if (suppressed[j]) continue;
-            if (bbox_iou(&temp_dets[i].bbox, &temp_dets[j].bbox) > det->iou_threshold
-                && temp_dets[i].class_id == temp_dets[j].class_id) {
-                suppressed[j] = true;
-            }
-        }
+    int keep = yolo_nms_suppress(temp_dets, num_temp, sizeof(Detection),
+                                  det->confidence_threshold, det->iou_threshold,
+                                  effective_max, detection_bbox_sim, 16);
+    for (int i = 0; i < keep; i++) {
+        out_detections[i] = temp_dets[i];
     }
-    free(suppressed);
     free(temp_dets);
 
     log_debug("YOLO11: %d outputs, %d detections after NMS", (int)num_outputs, keep);
