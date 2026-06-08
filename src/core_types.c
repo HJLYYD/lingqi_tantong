@@ -11,6 +11,9 @@ void detection_init(Detection* det, float x1, float y1, float x2, float y2,
     det->class_id = class_id;
     strncpy(det->class_name, class_name ? class_name : "unknown", MAX_STRING_LEN - 1);
     det->class_name[MAX_STRING_LEN - 1] = '\0';
+    det->track_id_hint = -1;
+    det->is_partial_body = false;
+    det->num_visible_keypoints = 0;
 }
 
 void pose_estimation_init(PoseEstimation* pose) {

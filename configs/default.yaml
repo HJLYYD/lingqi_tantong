@@ -64,6 +64,24 @@ detection:
   iou_threshold: 0.40           # tighter NMS to suppress overlapping boxes on same person
   input_size: [640, 640]
   classes: 80
+  # ── Keypoint-based anatomical validation ──
+  # Rejects detections whose keypoints fail anatomical plausibility checks
+  # (shoulder symmetry, torso proportions, limb ratios, head position).
+  # Set keypoint_min_count to 0 to disable keypoint filtering.
+  keypoint_min_count: 6           # raised from 5: minimum valid keypoints for human detection
+  keypoint_min_confidence: 0.30   # per-keypoint confidence threshold
+  keypoint_validity_threshold: 0.50  # raised from 0.40: overall anatomical score for acceptance
+  # ── Cascade optimization ──
+  # When tracking is stable (confirmed tracks exist), the pipeline enters
+  # TRACKING mode: skip YOLO11n secondary detector, reduce face detection
+  # frequency. Every cascade_validation_interval frames, a full-resolution
+  # validation frame runs both models to catch new entries.
+  cascade_enabled: true
+  cascade_validation_interval: 15  # frames between full-res re-validation
+  cascade_tracking_resolution: [320, 320]  # reduced input when tracking (not yet used by fixed-input models)
+  # ── Stricter fallback when no pose data available ──
+  fallback_confidence: 0.20       # conf threshold when YOLO11n runs without pose model
+  fallback_area_ratio_min: 0.008  # min bbox area ratio without pose validation
 
 pose:
   # PRIMARY person detector + pose estimator (YOLOv8n-pose, xquant-split).
@@ -107,12 +125,32 @@ action:
   confidence_threshold: 0.50
 
 tracking:
-  max_lost: 30
-  min_iou: 0.50
+  max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
+  max_occluded_frames: 45         # reduced from 90: extended but not infinite
+  min_iou: 0.30
   max_distance: 5.0
   max_track_history: 300
   kalman_process_noise: 0.05
   kalman_measurement_noise: 0.10
+  # ── Enhanced confirmation (lowered for faster response) ──
+  confirmation_frames: 3          # reduced from 5: 3 hits ≈ 0.85s to confirm
+  min_keypoints_for_confirm: 3    # lowered from 4: faster confirm for partial-body
+  min_keypoints_strong: 6         # lowered from 8: INT8 keypoints rarely reach 8
+  spatial_jump_max_m: 3.0         # reject implausible position jumps (>3m/frame)
+  # ── Cascade matching (NEW) ──
+  cascade_max_age: 30             # max frames since update for cascade levels
+  cascade_min_hits: 3             # min hits before track enters cascade
+  appearance_weight: 0.35          # weight of appearance vs IoU in cost matrix
+  appearance_max_dist: 0.50        # cosine distance gate for appearance matching
+  iou_threshold_low: 0.15          # second-stage IoU for occlusion recovery
+  # ── Occlusion handling (NEW) ──
+  upper_body_min_keypoints: 4      # min upper-body keypoints for partial detection
+  side_body_min_keypoints: 3       # min one-side keypoints for lateral view
+  occlusion_score_threshold: 0.40  # below this ratio → considered occluded
+  # ── Re-identification (NEW) ──
+  reid_pool_max_age: 60           # frames to keep deleted track in re-id pool
+  # ── Multi-person detection (NEW) ──
+  new_person_grace_frames: 3       # grace period for new person detection trigger
   init_state:
     position_variance: 0.1
     velocity_variance: 0.01

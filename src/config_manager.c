@@ -45,6 +45,18 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_int(cm, "detection.input_size.0", 640);
     config_set_int(cm, "detection.input_size.1", 640);
     config_set_int(cm, "detection.classes", 80);
+    /* Keypoint validator defaults */
+    config_set_int(cm, "detection.keypoint_min_count", 5);
+    config_set_float(cm, "detection.keypoint_min_confidence", 0.30f);
+    config_set_float(cm, "detection.keypoint_validity_threshold", 0.40f);
+    /* Cascade defaults */
+    config_set_bool(cm, "detection.cascade_enabled", true);
+    config_set_int(cm, "detection.cascade_validation_interval", 15);
+    config_set_int(cm, "detection.cascade_tracking_resolution.0", 320);
+    config_set_int(cm, "detection.cascade_tracking_resolution.1", 320);
+    /* Enhanced fallback filter defaults */
+    config_set_float(cm, "detection.fallback_confidence", 0.20f);
+    config_set_float(cm, "detection.fallback_area_ratio_min", 0.008f);
 
     config_set_string(cm, "pose.backend", "ai_accel");
     config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
@@ -79,6 +91,11 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_int(cm, "tracking.max_track_history", 300);
     config_set_float(cm, "tracking.kalman_process_noise", 0.05f);
     config_set_float(cm, "tracking.kalman_measurement_noise", 0.1f);
+    /* Enhanced confirmation defaults */
+    config_set_int(cm, "tracking.confirmation_frames", 5);
+    config_set_int(cm, "tracking.min_keypoints_for_confirm", 4);
+    config_set_int(cm, "tracking.min_keypoints_strong", 8);
+    config_set_float(cm, "tracking.spatial_jump_max_m", 3.0f);
 
     config_set_float(cm, "spatial.fx", 960.0f);
     config_set_float(cm, "spatial.fy", 960.0f);

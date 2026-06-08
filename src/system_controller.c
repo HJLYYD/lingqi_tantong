@@ -426,6 +426,8 @@ static void* k1_postprocess_thread(void* arg) {
             sc->tracking_manager, inference->detections, inference->num_detections,
             s->positions, num_positions, sc->frame_count);
 
+        object_tracker_associate_poses(sc->tracking_manager, inference->poses, inference->num_poses);
+
         associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
                                       inference->poses, inference->num_poses);
         associate_faces_with_objects(tracking.tracked_objects, tracking.num_tracked,
@@ -660,6 +662,46 @@ SystemController* system_controller_create(const char* config_path) {
         config_get_int(sc->config, "tracking.max_track_history", 300)
     );
 
+    /* ── Apply enhanced tracking confirmation config ── */
+    object_tracker_set_enhanced_config(
+        sc->tracking_manager,
+        config_get_int(sc->config, "tracking.confirmation_frames", TRACKING_CONFIRMATION_FRAMES),
+        config_get_int(sc->config, "tracking.min_keypoints_for_confirm", TRACKING_MIN_KEYPOINTS_FOR_CONFIRM),
+        config_get_int(sc->config, "tracking.min_keypoints_strong", TRACKING_MIN_KEYPOINTS_STRONG),
+        config_get_float(sc->config, "tracking.spatial_jump_max_m", TRACKING_SPATIAL_JUMP_MAX_M)
+    );
+
+    /* ── NEW: Apply cascade matching config ── */
+    object_tracker_set_cascade_config(
+        sc->tracking_manager,
+        config_get_int(sc->config, "tracking.cascade_max_age", 30),
+        config_get_int(sc->config, "tracking.cascade_min_hits", 3),
+        config_get_float(sc->config, "tracking.appearance_weight", 0.35f),
+        config_get_float(sc->config, "tracking.appearance_max_dist", 0.50f),
+        config_get_float(sc->config, "tracking.iou_threshold_low", 0.15f)
+    );
+
+    /* ── NEW: Apply occlusion handling config ── */
+    object_tracker_set_occlusion_config(
+        sc->tracking_manager,
+        config_get_int(sc->config, "tracking.max_occluded_frames", 90),
+        config_get_int(sc->config, "tracking.upper_body_min_keypoints", 4),
+        config_get_int(sc->config, "tracking.side_body_min_keypoints", 3),
+        config_get_float(sc->config, "tracking.occlusion_score_threshold", 0.40f)
+    );
+
+    /* ── NEW: Apply re-identification config ── */
+    object_tracker_set_reid_config(
+        sc->tracking_manager,
+        config_get_int(sc->config, "tracking.reid_pool_max_age", 90)
+    );
+
+    /* ── NEW: Apply multi-person detection config ── */
+    object_tracker_set_multi_person_config(
+        sc->tracking_manager,
+        config_get_int(sc->config, "tracking.new_person_grace_frames", 3)
+    );
+
     float fx = config_get_float(sc->config, "spatial.fx", 960.0f);
     float fy = config_get_float(sc->config, "spatial.fy", 960.0f);
     float cx = config_get_float(sc->config, "spatial.cx", 960.0f);
@@ -880,6 +922,9 @@ SystemStatus system_controller_process_video(SystemController* sc,
         TrackingResult tracking = object_tracker_update(
             sc->tracking_manager, inference.detections, inference.num_detections,
             positions, num_positions, sc->frame_count);
+
+        /* ── NEW: Pose association via tracker (updates appearance features) ── */
+        object_tracker_associate_poses(sc->tracking_manager, inference.poses, inference.num_poses);
 
         associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
                                       inference.poses, inference.num_poses);

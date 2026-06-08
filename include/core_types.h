@@ -92,6 +92,9 @@ typedef struct {
     float confidence;
     int class_id;
     char class_name[MAX_STRING_LEN];
+    int track_id_hint;          /* re-identification hint: if >=0, reuse this track ID */
+    bool is_partial_body;       /* true if this detection is upper/lateral body only */
+    int num_visible_keypoints;  /* visible keypoints in associated pose (0 if no pose) */
 } Detection;
 
 typedef struct {

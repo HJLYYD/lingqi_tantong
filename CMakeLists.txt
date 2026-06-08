@@ -197,6 +197,7 @@ set(CORE_SOURCES
     src/core_types.c
     src/k1_platform.c
     src/yolo_postprocess.c
+    src/keypoint_validator.c
 )
 
 set(DATA_SOURCES
