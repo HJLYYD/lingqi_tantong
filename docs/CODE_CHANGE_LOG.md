@@ -212,7 +212,7 @@ bool keypoint_validator_side_body_check(kv, pose, bbox);   // 侧半身验证
 - 修复: 静态局部变量 `lost_counter` 可能导致多实例问题
 
 `inference_pipeline_process_frame()`:
-- **关键修复**: TRACKING模式中每5帧运行YOLO11n (`CASCADE_SECONDARY_INTERVAL = 5`)
+- **关键修复**: TRACKING模式中每3帧运行YOLO11n (`CASCADE_SECONDARY_INTERVAL = 3`)
 - 更改: `bool run_secondary = run_full_res || (TRACKING && frame_counter % 5 == 0)`
 - 新增: 三级部分身体验证逻辑 (全身→上半身→侧身)
 - 新增: 部分身体检测标记 (`is_partial_body=true`, `num_visible_keypoints=N`)

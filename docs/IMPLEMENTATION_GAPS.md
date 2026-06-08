@@ -118,18 +118,25 @@ src/vins/
 
 ---
 
-### 6. TinierHAR Temporal Action Recognition
+### 6. ST-GCN Temporal Action Recognition
 
 | Attribute | Details |
 |-----------|---------|
-| **Status** | 🔴 Completely unimplemented |
-| **Reference** | `../lingqi tantong/algorithm_logic.md` §(5) TinierHAR-GRU |
-| **Blocker** | Cannot predict target intent (standing/walking/running/crouching/raising weapon/throwing) |
+| **Status** | 🟢 Implemented (`src/stgcn_action_recognizer.c`, ~445 lines) |
+| **Reference** | ST-GCN (Spatial-Temporal Graph Convolutional Network) |
+| **Model** | `models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx` |
 
-**What needs to be implemented:**
-- 17-keypoint normalization → 34-dimensional feature vector
-- 30-frame sliding window → GRU inference → Softmax
-- 6-class action classification + confidence threshold 0.6
+**Implemented features:**
+- ✅ Auto-detection of output class count from ONNX model shape
+- ✅ 30-frame sliding window with zero-padding for cold start
+- ✅ Motion (mot) channel computation from adjacent frames
+- ✅ Dual-input ONNX inference (pts + mot tensors)
+- ✅ Confidence-sorted top-K action classification
+- ✅ Dynamic output dimension detection (7-class through 60-class models)
+
+**Pending enhancements:**
+- ⬜ INT8 quantization for SpacemiT EP acceleration (currently FP32 CPU-only)
+- ⬜ Multi-person action recognition (currently single-person tracking)
 
 ---
 
@@ -199,11 +206,9 @@ Still needed:
 
 ### 12. Build System Integration
 
-There are currently 2 build methods:
-- **CMake**: Cross-platform standard build (includes RISC-V cross-compilation preset)
-- **build.py**: Python script for quick builds (development convenience)
-
-> Removed references to non-existent Makefile and build_zig.py.
+The project uses:
+- **CMake**: Cross-platform standard build with RISC-V cross-compilation preset (RV64GCV 1.0, RV64GCV 0.7, RV64GC)
+- **Toolchain files**: `cmake/riscv64-toolchain.cmake`, `cmake/esp32p4-toolchain.cmake`
 
 ---
 
@@ -270,7 +275,7 @@ v1.0.0-alpha (Current: x86 C code + offline video)
       ├── VINS-Mono visual-inertial odometry (IMU preintegration + sliding window BA)
       ├── ATW asynchronous time warp (IMU attitude-driven, MTP≤17.8ms)
       ├── KCP-Lite reliable transport (wireless scenarios only)
-      ├── TinierHAR temporal action recognition (30-frame GRU)
+      ├── ST-GCN action recognition: ✅ already implemented (`src/stgcn_action_recognizer.c`)
       ├── MiDaS depth estimation (AI acceleration INT8)
       ├── RVV 0.7.1 vectorized acceleration (image preprocessing critical path)
       ├── Memory optimization (K1 ≤1.5GB)
@@ -417,7 +422,7 @@ void arrow_receiver_destroy(arrow_receiver_t* ar);
 | 3 | ATW Asynchronous Time Warp | Phase 3 | 🔴 Core |
 | 4 | KCP-Lite Transport | ✅ Complete | 🟢 Implemented |
 | 5 | MiDaS Depth Estimation (AI Acceleration) | Phase 3 | 🔴 Accuracy |
-| 6 | TinierHAR Action Recognition | Phase 3 | 🟠 Functionality |
+| 6 | ST-GCN Action Recognition | ✅ Complete | 🟢 Implemented |
 | 7 | ICP Point Cloud Registration | Phase 4 | 🟢 Optimization |
 | 13 | IMUHandler Data Source Integration | Phase 2 | ✅ Covered in this plan |
 | 14 | AR Renderer OpenGL ES 3.0 | Phase 4 | 🟢 Optimization |

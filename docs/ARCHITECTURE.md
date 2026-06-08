@@ -35,8 +35,8 @@
 │  │inference_pipeline│ │ tracking_manager │ │  spatial_engine  │      │
 │  │                  │ │                  │ │                  │      │
 │  │ Cascade:         │ │ ByteTrack:       │ │ Pinhole Model:   │      │
-│  │ YOLOv8n ─►       │ │ Three-stage matching    │ │ 2D box → 3D pos  │      │
-│  │ YOLOv8-Pose ─►   │ │ + 7-state Kalman │ │ + depth est.     │      │
+│  │ YOLOv8-Pose (PRIMARY) │ │ Cascade+Hungarian  │ │ 2D box → 3D pos  │      │
+│  │ YOLO11n (SECONDARY)   │ │ + 7-state Kalman │ │ + depth est.     │      │
 │  │ YOLOv5-Face ─► ArcFace │ │ + EMA smoothing  │ │ + trajectory     │      │
 │  └──────────────────┘ └──────────────────┘ └──────────────────┘      │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -76,7 +76,7 @@
 ```
 FrameData (uint8*,width,height,channels,timestamp)
     │
-    ├──▶ YOLOv8n     ──▶ Detection[] (bbox,conf,class,label)
+    ├──▶ YOLO11     ──▶ Detection[] (bbox,conf,class,label)
     │
     ├──▶ YOLOv8-Pose ──▶ PoseEstimation[] (keypoints[17],bbox,conf)
     │
@@ -136,8 +136,8 @@ X = \frac{(u - c_x) \cdot Z}{f_x}, \quad
 Y = \frac{(v - c_y) \cdot Z}{f_y}
 $$
 
-- $f_x, f_y$: Focal length (pixels), default 500
-- $c_x, c_y$: Principal point offset (pixels), default 320, 240
+- $f_x, f_y$: Focal length (pixels), default 960
+- $c_x, c_y$: Principal point offset (pixels), default 960, 540 (for 1920×1080)
 - $H_{\text{avg}}$: Average human height (m), default 1.70
 - $h_{\text{bbox}}$: Bounding box height (pixels)
 - $(u, v)$: Bounding box bottom-center pixel coordinates
@@ -148,18 +148,26 @@ $$
 
 **State vector:**
 $$
-\mathbf{x} = [u, v, w, h, \dot{u}, \dot{v}, s]
+\mathbf{x} = [cx, cy, area, aspect\_ratio, \dot{cx}, \dot{cy}, \dot{area}]
 $$
 
-- $u, v$: Bounding box center pixel coordinates
-- $w, h$: Bounding box width, height
-- $\dot{u}, \dot{v}$: Velocity components
-- $s$: Scale factor
+- $cx, cy$: Bounding box center pixel coordinates
+- $area$: Bounding box area
+- $aspect\_ratio$: Width / Height
+- $\dot{cx}, \dot{cy}, \dot{area}$: Velocities of center and area
 
 **State transition (constant velocity model):**
 $$
-u_{k+1} = u_k + \dot{u}_k \cdot \Delta t
+cx_{k+1} = cx_k + \dot{cx}_k \cdot \Delta t
 $$
+$$
+cy_{k+1} = cy_k + \dot{cy}_k \cdot \Delta t
+$$
+$$
+area_{k+1} = area_k + \dot{area}_k \cdot \Delta t
+$$
+
+**Measurement observation:** $[cx, cy, area, aspect\_ratio]$ (4 observed, 3 latent)
 
 ### 3.3 IMU Data Sliding Smoothing
 
@@ -210,11 +218,14 @@ void module_destroy(Module* m);
 
 ```c
 #ifdef HAS_ONNX_RUNTIME
-    // Real ONNX model inference path
-    ort_run_session(session, input_tensor);
+    // Real ONNX model inference path (ONNX Runtime required)
+    ort_create_session(model_path, num_threads, use_ep);
+    ort_ctx_run(ctx, output_values);
+    // DFL decoding for xquant-split models
+    yolo_dfl_decode_position(reg_data, pix, hw, dists);
 #else
-    // Heuristic fallback (pure C algorithm, no external dependencies)
-    heuristic_detect(frame, &results);
+    // Build-time error: project has no heuristic fallback
+    #error "Module requires HAS_ONNX_RUNTIME"
 #endif
 ```
 
@@ -227,7 +238,7 @@ void module_destroy(Module* m);
 | **Stack-first** | Small structs (BoundingBox, Detection) passed by value |
 | **Frame buffer pool** | VideoProcessor pre-allocates fixed-size ring buffer |
 | **Explicit lifecycle** | create/destroy pattern, no implicit memory leak paths |
-| **Fixed upper bounds** | Detections ≤100, TrackedObjects ≤32, Trajectory ≤90 |
+| **Fixed upper bounds** | Detections ≤100, TrackedObjects ≤100, Trajectory ≤300, Tracks ≤256 |
 | **No global variables** | All state encapsulated in module structs |
 
 ---
@@ -238,11 +249,11 @@ void module_destroy(Module* m);
 |----------|-----------|
 | C11 over C99 | Static assertions `_Static_assert`, anonymous unions, alignment macros |
 | Dual coordinate systems (2D+3D) | Decoupled 2D fast display + 3D spatial analysis |
-| EMA smoothing (α=0.25) | Biased toward new value at 0.25, reduces jitter, improves localization stability |
+| EMA smoothing (α=0.30) | Biased toward new value at 0.30, reduces jitter, improves localization stability |
 | Independent top-down view area | Front view rendering unaffected by 3D trajectories |
-| ONNX/Heuristic dual-path | Ensures build and run without external dependencies |
+| ONNX Runtime required | Real ONNX inference only; no heuristic fallback exists |
 | YAML-style configuration | Human-readable, compatible with Python version config |
-| Fixed 512-dim face features | Aligned with ArcFace MobileFaceNet output |
+| Fixed 128-dim face features | Aligned with ArcFace MobileFaceNet-cuted model output |
 
 ---
 
@@ -294,6 +305,6 @@ main.c
 | Document | Path |
 |----------|------|
 | Project README | `README.md` |
-| Build Guide | `docs/BUILD_GUIDE.md` |
+| Build Info | See `CMakeLists.txt` and `cmake/` directory |
 | Unimplemented Modules | `docs/IMPLEMENTATION_GAPS.md` |
 | Configuration File | `configs/default.yaml` |

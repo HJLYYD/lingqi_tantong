@@ -32,23 +32,23 @@
 static void config_set_defaults(ConfigManager* cm) {
     config_set_bool(cm, "system.use_onnx", true);
     config_set_bool(cm, "system.use_spacemit_ep", true);
-    config_set_int(cm, "system.spacemit_ep_intra_threads", 3);
+    config_set_int(cm, "system.spacemit_ep_intra_threads", 1);     /* intra=1 for stability on K1 */
     config_set_int(cm, "system.max_frames", 0);
     config_set_int(cm, "system.worker_threads", 4);
     config_set_string(cm, "system.log_level", "INFO");
 
     config_set_string(cm, "detection.backend", "ai_accel");
     config_set_string(cm, "detection.model_path", "models/Human Recognition/yolo11n.q.onnx");
-    config_set_float(cm, "detection.confidence_threshold", 0.20f);  /* DFL peakiness range: 0.18-0.70 */
-    config_set_float(cm, "detection.iou_threshold", 0.45f);         /* tighter NMS */
+    config_set_float(cm, "detection.confidence_threshold", 0.12f);  /* DFL peakiness for quantized models */
+    config_set_float(cm, "detection.iou_threshold", 0.40f);         /* NMS for secondary detector */
     config_set_int(cm, "detection.input_size", 640);
     config_set_int(cm, "detection.input_size.0", 640);
     config_set_int(cm, "detection.input_size.1", 640);
     config_set_int(cm, "detection.classes", 80);
     /* Keypoint validator defaults */
-    config_set_int(cm, "detection.keypoint_min_count", 5);
+    config_set_int(cm, "detection.keypoint_min_count", 6);
     config_set_float(cm, "detection.keypoint_min_confidence", 0.30f);
-    config_set_float(cm, "detection.keypoint_validity_threshold", 0.40f);
+    config_set_float(cm, "detection.keypoint_validity_threshold", 0.50f);
     /* Cascade defaults */
     config_set_bool(cm, "detection.cascade_enabled", true);
     config_set_int(cm, "detection.cascade_validation_interval", 15);
@@ -60,8 +60,8 @@ static void config_set_defaults(ConfigManager* cm) {
 
     config_set_string(cm, "pose.backend", "ai_accel");
     config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
-    config_set_float(cm, "pose.confidence_threshold", 0.15f);
-    config_set_float(cm, "pose.iou_threshold", 0.45f);
+    config_set_float(cm, "pose.confidence_threshold", 0.10f);  /* DFL peakiness for quantized pose model */
+    config_set_float(cm, "pose.iou_threshold", 0.40f);
     config_set_int(cm, "pose.input_size.0", 640);
     config_set_int(cm, "pose.input_size.1", 640);
     config_set_int(cm, "pose.num_keypoints", 17);
@@ -79,22 +79,22 @@ static void config_set_defaults(ConfigManager* cm) {
 
     config_set_string(cm, "action.backend", "ai_accel");
     config_set_string(cm, "action.model_path", "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx");
-    config_set_int(cm, "action.num_frames", 30);    /* ST-GCN temporal window; match default.yaml */
+    config_set_int(cm, "action.num_frames", 30);    /* ST-GCN temporal window */
     config_set_int(cm, "action.num_keypoints", 14); /* ST-GCN model joint count */
     config_set_int(cm, "action.num_persons", 1);
-    config_set_int(cm, "action.num_classes", 7);    /* auto-detected at load time; 7-class NTU RGB+D subset */
+    config_set_int(cm, "action.num_classes", 7);    /* Auto-detected from model output shape at load time */
     config_set_float(cm, "action.confidence_threshold", 0.5f);
 
     config_set_int(cm, "tracking.max_lost", 30);
-    config_set_float(cm, "tracking.min_iou", 0.50f);
+    config_set_float(cm, "tracking.min_iou", 0.30f);
     config_set_float(cm, "tracking.max_distance", 5.0f);
     config_set_int(cm, "tracking.max_track_history", 300);
     config_set_float(cm, "tracking.kalman_process_noise", 0.05f);
-    config_set_float(cm, "tracking.kalman_measurement_noise", 0.1f);
+    config_set_float(cm, "tracking.kalman_measurement_noise", 0.10f);
     /* Enhanced confirmation defaults */
-    config_set_int(cm, "tracking.confirmation_frames", 5);
-    config_set_int(cm, "tracking.min_keypoints_for_confirm", 4);
-    config_set_int(cm, "tracking.min_keypoints_strong", 8);
+    config_set_int(cm, "tracking.confirmation_frames", 3);
+    config_set_int(cm, "tracking.min_keypoints_for_confirm", 3);
+    config_set_int(cm, "tracking.min_keypoints_strong", 6);
     config_set_float(cm, "tracking.spatial_jump_max_m", 3.0f);
 
     config_set_float(cm, "spatial.fx", 960.0f);

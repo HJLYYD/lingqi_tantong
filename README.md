@@ -1,8 +1,7 @@
 # LingQi TanTong Intelligent Detection Arrow System — High-Performance C Implementation
 
-> **Version**: v1.1.0 — Muse Pi Pro (SpacemiT K1 X60) Fully Adapted
+> **Version**: v2.0 — Muse Pi Pro (SpacemiT K1 X60) Fully Adapted
 > **Target Platform**: SpacemiT K1 (X60) Muse Pi Pro — RISC-V 64 (Bianbu Linux)
-> **Arrow End Platform**: Espressif ESP32-P4 — RISC-V 32 (FreeRTOS)
 > **Development Platform**: Linux (Cross-compilation) / K1 Native Build
 > **Language Standard**: C11 + C++17 (Execution Provider Bridge)
 > **Build System**: CMake ≥3.16 
@@ -40,28 +39,29 @@ The LingQi TanTong system consists of two physical computing nodes:
 | Computing Node | Hardware Platform | Core Responsibilities |
 |----------|----------|----------|
 | **Arrow End** | ESP32-P4 + OV5640 + GY-87 | Image capture (MIPI CSI), IMU attitude estimation (9-DOF Madgwick AHRS), data packaging and transmission (UART 3 Mbps) |
-| **Shooter End** | SpacemiT K1 Muse Pi Pro | AI inference acceleration (RVV 1.0 + IME), multi-object tracking (ByteTrack), 3D spatial localization (pinhole camera model + IMU correction), AR visualization rendering |
+| **Shooter End** | SpacemiT K1 Muse Pi Pro | AI inference acceleration (RVV 1.0 + IME), multi-object tracking (ByteTrack + Hungarian + cascade matching), 3D spatial localization (pinhole camera model + IMU correction), AR visualization rendering |
 
 The system provides the following core features:
 
-1. **Object Detection**: Real-time pedestrian detection based on YOLOv8n model, supporting ONNX Runtime + SpacemiT Execution Provider hardware-accelerated inference and pure CPU heuristic fallback dual-path
-2. **Pose Estimation**: YOLOv8-Pose model 17-keypoint COCO human skeleton estimation, supporting per-target cropped inference
-3. **Face Recognition**: YOLOv5-Face lightweight face detection cascaded with ArcFace deep feature extraction (512-dimensional embedding vector)
-4. **Multi-Object Tracking**: ByteTrack paradigm three-stage data association + 7-state Kalman filtering + Exponential Moving Average (EMA) smoothing
-5. **3D Spatial Localization**: Pinhole camera model-driven monocular depth estimation, fused with IMU pitch angle correction and world coordinate system initialization
-6. **AR Visualization**: Bounding box rendering, skeleton line overlay, trajectory top-down view rendering, motion-compensated AR markers
-7. **Real-time Data Link**: Arrow custom protocol implementing ESP32-P4 → K1 3 Mbps dual UART real-time frame transmission
-8. **K1 Hardware Acceleration**: RISC-V Vector 1.0 (256-bit VLEN) vectorization + IME matrix extension instructions (2.0 TOPS)
-9. **Result Management**: Session-level tracking, JSON/CSV multi-format analysis report auto-export
+1. **Person Detection (Dual-Model Cascade)**: YOLOv8-Pose (PRIMARY person detector with 17 COCO keypoints) + YOLO11n (SECONDARY person detector), hardware-accelerated via ONNX Runtime + SpacemiT Execution Provider
+2. **Pose Estimation**: YOLOv8-Pose 17-keypoint COCO human skeleton estimation with OKS-based NMS
+3. **Face Recognition**: YOLOv5-Face lightweight face detection cascaded with ArcFace deep feature extraction (128-dimensional embedding vector)
+4. **Action Recognition**: ST-GCN (Spatial-Temporal Graph Convolutional Network) for skeleton-based action recognition from pose keypoints
+5. **Multi-Object Tracking**: ByteTrack-inspired cascade matching + Hungarian algorithm (Kuhn-Munkres) + 7-state Kalman filtering + EMA smoothing (α=0.30)
+6. **3D Spatial Localization**: Pinhole camera model-driven monocular depth estimation, fused with IMU pitch angle correction and world coordinate system initialization
+7. **AR Visualization**: Bounding box rendering, skeleton line overlay, trajectory top-down view rendering
+8. **Real-time Data Link**: Arrow custom protocol implementing ESP32-P4 → K1 3 Mbps dual UART real-time frame transmission
+9. **K1 Hardware Acceleration**: RISC-V Vector 1.0 (256-bit VLEN) vectorization + IME matrix extension instructions (2.0 TOPS)
+10. **Result Management**: Session-level tracking, JSON/CSV multi-format analysis report auto-export
 
 ### 1.3 Technical Specifications
 
 | Metric | Target Value | Current Status |
 |------|--------|----------|
 | Object Detection FPS (K1 EP INT8) | ≥25 | Estimated achievable, pending real-world testing |
-| Object Detection mAP50 (YOLOv8n) | ≥50% | Model integrated |
+| Object Detection mAP50 (YOLO11n) | ≥50% | Model integrated |
 | Face Detection AP (YOLOv5-Face) | ≥90% | Model integrated |
-| Face Recognition TAR@FAR=1e-4 | ≥95% | Model integrated |
+| Action Recognition Accuracy (ST-GCN) | ≥70% | Model integrated |
 | Tracking ID Switch Rate | <5% | Implemented |
 | Spatial Localization Error (<10m) | <20% | Implemented |
 | End-to-end Latency (Arrow→Display) | <200ms | Implemented |
@@ -72,9 +72,12 @@ The system provides the following core features:
 The academic and technical contributions of this project can be summarized in the following four aspects:
 
 1. **Heterogeneous Embedded AI System Paradigm**: Proposed and validated a dual-device heterogeneous computing architecture of "low-power front-end perception + RISC-V back-end inference," providing a reusable reference paradigm for embedded AI system design.
+
 2. **RISC-V AI Acceleration Practice**: Systematically explored the application of SpacemiT K1 chip's RVV 1.0 + IME instruction set in computer vision inference acceleration, accumulating valuable practical experience for this chip ecosystem.
-3. **Multi-sensor Fusion Localization**: Implemented a spatial localization scheme fusing three sources — vision (monocular depth estimation), inertial (IMU attitude correction), and barometric (altitude assist) — effectively improving the robustness of monocular visual depth estimation.
-4. **Full C Language Embedded Implementation**: The entire system is written in C11 standard, with over 15,000 lines of code, without relying on any heavyweight external frameworks, and can be ported to various resource-constrained platforms.
+
+3. **Multi-sensor Fusion Localization**: Implemented a spatial localization scheme fusing two sources — vision (monocular depth estimation) and inertial (IMU attitude correction) — effectively improving the robustness of monocular visual depth estimation.
+
+4. **Full C Language Embedded Implementation**: The entire system is written in C11 standard with a C++17 bridge for SpacemiT EP, without relying on any heavyweight external frameworks, and can be ported to various resource-constrained platforms.
 
 ---
 
@@ -92,7 +95,7 @@ This project selected YOLOv8n (nano version) as the pedestrian detection backbon
 
 For face detection, SCRFD [Guo et al., 2021] proposed Sample Redistribution and Computation Redistribution strategies, achieving competitive detection accuracy on the WIDER FACE dataset with an extremely small model of 0.8M parameters (SCRFD-0.5G). This project adopts the YOLOv5-Face version (~0.8M parameters), balancing accuracy and inference efficiency.
 
-For face recognition, ArcFace [Deng et al., 2019] significantly improved the inter-class separability and intra-class compactness of face feature embeddings by adding an Additive Angular Margin Loss in angular space. This project uses an ArcFace model based on the MobileFaceNet architecture, outputting 512-dimensional feature vectors for identity matching via cosine similarity.
+For face recognition, ArcFace [Deng et al., 2019] significantly improved the inter-class separability and intra-class compactness of face feature embeddings by adding an Additive Angular Margin Loss in angular space. This project uses an ArcFace model based on the MobileFaceNet-cuted architecture, outputting 128-dimensional feature vectors for identity matching via cosine similarity.
 
 ### 2.3 Multi-Object Tracking Methods
 
@@ -136,7 +139,7 @@ At the design philosophy level, the system adheres to the following core princip
 
 1. **Minimal Dependency Principle**: Core algorithm libraries have zero external dependencies (except the standard C library). ONNX Runtime is optionally integrated through `#ifdef HAS_ONNX_RUNTIME` conditional compilation, ensuring buildability and runnability in any POSIX-compatible environment.
 
-2. **Dual-Path Redundancy**: Each AI inference module supports both ONNX model inference and heuristic algorithm fallback paths. The system automatically degrades to pure C algorithms when ONNX Runtime is unavailable (sacrificing accuracy but maintaining functionality).
+2. **ONNX Runtime Required**: All AI inference modules require ONNX Runtime with either SpacemiT EP (RVV 1.0 + IME hardware acceleration) or CPU EP (real ONNX inference, no hardware acceleration). There is no heuristic fallback — the system depends on ONNX Runtime for inference.
 
 3. **Configuration-Driven Architecture**: All tunable parameters are managed uniformly through YAML-style configuration files, supporting runtime dynamic loading. Detection thresholds, tracking parameters, and visualization options can be adjusted without recompilation.
 
@@ -149,7 +152,7 @@ At the design philosophy level, the system adheres to the following core princip
 | C Compiler | GCC 13.2+ (riscv64-linux-gnu-gcc) | K1 native/cross-compilation |
 | C++ Compiler | G++ 13.2+ (riscv64-linux-gnu-g++) | SpacemiT EP C++ bridge layer |
 | CMake | ≥3.16 | Cross-platform build management |
-| Python 3 | ≥3.8 | Build auxiliary script (build.py) |
+| Python 3 | ≥3.8 | Development/debugging utilities |
 | ESP-IDF | v5.1+ | ESP32-P4 firmware development framework |
 | ONNX Runtime | SpacemiT ORT 2.0.2 | RISC-V AI inference acceleration |
 | SpacemiT EP | libspacemit_ep.so | RVV 1.0 + IME hardware acceleration |
@@ -165,7 +168,7 @@ The project adopts a quality assurance system driven by cognitive reviews. Durin
 - **Realtime JPEG Decode Completion**: Changed from gray fill placeholder to `soft_jpeg_decode_to_rgb()` real decoding
 - **Array Bounds Protection**: Added `MAX_DETECTIONS_PER_FRAME` boundary checks when writing inference results
 
-For detailed fix records, see [docs/Cognitive Review Report](docs/COGNITION_REVIEW_REPORT.md).
+For detailed change records, see [docs/CODE_CHANGE_LOG.md](docs/CODE_CHANGE_LOG.md).
 
 ---
 
@@ -248,8 +251,8 @@ The Shooter End (K1) software system adopts a strict layered architecture design
 │  ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐      │
 │  │InferencePipeline │ │ TrackingManager  │ │  SpatialEngine   │      │
 │  │                  │ │                  │ │                  │      │
-│  │ YOLOv8n ─►       │ │ ByteTrack 3-stage │ │ Pinhole camera model    │      │
-│  │ YOLOv8-Pose ─►   │ │ + 7-state Kalman │ │ + IMU correction      │      │
+│  │ YOLOv8-Pose(PRIMARY) │ │ Cascade+Hungarian │ │ Pinhole camera model    │      │
+│  │ YOLO11n(SECONDARY)  │ │ + 7-state Kalman │ │ + IMU correction      │      │
 │  │ YOLOv5-Face ─► ArcFace │ │ + EMA smoothing  │ │ + Trajectory management      │      │
 │  └──────────────────┘ └──────────────────┘ └──────────────────┘      │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -287,7 +290,7 @@ The Shooter End (K1) software system adopts a strict layered architecture design
 ```
 FrameData (uint8*, width, height, channels, timestamp)
     │
-    ├──▶ YOLOv8n     ──▶ Detection[] (bbox, conf, class_id, class_name)
+    ├──▶ YOLOv8-Pose ──▶ Detection[] (bbox, conf, class_id, class_name)
     │                        │
     │                        ├── Filtering (confidence/area/aspect ratio/NMS)
     │                        │
@@ -499,19 +502,19 @@ Slot acquisition and release adopt a **producer-consumer model**, implementing b
 
 ### 5.3 Inference Pipeline: Cascaded AI Model Execution
 
-[inference_pipeline.c](file:///d:/shool/大三下/embedded/lingqi_tantong_c/src/inference_pipeline.c) implements cascaded multi-model AI inference, executing sequentially in the order YOLOv8n → YOLOv8-Pose → YOLOv5-Face → ArcFace.
+[inference_pipeline.c](src/inference_pipeline.c) implements cascaded multi-model AI inference, executing sequentially in the order YOLOv8-Pose (PRIMARY) → YOLO11n (SECONDARY) → YOLOv5-Face → ArcFace → ST-GCN.
 
 #### 5.3.1 Model Loading
 
 ```c
-int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* model_dir) {
-    // 1. YOLOv8n pedestrian detection (required)
-    snprintf(path_buf, sizeof(path_buf), "%s/Human Recognition/yolo11n.q.onnx", model_dir);
-    pipeline->detector = yolov8_detector_create(path_buf, 320, 320, 0.40f, 0.45f, use_onnx);
+int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* model_dir, const ConfigManager* config) {
+    // 1. YOLOv8-Pose person detection + keypoints (PRIMARY, REQUIRED)
+    snprintf(path_buf, sizeof(path_buf), "%s/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx", model_dir);
+    pipeline->pose_estimator = yolov8_pose_estimator_create(path_buf, 640, 640, 0.10f, 0.40f);
     // If loading fails, entire pipeline unavailable → return -1
 
-    // 2. YOLOv8-Pose pose estimation (optional, warning only on load failure)
-    pipeline->pose_estimator = yolov8_pose_estimator_create(/* ... */);
+    // 2. YOLO11n person detection (SECONDARY, optional — pose-only mode if missing)
+    pipeline->detector = yolov8_detector_create(/* ... */);
 
     // 3. YOLOv5-Face face detection (optional)
     pipeline->face_detector = yolov5_face_detector_create(/* ... */);
@@ -519,84 +522,80 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
     // 4. ArcFace face recognition (optional)
     pipeline->face_recognizer = arcface_recognizer_create(/* ... */);
 
+    // 5. ST-GCN action recognition (optional)
+    pipeline->action_recognizer = stgcn_action_recognizer_create(/* ... */);
+
     return loaded_count;
 }
 ```
 
-**Design Decision**: Only the YOLOv8n detector is required (returns -1 indicating system unavailability); the remaining three models are optional (load failure only produces a warning log). This ensures the system can still provide core pedestrian detection + tracking functionality when some model files are missing.
+**Design Decision**: Only the YOLOv8-Pose model is required (returns -1 indicating system unavailability); the remaining four models are optional (load failure only produces a warning log). This ensures the system can still provide core person detection + tracking functionality when some model files are missing.
 
-#### 5.3.2 Detection Result Filtering Pipeline
+#### 5.3.2 Cascade State Machine
 
-From YOLOv8n raw output to valid detection results, three levels of filtering are applied:
+The inference pipeline adaptively switches between full-resolution search and reduced-frequency tracking to save inference time:
 
 ```
-Raw detections (up to 300)
+PIPELINE_CASCADE_SEARCHING: No confirmed tracks.
+  → Run YOLOv8-Pose (PRIMARY) + YOLO11n (SECONDARY) at 640×640.
+  → Apply keypoint anatomical + partial-body validation.
+  → Maximum recall, higher latency.
+
+PIPELINE_CASCADE_TRACKING: ≥1 confirmed track.
+  → Run YOLOv8-Pose every frame (PRIMARY).
+  → Run YOLO11n every ~3 frames (reduced frequency).
+  → New people entering are still detected within ~1 second.
+
+PIPELINE_CASCADE_VALIDATING: Periodic full-res check (1 frame).
+  → Same as SEARCHING: both models at 640×640.
+  → Triggered by: validation_interval timer OR multi-person detection trigger.
+```
+
+#### 5.3.3 Detection Result Filtering Pipeline
+
+From model raw output to valid detection results, a multi-level filter is applied:
+
+```
+Raw proposals (up to 6000)
     │
-    ▼ Level 1: Confidence filtering (min=0.45)
-    │  Discard boxes with conf < 0.45
+    ▼ Level 1: DFL peakiness confidence filtering
+    │  Discard proposals with dfl_conf < threshold
+    │  (INT8 cls head is broken; DFL peakiness is the real signal)
     ▼
     │
     ▼ Level 2: Geometric plausibility filtering
-    │  Discard boxes with area_ratio < 0.003 (too small) or > 0.7 (too large)
-    │  Discard boxes with height_ratio < 0.05 or > 0.95
-    │  Discard boxes with aspect_ratio < 0.25 or > 3.5 (non-human proportions)
+    │  Discard boxes with area_ratio < 0.005 or > 0.40
+    │  Discard boxes with height_ratio < 0.04 or > 0.75
+    │  Discard boxes with aspect_ratio < 0.30 or > 1.80 (non-human proportions)
     │  Discard boxes completely outside the frame
+    │  Check body aspect ratio (height/width must be human-like)
     ▼
     │
-    ▼ Level 3: Confidence sorting + NMS
-    │  Sort by confidence descending
-    │  NMS IoU threshold = 0.5, keep highest confidence boxes
+    ▼ Level 3: Keypoint-based anatomical validation (three-tier)
+    │  Tier 1: Full-body (paired shoulders/hips/knees required)
+    │  Tier 2: Upper-body fallback (keypoints 0-10, ≥4 valid)
+    │  Tier 3: Side-body fallback (one-side chain, ≥3 valid)
+    │  Partial-body detections marked but NOT rejected
     ▼
-Final detection results
+    │
+    ▼ Level 4: Dual-model consensus filter
+    │  When both models run, each detection must either:
+    │    (a) pass keypoint anatomical validation, OR
+    │    (b) be confirmed by BOTH models (IoU ≥ 0.35)
+    │  Solo detections without consensus are discarded
+    ▼
+    │
+    ▼ Level 5: Top-K + NMS
+    │  Sort by confidence descending
+    │  Top-K (50) globally across all stride groups
+    │  NMS per-stride (IoU 0.30) + final NMS (IoU 0.35)
+    ▼
+Final detection results (max 20)
 ```
 
-```c
-static int filter_detections(const Detection* input, int num_input, int img_w, int img_h,
-                              Detection* output, int max_output) {
-    for (int i = 0; i < num_input && filtered < max_output; i++) {
-        // Confidence filtering
-        if (det->confidence < 0.45f) continue;
-        // Area plausibility
-        float area_ratio = det_area / image_area;
-        if (area_ratio < 0.003f || area_ratio > 0.7f) continue;
-        // Height plausibility
-        float height_ratio = det_height / img_h;
-        if (height_ratio < 0.05f || height_ratio > 0.95f) continue;
-        // Aspect ratio plausibility (humans should be vertically elongated)
-        float aspect = bbox_width / max(det_height, 1.0f);
-        if (aspect < 0.25f || aspect > 3.5f) continue;
-        // Boundary check
-        if (det->bbox completely outside frame) continue;
-        output[filtered++] = *det;
-    }
-    // Confidence sorting + NMS (IoU threshold 0.5)
-    utils_sort_detections_by_confidence(output, filtered);
-    // NMS: For each high-confidence box, suppress low-confidence boxes with IoU > 0.5
-}
-```
+#### 5.3.4 YOLOv8-Pose Full-Frame Estimation
 
-#### 5.3.3 Per-Target Cropping Strategy for Pose Estimation
-
-YOLOv8-Pose does not perform inference on the entire frame, but instead crops → infers → coordinate remaps for each detected person:
-
-```c
-for each detection:
-    // 1. Calculate crop region (with 20% margin)
-    crop_rect = bbox.expand(0.2)
-
-    // 2. Crop the person's RGB sub-image
-    person_crop = extract_from_frame(frame, crop_rect)
-
-    // 3. Run pose estimation (up to 5 poses within person)
-    yolov8_pose_estimator_estimate(estimator, person_crop, ...)
-
-    // 4. Coordinate remapping (from local crop coordinates → global frame coordinates)
-    for each keypoint:
-        keypoint.x += crop_rect.x1
-        keypoint.y += crop_rect.y1
-```
-
-**Design Decision Rationale**: (1) With YOLOv8-Pose model at 640×640 input, if characters in the frame are small (<100px tall), keypoint localization accuracy drops significantly; (2) Per-target cropping + margin can scale characters closer to the model's expected scale; (3) Although this adds N_persons inference calls, the cropped sub-images are much smaller than the full frame, keeping actual computational cost manageable.
+YOLOv8-Pose performs inference on the entire frame (not per-target cropping), outputting up to 20 pose estimations per frame with COCO-17 keypoints decoded from xquant-split DFL regression + keypoint branches.
 
 #### 5.3.4 Face Detection and Recognition Cascade
 
@@ -619,13 +618,15 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
 }
 ```
 
-### 5.4 ByteTrack Multi-Object Tracking: Three-Stage Matching + Kalman Filtering
+### 5.4 ByteTrack Multi-Object Tracking: Cascade Matching + Hungarian + Kalman Filtering
 
-[tracking_manager.c](file:///d:/shool/大三下/embedded/lingqi_tantong_c/src/tracking_manager.c) implements a multi-object tracker following the ByteTrack paradigm.
+[tracking_manager.c](src/tracking_manager.c) implements a multi-object tracker following the ByteTrack paradigm with cascade matching, Hungarian algorithm, appearance features, and occlusion handling.
 
 #### 5.4.1 7-State Kalman Filter
 
 **State Vector**: $\mathbf{x} = [cx, cy, area, aspect\_ratio, \dot{cx}, \dot{cy}, \dot{area}]$
+
+Where $cx, cy$ are the bbox center coordinates, $area$ is the bbox area, $aspect\_ratio$ is width/height, and $\dot{cx}, \dot{cy}, \dot{area}$ are their velocities.
 
 **State Transition Matrix** (constant velocity motion model):
 $\mathbf{F} = \begin{bmatrix} 1 & 0 & 0 & 0 & dt & 0 & 0 \\ 0 & 1 & 0 & 0 & 0 & dt & 0 \\ 0 & 0 & 1 & 0 & 0 & 0 & dt \\ 0 & 0 & 0 & 1 & 0 & 0 & 0 \\ 0 & 0 & 0 & 0 & 1 & 0 & 0 \\ 0 & 0 & 0 & 0 & 0 & 1 & 0 \\ 0 & 0 & 0 & 0 & 0 & 0 & 0 \end{bmatrix}$
@@ -640,119 +641,47 @@ static void kalman_init(KalmanBoxTracker* kf, const BoundingBox* bbox, int track
     kf->state[3] = bbox_width / bbox_height;  // aspect ratio
     kf->state[4..6] = 0.0f;                   // velocities initialized to zero
 
-    // Covariance matrix diagonal initialization (position moderately trusted, velocity highly uncertain)
-    for i in 0..6:
-        covariance[i][i] = (i < 4) ? 10.0 : 1000.0
-
-    // Process noise: q = 0.04 (position), q*10 = 0.4 (velocity)
-    // Measurement noise: diagonal 0.1
+    // Process noise: q_pos = 0.02 (position), q_vel = 0.04 (velocity)
+    // Measurement noise: diagonal 0.15
 }
 ```
 
 **Prediction Step** ($\hat{\mathbf{x}}_{k+1} = \mathbf{F} \mathbf{x}_k$, $\mathbf{P}_{k+1} = \mathbf{F} \mathbf{P}_k \mathbf{F}^T + \mathbf{Q}$):
-
 ```c
 static void kalman_predict(KalmanBoxTracker* kf) {
-    // State prediction: x_new = F × x (7×7 × 7×1 = 7×1)
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 7; j++)
-            new_state[i] += transition[i][j] * state[j];
-
+    // State prediction: x_new = F × x
     // Covariance prediction: P_new = F × P × F^T + Q
-    utils_matrix_multiply_abt(transition, covariance, new_cov);
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 7; j++)
-            covariance[i][j] = new_cov[i][j] + process_noise[i][j];
 }
 ```
 
 **Update Step** (standard Kalman update: $\mathbf{K} = \mathbf{P} \mathbf{H}^T (\mathbf{H} \mathbf{P} \mathbf{H}^T + \mathbf{R})^{-1}$, $\mathbf{x} = \mathbf{x} + \mathbf{K} (\mathbf{z} - \mathbf{H}\mathbf{x})$):
-
 ```c
 static void kalman_update(KalmanBoxTracker* kf, const BoundingBox* bbox) {
     // Measurement vector z = [cx, cy, area, aspect_ratio]
     // Innovation y = z - H × x
     // Innovation covariance S = H × P × H^T + R
-    // Kalman gain K = P × H^T × S^(-1)
+    // Kalman gain K = P × H^T × S^(-1)  (with diagonal fallback)
     // State update x = x + K × y
     // Covariance update P = (I - K×H) × P
 }
 ```
 
-#### 5.4.2 Three-Stage Data Association Strategy
+#### 5.4.2 Cascade Matching with Hungarian Algorithm
 
-Drawing on ByteTrack's core idea, the association process is divided into three stages:
-
-```
-Stage 1: HIGH conf(≥0.6) + confirmed tracks
-  → IoU matching (threshold=0.3, HIGH conf detection vs confirmed track prediction)
-Stage 2: LOW conf(0.1-0.6) + remaining tracks
-  → IoU matching (threshold=0.5, LOW conf detection vs unmatched track prediction)
-Stage 3: UNMATCHED tracks + UNMATCHED detections
-  → Unmatched high-confidence detections → Create new track (tentative state)
-  → Unmatched tracks → lost_count++
-```
-
-```c
-TrackingResult object_tracker_update(ObjectTracker* tracker,
-                                      const Detection* detections, int num_detections,
-                                      const SpatialPosition* positions, int num_positions,
-                                      int frame_num) {
-    // 0. Predict all existing tracks (Kalman predict)
-    for each track:
-        kalman_predict(&track.kf)
-        predicted_bbox = kalman_get_bbox(&track.kf)
-
-    // 1. Three-stage IoU matching
-    for stage in [0, 1, 2]:
-        iou_thresh = (stage == 1) ? 0.5 : 0.3
-        for each unmatched track:
-            for each unmatched detection:
-                iou = bbox_iou(track.pred_bbox, detection.bbox)
-                if iou > iou_thresh:
-                    best_match = (track, detection, iou)
-
-            if found_match:
-                kalman_update(track, detection)
-                EMA_smooth(track.spatial_pos, detection.position)
-                mark_matched(track, detection)
-
-    // 2. Unmatched tracks → lost_count++
-    for unmatched tracks:
-        track.lost_count++
-        track.bbox = predicted_bbox  // Continue maintaining with Kalman prediction
-
-    // 3. Unmatched high-conf detections → Create new tracks
-    for unmatched high-conf(≥0.6) detections:
-        create_track(tracker, detection, position, frame_num)
-        result.new_tracks++
-
-    // 4. Remove timed-out tracks
-    for tracks with lost_count > max_lost:
-        remove_track(tracker, idx)
-        result.lost_tracks++
-
-    // 5. Only return confirmed tracks (consecutive_hits ≥ 3)
-    return confirmed_tracks;
-}
-```
+The tracker uses cascade matching (grouping tracks by time-since-update, matching freshest first) with the Kuhn-Munkres Hungarian algorithm for optimal global assignment, replacing greedy IoU matching. The cost matrix combines IoU (65% weight) and appearance feature cosine distance (35% weight).
 
 #### 5.4.3 EMA Spatial Coordinate Smoothing
 
-For each successfully matched tracked object, Exponential Moving Average (α=0.25) smoothing is applied to spatial coordinates to reduce inter-frame jitter:
-
+For each successfully matched tracked object, Exponential Moving Average (α=0.30) smoothing is applied to spatial coordinates to reduce inter-frame jitter:
 ```c
-if (entry->smoothed_count > 0) {
-    SpatialPosition* last = &entry->smoothed_positions[latest];
-    smoothed.x = 0.25 * position->x + 0.75 * last->x;
-    smoothed.y = 0.25 * position->y + 0.75 * last->y;
-    smoothed.z = 0.25 * position->z + 0.75 * last->z;
-}
+smoothed.x = 0.30 * position->x + 0.70 * last->x;
+smoothed.y = 0.30 * position->y + 0.70 * last->y;
+smoothed.z = 0.30 * position->z + 0.70 * last->z;
 ```
 
 ### 5.5 3D Spatial Localization: Pinhole Camera Model
 
-[spatial_engine.c](file:///d:/shool/大三下/embedded/lingqi_tantong_c/src/spatial_engine.c) implements monocular visual depth estimation and 3D coordinate computation based on the pinhole camera model.
+[spatial_engine.c](src/spatial_engine.c) implements monocular visual depth estimation and 3D coordinate computation based on the pinhole camera model.
 
 #### 5.5.1 Mathematical Model
 
@@ -760,7 +689,7 @@ if (entry->smoothed_count > 0) {
 
 $$Z = \frac{f_y \cdot H_{avg}}{h_{bbox}}$$
 
-Where $f_y$ is the camera focal length (pixels), $H_{avg} = 1.70\text{m}$ is the assumed average human height, and $h_{bbox}$ is the detection box height (pixels).
+Where $f_y$ is the camera focal length (pixels, default 960), $H_{avg} = 1.70\text{m}$ is the assumed average human height, and $h_{bbox}$ is the detection box height (pixels). Depth is clamped to [0.5m, 50m].
 
 **3D Coordinate Back-projection (pixels → camera coordinate system)**:
 
@@ -768,59 +697,13 @@ $$X_{cam} = \frac{(u - c_x) \cdot Z}{f_x}$$
 $$Y_{cam} = \frac{(v - c_y) \cdot Z}{f_y}$$
 $$Z_{cam} = Z$$
 
-Where $(u, v)$ is the detection box bottom center pixel coordinates, and $(c_x, c_y)$ is the camera optical center.
-
-**World Coordinate System Alignment**:
-
-$$X_{world} = X_{cam} - X_{origin}$$
-$$Y_{world} = Y_{cam} - Y_{origin}$$
-$$Z_{world} = Z_{cam} - Z_{origin}$$
+Where $(u, v)$ is the detection box center pixel coordinates, and $(c_x, c_y)$ is the camera optical center (default: 960, 540 for 1920×1080).
 
 **IMU Pitch Angle Depth Correction**:
 
 $$Z_{corrected} = Z \cdot \cos(\theta_{pitch})$$
 
-When the camera tilts downward (pitch angle $\theta_{pitch} > 0$), the true depth is greater than the vertical direction estimate, compensated by cosine correction.
-
-#### 5.5.2 Code Implementation
-
-```c
-SpatialResult spatial_engine_calculate_position(SpatialLocalizationEngine* engine,
-                                                 const Detection* detection,
-                                                 int frame_width, int frame_height,
-                                                 const float* depth_map, int depth_w, int depth_h) {
-    // 1. Depth estimation
-    if (depth_map) {
-        // Path A: Use external depth map (MiDaS etc., take median of 5×5 patch at bbox center)
-        depth = median(depth_map, bbox_center, 5x5_patch);
-        confidence = 0.9f;
-    } else {
-        // Path B: Prior depth estimation based on bounding box height
-        depth = (avg_person_height * focal_length) / bbox_height(detection);
-        depth = clamp(depth, 0.3f, 120.0f);
-        confidence = max(0.3f, 1.0f - (depth / 120.0f) * 0.7f);
-    }
-
-    // 2. IMU pitch angle correction
-    if (has_camera_pose && fabsf(camera_pitch) > 0.001f) {
-        float pitch_rad = camera_pitch * (M_PI / 180.0f);
-        depth *= cosf(pitch_rad);
-    }
-
-    // 3. Pixel → world coordinate conversion
-    float u = bbox_center_x(&detection->bbox);
-    float v = bbox_center_y(&detection->bbox);
-    float world_x = (u - cx) * depth / fx;
-    float world_y = (v - cy) * depth / fy;
-    float world_z = depth;
-
-    // 4. World origin alignment (first detected target in first frame as origin)
-    result.position.x = world_x - engine->world_origin.x;
-    result.position.y = world_y - engine->world_origin.y;
-    result.position.z = world_z - engine->world_origin.z;
-    return result;
-}
-```
+When the camera tilts downward (pitch angle $\theta_{pitch} > 0$), the true depth is greater than the vertical direction estimate.
 
 #### 5.5.3 Coordinate System Initialization
 
@@ -920,7 +803,7 @@ Step 8: Quaternion → Euler angle conversion
 
 #### 5.7.1 Arrow End Frame Format (ESP32-P4 → K1 UART)
 
-[protocol.c](file:///d:/shool/大三下/embedded/lingqi_tantong_c/esp32p4_firmware/main/protocol.c) defines the following frame format:
+The Arrow custom protocol defines the following frame format for ESP32-P4 → K1 UART communication:
 
 ```
 ┌──────────┬──────┬──────┬──────────┬────────┬──────────────┬──────┬──────────┐
@@ -1069,7 +952,7 @@ The [C→C++ bridge layer](file:///d:/shool/大三下/embedded/lingqi_tantong_c/
 | CMake | ≥3.16 | Build system |
 | SpacemiT ONNX Runtime | 2.0.2 | [Official Download](https://archive.spacemit.com/spacemit-ai/onnxruntime/spacemit-ort.riscv64.2.0.2.tar.gz) |
 | ESP-IDF | v5.1+ | ESP32-P4 firmware compilation |
-| Python 3 | ≥3.8 | build.py auxiliary script |
+| Python 3 | ≥3.8 | Development/debugging utilities |
 
 ### 6.2 Installation Steps (K1 Native Build)
 
@@ -1110,14 +993,20 @@ cmake --build build -j$(nproc)
 scp build/lingqi_tantong k1@192.168.1.x:/home/k1/
 ```
 
-### 6.4 Python Build Script
+### 6.4 Building for Different Platforms
 
 ```bash
-python build.py riscv64              # RISC-V cross-compilation
-python build.py host                 # Local development testing (host mode, no EP)
-python build.py test                 # Compile and run unit tests
-python build.py clean                # Clean build artifacts
-python build.py deploy --deploy-host 192.168.1.100   # Auto SCP deployment
+# RISC-V cross-compilation
+cmake -B build_riscv \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64-toolchain.cmake \
+  -DBIANBU_SYSROOT=/path/to/bianbu-sysroot \
+  -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.2.0.2 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build_riscv -j$(nproc)
+
+# x86 Linux development build
+cmake -B build -DUSE_ONNX_RUNTIME=ON -DONNX_RUNTIME_DIR=/path/to/onnxruntime
+cmake --build build -j$(nproc)
 ```
 
 ### 6.5 Command-Line Parameters Reference
@@ -1157,34 +1046,17 @@ python build.py deploy --deploy-host 192.168.1.100   # Auto SCP deployment
     --uart-C /dev/ttyS1 \
     --baudrate 3000000 \
     --config configs/default.yaml
-
-# WSL one-click run
-bash run_wsl.sh
 ```
 
-### 6.7 Unit Tests
+### 6.7 Testing
+
+Unit tests and integration tests are under development. Run the application with a test video to verify functionality:
 
 ```bash
-./test_basic
+./lingqi_tantong --video_path test_video.mp4 --max_frames 50
 ```
 
-Expected output:
-```
-===== LingQi TanTong Basic Tests =====
-PASSED: test_bounding_box_iou
-PASSED: test_distance_calculation
-PASSED: test_trajectory_buffer
-PASSED: test_config_manager
-PASSED: test_detector_create
-PASSED: test_tracker_three_frame_confirmation
-PASSED: test_spatial_engine_depth_estimation
-PASSED: test_utils_clamp
-PASSED: test_utils_sort
-PASSED: test_inference_pipeline_create
-PASSED: test_result_manager_session
-PASSED: test_frame_data_init
-===== All 12 tests PASSED =====
-```
+For production deployment, use the systemd service configuration below.
 
 ### 6.8 systemd Service Deployment (Production)
 
@@ -1226,7 +1098,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 
 | Parameter | Type | Default | Valid Range | Description |
 |------|------|--------|----------|------|
-| `use_onnx` | bool | `false` | — | Whether to enable ONNX Runtime inference (false=heuristic fallback) |
+| `use_onnx` | bool | `true` | — | Whether to enable ONNX Runtime inference (required for all AI models) |
 | `log_level` | string | `INFO` | DEBUG/INFO/WARN/ERROR | Global log level |
 | `startup_mode` | string | `realtime` | offline/realtime/benchmark | Default startup mode |
 | `max_frames` | int | `0` | ≥0 | Maximum frames to process (0=unlimited) |
@@ -1260,7 +1132,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | Parameter | Type | Default | Valid Range | Description |
 |------|------|--------|----------|------|
 | `backend` | string | `cpu` | cpu/ai_accel | Inference backend |
-| `model` | string | — | — | YOLOv8n ONNX model path |
+| `model_path` | string | — | — | YOLO11n ONNX model path |
 | `confidence_threshold` | float | `0.25` | 0.0-1.0 | Raw detection confidence threshold |
 | `iou_threshold` | float | `0.45` | 0.0-1.0 | NMS IoU threshold |
 | `input_size` | int | `320` | 320/640 | Model input size |
@@ -1343,23 +1215,9 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 
 A: Check the build log for `SpacemiT EP: YES (RVV 1.0 + IME)` output. At runtime, check logs for successful `SessionOptionsSpaceMITEnvInit` call records.
 
-**Q: What is the detection accuracy of heuristic fallback (without ONNX Runtime)?**
-
-A: Heuristic fallback accuracy is very low (mAP < 10%), only used for verifying pipeline flow integrity. Production deployment **must** enable ONNX Runtime + SpacemiT EP.
-
 **Q: K1 has no independent NPU, how to understand the 2.0 TOPS compute?**
 
 A: The K1 X60 core achieves AI acceleration through RVV 1.0 (256-bit vector) + IME (16 custom matrix instructions) within the CPU core. "2.0 TOPS" is the equivalent compute of these instruction extensions in INT8 inference scenarios. The core advantage is zero copy overhead (data processed within the CPU core, no DMA transfer to a separate NPU required).
-
-**Q: How to independently compile ESP32-P4 firmware?**
-
-A: ESP32-P4 firmware is a standalone ESP-IDF project located in the `esp32p4_firmware/` directory:
-```bash
-cd esp32p4_firmware
-idf.py set-target esp32p4
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
-```
 
 ---
 
@@ -1369,7 +1227,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 | Model | CPU-only (FP32) | SpacemiT EP (FP32) | EP (INT8 Quantized) |
 |------|----------------|--------------------|-------------------|
-| YOLOv8n (320×320) | ~500ms | ~200ms | **~60ms** |
+| YOLO11n (320×320) | ~500ms | ~200ms | **~60ms** |
 | YOLOv8-Pose (640×640) | ~800ms | ~350ms | **~100ms** |
 | YOLOv5-Face (320×320) | ~300ms | ~120ms | **~40ms** |
 | ArcFace (112×112) | ~100ms | ~40ms | **~15ms** |
@@ -1380,7 +1238,6 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 | Scenario | FPS | Latency (ms) | Memory (MB) |
 |------|-----|-----------|-----------|
-| No ONNX (heuristic fallback) | 85-120 | 8-12 | 45 |
 | ONNX CPU (FP32) | 18-25 | 40-55 | 180 |
 | ONNX CPU (INT8) | 35-50 | 20-28 | 120 |
 
@@ -1435,7 +1292,7 @@ export LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 
 | Metric | Target Value | Current Estimate |
 |------|--------|----------|
-| End-to-end FPS (EP INT8, YOLOv8n only) | ≥30 | ~17 (4-model cascade) |
+| End-to-end FPS (EP INT8, YOLO11n only) | ≥30 | ~17 (4-model cascade) |
 | End-to-end Latency (Arrow → Display) | <200ms | ~150ms (excluding Arrow) |
 | Memory Usage | <800 MB | ~600 MB (estimated) |
 | Model Loading Time | <10s | Pending real-world testing |
@@ -1466,7 +1323,7 @@ export LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 
 #### v1.2 (Near-term High Priority)
 
-- [ ] **Full INT8 Model Quantization**: All four models (YOLOv8n / YOLOv8-Pose / YOLOv5-Face / ArcFace) INT8 quantized
+- [x] **Full INT8 Model Quantization**: All key models (YOLO11n / YOLOv8-Pose / YOLOv5-Face / ArcFace) are INT8-quantized; ST-GCN remains FP32
 - [ ] **K1 Hardware Benchmarking**: `onnxruntime_perf_test -e spacemit` to obtain real performance data
 - [ ] **EP vs CPU-only Real-world Comparison Report**
 - [ ] **RVV Hand-written Vectorization**: letterbox, NMS, matrix multiplication critical path RVV intrinsic optimization
@@ -1477,7 +1334,6 @@ export LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 - [ ] **VINS-Mono Visual-Inertial Odometry**: IMU pre-integration + sliding window Bundle Adjustment
 - [ ] **ATW Asynchronous Time Warp**: OpenGL ES 3.2 fragment shader implementation, MTP ≤ 17.8ms
 - [ ] **MiDaS Depth Estimation ONNX INT8**: Replace current height-prior depth estimation
-- [ ] **TinierHAR-GRU Temporal Action Recognition**: 30-frame sliding window → 6-class action classification
 - [ ] **ICP Point Cloud Registration**: Arrow End → Shooter End spatial coordinate system alignment
 
 #### v3.0 (Long-term Engineering Optimization)
@@ -1587,17 +1443,19 @@ export LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 
 ```
 lingqi_tantong_c/
-├── include/                              # Header files (29)
+├── include/                              # Header files (30)
 │   ├── core_types.h                      #   Core data types + inline functions
 │   ├── system_controller.h               #   System main controller interface
 │   ├── inference_pipeline.h              #   AI inference pipeline interface
 │   ├── tracking_manager.h                #   Multi-object tracking interface
 │   ├── spatial_engine.h                  #   3D spatial localization interface
-│   ├── yolov8_detector.h                 #   YOLOv8 detector interface
+│   ├── yolov8_detector.h                 #   YOLO11 detector interface
 │   ├── yolov8_pose_estimator.h           #   YOLOv8 pose estimation interface
 │   ├── yolov5_face_detector.h            #   YOLOv5-Face face detection interface
-│   ├── scrfd_detector.h                  #   SCRFD face detection interface (legacy compatibility)
+│   ├── scrfd_detector.h                  #   SCRFD face detection interface (legacy)
 │   ├── arcface_recognizer.h              #   ArcFace face recognition interface
+│   ├── stgcn_action_recognizer.h         #   ST-GCN action recognizer interface
+│   ├── keypoint_validator.h              #   Keypoint anatomical validator interface
 │   ├── visualizer.h                      #   Visualization rendering interface
 │   ├── ar_renderer.h                     #   AR rendering interface
 │   ├── video_processor.h                 #   Video frame reading interface
@@ -1607,6 +1465,7 @@ lingqi_tantong_c/
 │   ├── kcp_lite.h                        #   KCP reliable transport protocol interface
 │   ├── mahony_filter.h                   #   Mahony complementary filter interface
 │   ├── ort_common.h                      #   ONNX Runtime shared module
+│   ├── ort_inference_context.h           #   ONNX inference context interface
 │   ├── spacemit_ort_bridge.h             #   SpacemiT EP C↔C++ bridge
 │   ├── ai_accel_adapter.h                #   RISC-V AI acceleration adapter layer
 │   ├── config_manager.h                  #   Configuration manager interface
@@ -1621,22 +1480,25 @@ lingqi_tantong_c/
 │   ├── main.c                            #   Program entry
 │   ├── system_controller.c               #   System controller implementation
 │   ├── inference_pipeline.c              #   Inference pipeline implementation
-│   ├── tracking_manager.c                #   Tracking manager implementation
+│   ├── tracking_manager.c                #   Tracking manager implementation (Hungarian + cascade)
 │   ├── spatial_engine.c                  #   Spatial engine implementation
-│   ├── yolov8_detector.c                 #   YOLOv8 detector (ONNX+heuristic)
-│   ├── yolov8_pose_estimator.c           #   YOLOv8 pose estimation
-│   ├── yolov5_face_detector.c             #   YOLOv5-Face face detection
-│   ├── scrfd_detector.c                  #   SCRFD face detection (legacy compatibility)
-│   ├── arcface_recognizer.c              #   ArcFace face recognition
+│   ├── yolov8_detector.c                 #   YOLO11 detector (ONNX only, DFL decode)
+│   ├── yolov8_pose_estimator.c           #   YOLOv8 pose estimation (ONNX only, OKS NMS)
+│   ├── yolov5_face_detector.c             #   YOLOv5-Face face detection (ONNX only)
+│   ├── scrfd_detector.c                  #   SCRFD face detection (ONNX only)
+│   ├── arcface_recognizer.c              #   ArcFace face recognition (ONNX only)
+│   ├── stgcn_action_recognizer.c         #   ST-GCN action recognition (ONNX only)
+│   ├── keypoint_validator.c              #   Keypoint anatomical validation
 │   ├── visualizer.c                      #   Visualization rendering
 │   ├── ar_renderer.c                     #   AR rendering
-│   ├── video_processor.c                 #   Video processing
+│   ├── video_processor.c                 #   Video processing (ffmpeg + V4L2)
 │   ├── video_writer.c                    #   Video writing
 │   ├── imu_handler.c                     #   IMU processing
 │   ├── arrow_receiver.c                  #   Arrow protocol reception
-│   ├── kcp_lite.c                        #   KCP-Lite implementation (576 lines)
+│   ├── kcp_lite.c                        #   KCP-Lite implementation
 │   ├── mahony_filter.c                   #   Mahony filtering
 │   ├── ort_common.c                      #   ONNX Runtime shared
+│   ├── ort_inference_context.c           #   ONNX inference context
 │   ├── spacemit_ort_bridge.cpp           #   SpacemiT EP C++ bridge
 │   ├── ai_accel_adapter.c               #   AI acceleration adapter
 │   ├── config_manager.c                  #   Configuration manager
@@ -1648,48 +1510,38 @@ lingqi_tantong_c/
 │   ├── core_types.c                      #   Core type helpers
 │   ├── k1_platform.c                     #   K1 platform detection
 │   └── benchmark.c                       #   Performance benchmark
-├── esp32p4_firmware/                     # ESP32-P4 Arrow End firmware
-│   ├── CMakeLists.txt                    #   ESP-IDF project file
-│   ├── partitions.csv                    #   Partition table
-│   ├── sdkconfig.defaults                #   Default SDK configuration
-│   └── main/
-│       ├── CMakeLists.txt                #   Component configuration
-│       ├── main.c                        #   Firmware entry (FreeRTOS 3 tasks)
-│       ├── camera_capture.c/h            #   Camera JPEG capture
-│       ├── gy87_driver.c/h               #   GY-87 I²C three-chip driver
-│       ├── imu_fusion.c/h                #   Madgwick 9-DOF fusion
-│       └── protocol.c/h                  #   Arrow frame protocol (UART)
 ├── cmake/                                # CMake toolchain files
 │   ├── riscv64-toolchain.cmake           #   RISC-V cross-compilation toolchain
 │   └── esp32p4-toolchain.cmake           #   ESP32-P4 toolchain
 ├── configs/
 │   └── default.yaml                      #   Default full-parameter configuration
 ├── models/                               # ONNX model files
-│   ├── Human Recognition/yolo11n.q.onnx    #   YOLO11n pedestrian detection
-│   ├── Face Recognition/                 #   Face detection + recognition models
-│   │   ├── yolov5n-face_cut.q.onnx   #      YOLOv5-Face face detection
-│   │   ├── arcface_mobilefacenet_cut.q.onnx #    ArcFace feature extraction
-│   │   ├── 1k3d68.onnx                  #      3D face keypoints
-│   │   ├── 2d106det.onnx                #      2D face keypoints
-│   │   └── genderage.onnx               #      Gender/age estimation
+│   ├── Human Recognition/
+│   │   └── yolo11n.q.onnx                #   YOLO11n person detection (quantized)
+│   ├── Face Recognition/
+│   │   ├── yolov5n-face_cut.q.onnx       #   YOLOv5-Face face detection (quantized)
+│   │   └── arcface_mobilefacenet_cut.q.onnx  # ArcFace feature extraction (quantized)
 │   └── Action Prediction/
 │       └── Skeleton Recognition/
-│           └── yolov8n-pose.q.onnx         #   YOLOv8-Pose 17 keypoints
+│           ├── yolov8n-pose.q.onnx       #   YOLOv8-Pose 17 keypoints (quantized)
+│           └── stgcn.fp32.onnx           #   ST-GCN action recognition (FP32)
 ├── docs/                                 # Design documents
 │   ├── ARCHITECTURE.md                   #   Architecture design details
-│   ├── BUILD_GUIDE.md                    #   Build and deployment guide
+│   ├── CODE_CHANGE_LOG.md                #   Code change log (v2.0 optimization)
 │   ├── IMPLEMENTATION_GAPS.md            #   Unimplemented module list
-│   ├── IMPROVEMENT_PLAN.md               #   Improvement plan
-│   ├── IMPROVEMENTS.md                  #   Improvement details
-│   └── COGNITION_REVIEW_REPORT.md       #   Systematic cognitive review report
-├── tests/
-│   └── test_basic.c                      #   12 basic unit tests
+│   ├── OPTIMIZATION_DESIGN.md            #   Optimization design document
+│   ├── PROBLEM_ANALYSIS_REPORT.md        #   Problem analysis report
+│   ├── REFACTORING_REPORT.md             #   Refactoring report
+│   ├── TESTING_GUIDE.md                  #   Testing guide
+│   └── TESTING_GUIDE_V2.md               #   Testing guide v2
+├── receive/                              # ESP32-P4 / Arrow-end test scripts
+│   ├── test-new-noface.py                #   Python test receiver
+│   ├── test-ov-imu.py                    #   IMU test script
+│   ├── test-ov-imu.ino                   #   Arduino IMU test
+│   └── test-udp.py                       #   UDP test script
 ├── CMakeLists.txt                        #   Top-level CMake build configuration
-├── build.py                              #   Python build/deploy script
-├── run_wsl.sh                            #   WSL one-click run script
-├── verify_port.py                        #   C porting verification tool
+├── configs/default.yaml                  #   Default configuration
 ├── test_video.mp4                        #   Test video file
-├── output/                               #   Output directory
 └── README.md                             #   This document
 ```
 
@@ -1718,6 +1570,6 @@ lingqi_tantong_c/
 
 > **Project Repository**: lingqi_tantong_c
 > **License**: Proprietary
-> **Last Updated**: 2026-05
-> **Total Code**: >15,000 lines C/C++ (including ESP32-P4 firmware)
-> **Code Coverage**: 100% source code review passed (41 issues fixed)
+> **Last Updated**: 2026-06
+> **Total Code**: ~12,000 lines C/C++ (Shooter End, K1 Muse Pi Pro)
+> **Models**: 5 ONNX models (4 INT8-quantized + 1 FP32)
