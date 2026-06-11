@@ -205,6 +205,7 @@ set(DATA_SOURCES
     src/imu_handler.c
     src/model_store.c
     src/arrow_receiver.c
+    src/mjpeg_receiver.c
 )
 
 set(MODEL_SOURCES

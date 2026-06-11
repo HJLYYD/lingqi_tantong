@@ -103,41 +103,7 @@ static void ring_destroy(DisplayOutput* d) {
 }
 
 /*
- * Find the next slot that:
- *   - is filled
- *   - has NOT been consumed by channel `read_idx` relative to `write_idx`
- *   - has the highest frame_index (always consume the latest frame)
- *
- * This implements a "display latest" policy: if the pipeline is faster than
- * the display channel, intermediate frames are skipped so the display always
- * shows the most recent result (no growing latency queue).
- */
-static int ring_find_latest_for(DisplayOutput* d, int* my_read_idx) {
-    int best_slot = -1;
-    int best_frame = -1;
-
-    for (int i = 0; i < DISPLAY_RING_SIZE; i++) {
-        DisplaySlot* s = &d->slots[i];
-        if (!s->filled) continue;
-        if (*my_read_idx == d->write_idx) {
-            /* Everything already consumed — check if this slot was seen */
-            /* Use frame_index to determine freshness */
-        }
-        if (s->frame_index > best_frame) {
-            /* Check this slot is newer than what we last consumed */
-            best_frame = s->frame_index;
-            best_slot = i;
-        }
-    }
-
-    if (best_slot >= 0) {
-        *my_read_idx = (best_slot + 1) % DISPLAY_RING_SIZE;
-    }
-    return best_slot;
-}
-
-/*
- * Simple latest-frame consumer: grab the most recently written filled slot
+ * Latest-frame consumer: grab the most recently written filled slot
  * that hasn't been consumed yet (tracked per-channel via frame_index).
  */
 static int ring_consume_latest(DisplayOutput* d, int* last_seen_frame,

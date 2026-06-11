@@ -60,12 +60,18 @@ static void print_usage(const char* program_name) {
     printf("  --save-video                Save output to MP4 video file\n");
     printf("  --max-frames <N>            Max frames to process in realtime mode (0=unlimited)\n");
     printf("  --frame-timeout <S>         Auto-exit after S seconds of no frames (default: 10)\n");
+    printf("  --mjpeg                     Enable MJPEG HTTP receiver (ESP32 WiFi)\n");
+    printf("  --mjpeg-ip <ip>             ESP32 IP address (default: 192.168.4.1)\n");
+    printf("  --mjpeg-port <port>         ESP32 HTTP port (default: 80)\n");
+    printf("  --wifi-ssid <ssid>          WiFi SSID to connect (default: ESP32-Camera-AP)\n");
+    printf("  --wifi-password <pw>        WiFi password (default: 12345678)\n");
     printf("  --help                      Show this help\n");
     printf("\nExamples:\n");
-    printf("  %s --realtime\n", program_name);
-    printf("  %s --realtime --display\n", program_name);
-    printf("  %s --realtime --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
-    printf("  %s --realtime --udp-stream udp://192.168.1.100:1234 --save-video\n", program_name);
+    printf("  %s --realtime --mjpeg --display\n", program_name);
+    printf("  %s --realtime --mjpeg --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
+    printf("  %s --realtime --mjpeg --max-frames 300 --save-video\n", program_name);
+    printf("  %s --realtime --mjpeg --mjpeg-ip 192.168.4.1 --display\n", program_name);
+    printf("  %s --realtime --mjpeg --udp-stream udp://192.168.1.100:1234\n", program_name);
     printf("  %s --realtime --uart-A /dev/ttyS0 --uart-C /dev/ttyS1 --baudrate 3000000\n", program_name);
     printf("  %s --video_path test.mp4 --save_frame_interval 1\n", program_name);
     printf("  %s --video_path test.mp4 --max_frames 100\n", program_name);
@@ -91,6 +97,13 @@ int main(int argc, char* argv[]) {
     bool cli_save_video = false;
     int cli_max_frames = 0;
     int cli_frame_timeout = 0;
+
+    /* MJPEG receiver CLI overrides */
+    bool cli_mjpeg_enabled = false;
+    const char* cli_mjpeg_ip = NULL;
+    int  cli_mjpeg_port = 0;
+    const char* cli_wifi_ssid = NULL;
+    const char* cli_wifi_password = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -135,6 +148,16 @@ int main(int argc, char* argv[]) {
             cli_max_frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frame-timeout") == 0 && i + 1 < argc) {
             cli_frame_timeout = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--mjpeg") == 0) {
+            cli_mjpeg_enabled = true;
+        } else if (strcmp(argv[i], "--mjpeg-ip") == 0 && i + 1 < argc) {
+            cli_mjpeg_ip = argv[++i];
+        } else if (strcmp(argv[i], "--mjpeg-port") == 0 && i + 1 < argc) {
+            cli_mjpeg_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--wifi-ssid") == 0 && i + 1 < argc) {
+            cli_wifi_ssid = argv[++i];
+        } else if (strcmp(argv[i], "--wifi-password") == 0 && i + 1 < argc) {
+            cli_wifi_password = argv[++i];
         }
     }
 
@@ -198,6 +221,27 @@ int main(int argc, char* argv[]) {
     if (cli_frame_timeout > 0) {
         sc->frame_timeout_s = cli_frame_timeout;
         log_info("CLI override: frame_timeout = %ds", cli_frame_timeout);
+    }
+    if (cli_mjpeg_enabled) {
+        sc->mjpeg_enabled = true;
+        log_info("CLI override: MJPEG receiver enabled");
+    }
+    if (cli_mjpeg_ip) {
+        strncpy(sc->mjpeg_esp_ip, cli_mjpeg_ip, sizeof(sc->mjpeg_esp_ip) - 1);
+        sc->mjpeg_enabled = true;
+        log_info("CLI override: MJPEG IP = %s", cli_mjpeg_ip);
+    }
+    if (cli_mjpeg_port > 0) {
+        sc->mjpeg_esp_port = cli_mjpeg_port;
+        log_info("CLI override: MJPEG port = %d", cli_mjpeg_port);
+    }
+    if (cli_wifi_ssid) {
+        strncpy(sc->mjpeg_wifi_ssid, cli_wifi_ssid, sizeof(sc->mjpeg_wifi_ssid) - 1);
+        log_info("CLI override: WiFi SSID = %s", cli_wifi_ssid);
+    }
+    if (cli_wifi_password) {
+        strncpy(sc->mjpeg_wifi_password, cli_wifi_password, sizeof(sc->mjpeg_wifi_password) - 1);
+        log_info("CLI override: WiFi password set");
     }
 
     if (realtime_mode) {

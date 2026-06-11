@@ -29,9 +29,9 @@ system:
 video:
   source: camera
   camera_device: "/dev/video0"
-  camera_width: 1920
-  camera_height: 1080
-  camera_fps: 30.0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 15.0
   camera_format: MJPEG
   camera_buffer_count: 4
   video_path: ""
@@ -50,6 +50,26 @@ arrow:
   reconnect_max_delay_s: 16
   reconnect_initial_delay_s: 1
   frame_timeout_s: 10              # auto-exit after N seconds of no frames in realtime mode
+
+mjpeg:
+  # WiFi MJPEG HTTP receiver for ESP32 camera (test-ov-imu.ino).
+  # Enables receiving JPEG frames over WiFi HTTP instead of Arrow UART.
+  # Enable via --mjpeg CLI flag
+  enabled: false
+  # ESP32 WiFi AP IP
+  esp_ip: "192.168.4.1"
+  # HTTP port
+  esp_port: 80
+  # ESP32 AP SSID (leave empty if pre-configured externally)
+  wifi_ssid: "ESP32-Camera-AP"
+  # ESP32 AP password
+  wifi_password: "12345678"
+  # Poll /imu endpoint for accel/gyro data
+  imu_enabled: true
+  # IMU poll interval in milliseconds
+  imu_poll_interval_ms: 100
+  # Exponential backoff cap in seconds
+  reconnect_max_delay_s: 16
 
 detection:
   # SECONDARY person detector (YOLO11n INT8-quantized xquant-split).

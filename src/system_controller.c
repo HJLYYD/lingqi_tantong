@@ -281,12 +281,14 @@ static void* k1_capture_thread(void* arg) {
                     video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
                     video_processor_is_opened(sc->video_processor));
     bool use_arrow = (sc->arrow_receiver != NULL);
-    if (!use_v4l2 && !use_arrow) {
-        log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera, no Arrow UART)");
+    bool use_mjpeg = (sc->mjpeg_receiver != NULL);
+    if (!use_v4l2 && !use_arrow && !use_mjpeg) {
+        log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera, Arrow UART, or MJPEG)");
         return NULL;
     }
 
     double last_frame_time = k1_get_time_ms() / 1000.0;
+    int cap_attempts = 0, cap_mjpeg_ok = 0;
 
     while (pl->running) {
         int slot = k1_pipeline_slot_acquire(pl);
@@ -294,6 +296,7 @@ static void* k1_capture_thread(void* arg) {
 
         K1PipelineSlot* s = &pl->slots[slot];
         bool got_frame = false;
+        cap_attempts++;
 
         if (use_v4l2) {
             FrameData* fd = video_processor_read_frame_raw(sc->video_processor);
@@ -338,7 +341,42 @@ static void* k1_capture_thread(void* arg) {
             }
         }
 
+        if (!got_frame && use_mjpeg) {
+            ArrowSourceFrame mjpeg_frame;
+            if (mjpeg_receiver_get_latest_frame(sc->mjpeg_receiver, &mjpeg_frame)) {
+                cap_mjpeg_ok++;
+                if (soft_jpeg_decode_to_rgb(mjpeg_frame.jpeg_data, mjpeg_frame.jpeg_len,
+                                            s->rgb_data, cam_w, cam_h) == 0) {
+                    got_frame = true;
+                    s->timestamp_us = (int64_t)(mjpeg_frame.timestamp * 1000.0);
+                    s->frame_index = mjpeg_frame.frame_index;
+                    if (mjpeg_frame.frame_index <= 3) {
+                        log_info("[K1 Pipeline] Capture got MJPEG frame#%d: %zu bytes (ok=%d/%d attempts)",
+                                 mjpeg_frame.frame_index, mjpeg_frame.jpeg_len,
+                                 cap_mjpeg_ok, cap_attempts);
+                    }
+                } else {
+                    log_warning("[K1 Pipeline] MJPEG decode failed frame#%d: %zu bytes",
+                                mjpeg_frame.frame_index, mjpeg_frame.jpeg_len);
+                }
+
+                if (mjpeg_frame.has_pose) {
+                    imu_handler_set_external_pose(sc->imu_handler,
+                        mjpeg_frame.pose.qw, mjpeg_frame.pose.qx,
+                        mjpeg_frame.pose.qy, mjpeg_frame.pose.qz,
+                        mjpeg_frame.pose.pitch, mjpeg_frame.pose.roll,
+                        mjpeg_frame.pose.yaw, mjpeg_frame.pose.altitude_m,
+                        mjpeg_frame.pose.temperature_c,
+                        mjpeg_frame.pose.timestamp_ms);
+                }
+            }
+        }
+
         if (!got_frame) {
+            if (cap_attempts <= 5 || cap_attempts % 100 == 0) {
+                log_debug("[K1 Pipeline] Capture attempt#%d: no frame (V4L2=%d arrow=%d mjpeg=%d, got=%d)",
+                          cap_attempts, use_v4l2, use_arrow, use_mjpeg, cap_mjpeg_ok);
+            }
             /* ── Frame timeout check ── */
             double now_s = k1_get_time_ms() / 1000.0;
             double idle_s = now_s - last_frame_time;
@@ -514,6 +552,7 @@ static void* k1_postprocess_thread(void* arg) {
         if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
             log_info("[K1 Pipeline] Reached max_frames=%d, shutting down", sc->max_frames);
             sc->running = false;
+            pl->running = false;
         }
 
         k1_pipeline_slot_release(pl, slot);
@@ -571,6 +610,18 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
                 arrow_receiver_add_secondary_link(sc->arrow_receiver, uart_device_C, baudrate);
                 log_info("[K1 Pipeline] Dual-link: secondary UART %s", uart_device_C);
             }
+        }
+    }
+
+    /* ── MJPEG HTTP receiver (WiFi from ESP32) ── */
+    if (sc->mjpeg_enabled && sc->mjpeg_esp_ip[0] != '\0') {
+        sc->mjpeg_receiver = mjpeg_receiver_create(
+            sc->mjpeg_esp_ip, sc->mjpeg_esp_port,
+            sc->mjpeg_wifi_ssid[0] != '\0' ? sc->mjpeg_wifi_ssid : NULL,
+            sc->mjpeg_wifi_password[0] != '\0' ? sc->mjpeg_wifi_password : NULL);
+        if (sc->mjpeg_receiver) {
+            log_info("[K1 Pipeline] MJPEG receiver: %s:%d",
+                     sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
         }
     }
 
@@ -669,6 +720,10 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     if (sc->arrow_receiver) {
         arrow_receiver_destroy(sc->arrow_receiver);
         sc->arrow_receiver = NULL;
+    }
+    if (sc->mjpeg_receiver) {
+        mjpeg_receiver_destroy(sc->mjpeg_receiver);
+        sc->mjpeg_receiver = NULL;
     }
     if (sc->display_output) {
         display_output_destroy(sc->display_output);
@@ -829,6 +884,23 @@ SystemController* system_controller_create(const char* config_path) {
         }
     }
 
+    /* MJPEG receiver config */
+    sc->mjpeg_receiver = NULL;
+    sc->mjpeg_enabled = config_get_bool(sc->config, "mjpeg.enabled", false);
+    {
+        const char* ip = config_get_string(sc->config, "mjpeg.esp_ip", "192.168.4.1");
+        strncpy(sc->mjpeg_esp_ip, ip ? ip : "192.168.4.1", sizeof(sc->mjpeg_esp_ip) - 1);
+    }
+    sc->mjpeg_esp_port = config_get_int(sc->config, "mjpeg.esp_port", 80);
+    {
+        const char* ssid = config_get_string(sc->config, "mjpeg.wifi_ssid", "");
+        strncpy(sc->mjpeg_wifi_ssid, ssid ? ssid : "", sizeof(sc->mjpeg_wifi_ssid) - 1);
+    }
+    {
+        const char* pw = config_get_string(sc->config, "mjpeg.wifi_password", "");
+        strncpy(sc->mjpeg_wifi_password, pw ? pw : "", sizeof(sc->mjpeg_wifi_password) - 1);
+    }
+
     log_info("System Controller initialized");
     return sc;
 }
@@ -847,6 +919,7 @@ void system_controller_destroy(SystemController* sc) {
     if (sc->ar_renderer) ar_renderer_destroy(sc->ar_renderer);
     if (sc->result_manager) result_manager_destroy(sc->result_manager);
     if (sc->arrow_receiver) arrow_receiver_destroy(sc->arrow_receiver);
+    if (sc->mjpeg_receiver) mjpeg_receiver_destroy(sc->mjpeg_receiver);
     if (sc->ai_context) ai_accel_context_destroy(sc->ai_context);
     if (sc->display_output) display_output_destroy(sc->display_output);
 
@@ -1177,6 +1250,21 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
         }
     }
 
+    /* ── MJPEG HTTP receiver (WiFi from ESP32) ── */
+    if (sc->mjpeg_enabled && sc->mjpeg_esp_ip[0] != '\0') {
+        sc->mjpeg_receiver = mjpeg_receiver_create(
+            sc->mjpeg_esp_ip, sc->mjpeg_esp_port,
+            sc->mjpeg_wifi_ssid[0] != '\0' ? sc->mjpeg_wifi_ssid : NULL,
+            sc->mjpeg_wifi_password[0] != '\0' ? sc->mjpeg_wifi_password : NULL);
+        if (sc->mjpeg_receiver) {
+            log_info("MJPEG receiver initialized: %s:%d",
+                     sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
+        } else {
+            log_warning("MJPEG receiver init failed for %s:%d",
+                        sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
+        }
+    }
+
     uint8_t* vis_buffer = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
     if (!vis_buffer) {
         strncpy(status.message, "Failed to allocate vis buffer", sizeof(status.message) - 1);
@@ -1233,6 +1321,9 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
         if (sc->arrow_receiver) {
             arrow_receiver_update(sc->arrow_receiver);
         }
+        if (sc->mjpeg_receiver) {
+            mjpeg_receiver_update(sc->mjpeg_receiver);
+        }
 
         bool got_frame = false;
 
@@ -1270,6 +1361,26 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
                         arrow_frame.pose.yaw, arrow_frame.pose.altitude_m,
                         arrow_frame.pose.temperature_c,
                         arrow_frame.pose.timestamp_ms);
+                }
+            }
+        }
+
+        if (!got_frame && sc->mjpeg_receiver) {
+            ArrowSourceFrame mjpeg_frame;
+            if (mjpeg_receiver_get_latest_frame(sc->mjpeg_receiver, &mjpeg_frame)) {
+                if (soft_jpeg_decode_to_rgb(mjpeg_frame.jpeg_data, mjpeg_frame.jpeg_len,
+                                            frame_rgb, cam_w, cam_h) == 0) {
+                    got_frame = true;
+                }
+
+                if (mjpeg_frame.has_pose) {
+                    imu_handler_set_external_pose(sc->imu_handler,
+                        mjpeg_frame.pose.qw, mjpeg_frame.pose.qx,
+                        mjpeg_frame.pose.qy, mjpeg_frame.pose.qz,
+                        mjpeg_frame.pose.pitch, mjpeg_frame.pose.roll,
+                        mjpeg_frame.pose.yaw, mjpeg_frame.pose.altitude_m,
+                        mjpeg_frame.pose.temperature_c,
+                        mjpeg_frame.pose.timestamp_ms);
                 }
             }
         }
@@ -1423,6 +1534,10 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
     if (sc->arrow_receiver) {
         arrow_receiver_destroy(sc->arrow_receiver);
         sc->arrow_receiver = NULL;
+    }
+    if (sc->mjpeg_receiver) {
+        mjpeg_receiver_destroy(sc->mjpeg_receiver);
+        sc->mjpeg_receiver = NULL;
     }
     if (sc->display_output) {
         display_output_destroy(sc->display_output);

@@ -52,8 +52,16 @@ ModelStore* model_store_create(const char* base_path) {
         strncpy(info->name, MODEL_REGISTRY[i].name, MAX_MODEL_NAME_LEN - 1);
         info->name[MAX_MODEL_NAME_LEN - 1] = '\0';
 
-        char full_path[MAX_PATH_LEN];
-        snprintf(full_path, sizeof(full_path), "%s/%s", store->base_path, MODEL_REGISTRY[i].path);
+        char full_path[MAX_PATH_LEN * 4];
+        int n = snprintf(full_path, sizeof(full_path), "%s/%s",
+                         store->base_path, MODEL_REGISTRY[i].path);
+        if (n < 0 || n >= (int)sizeof(full_path)) {
+            /* Path too long — truncation would corrupt; skip this model */
+            log_warning("Model path overflow for %s, skipping",
+                        MODEL_REGISTRY[i].name);
+            store->num_models--;
+            continue;
+        }
         strncpy(info->path, full_path, MAX_MODEL_PATH_LEN - 1);
         info->path[MAX_MODEL_PATH_LEN - 1] = '\0';
 

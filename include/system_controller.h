@@ -14,6 +14,7 @@
 #include "result_manager.h"
 #include "video_writer.h"
 #include "arrow_receiver.h"
+#include "mjpeg_receiver.h"
 #include "ai_accel_adapter.h"
 #include "display_output.h"
 
@@ -36,6 +37,7 @@ typedef struct {
     ARRenderer* ar_renderer;
     ResultManager* result_manager;
     ArrowReceiver* arrow_receiver;
+    MjpegReceiver* mjpeg_receiver;
     AIAcclContext* ai_context;
     DisplayOutput* display_output;
 
@@ -52,6 +54,13 @@ typedef struct {
     char stream_url[MAX_PATH_LEN];
     bool save_video_enabled;      /* MP4 file output */
     char save_video_path[MAX_PATH_LEN];
+
+    /* ── MJPEG receiver config ── */
+    bool mjpeg_enabled;
+    char mjpeg_esp_ip[64];
+    int  mjpeg_esp_port;
+    char mjpeg_wifi_ssid[64];
+    char mjpeg_wifi_password[64];
 
     float fps_history[SC_MAX_FPS_HISTORY];
     int fps_history_count;

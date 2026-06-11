@@ -46,7 +46,7 @@ ResultManager* result_manager_create(const char* base_output_dir) {
 
     mkdir(rm->base_output_dir, 0755);
 
-    char path[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN * 2];
     snprintf(path, sizeof(path), "%s/results", rm->base_output_dir);
     mkdir(path, 0755);
     snprintf(path, sizeof(path), "%s/models", rm->base_output_dir);
@@ -250,8 +250,9 @@ int result_manager_save_csv_report(const ResultManager* rm, const char* session_
 int result_manager_save_frame(const ResultManager* rm, const char* session_id, const uint8_t* frame_data, int width, int height, int frame_num) {
     if (!rm || !session_id || !frame_data) return -1;
 
-    char frame_path[MAX_PATH_LEN];
-    snprintf(frame_path, sizeof(frame_path), "%s/frames/%s_frame_%05d.bmp", rm->base_output_dir, session_id, frame_num);
+    char frame_path[MAX_PATH_LEN * 3];
+    snprintf(frame_path, sizeof(frame_path), "%s/frames/%s_frame_%05d.bmp",
+             rm->base_output_dir, session_id, frame_num);
 
     int ret = utils_write_bmp(frame_path, frame_data, width, height);
 
