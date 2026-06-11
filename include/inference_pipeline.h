@@ -52,10 +52,13 @@ typedef struct {
     PipelineCascadeState cascade_state;
     int cascade_frames_in_state;       /* consecutive frames in current state */
     int cascade_validation_interval;   /* frames between full-res validation checks */
+    int cascade_secondary_interval;    /* frames between secondary detector runs in TRACKING mode */
     bool cascade_enabled;              /* master switch from config */
     int cascade_tracking_w;            /* reduced resolution width when tracking */
     int cascade_tracking_h;            /* reduced resolution height when tracking */
     int cascade_lost_counter;          /* consecutive frames with 0 confirmed tracks */
+    int confirmed_track_count;         /* actual confirmed tracks from tracker (sync'ed externally) */
+    int total_track_count;             /* total tracks from tracker (sync'ed externally) */
 
     /* ── Keypoint validator ── */
     KeypointValidator* keypoint_validator;
@@ -64,6 +67,9 @@ typedef struct {
     /* ── Enhanced filter config ── */
     float fallback_conf_threshold;     /* stricter conf when no pose data */
     float fallback_area_ratio_min;     /* stricter area min when no pose data */
+
+    /* ── Action recognition config ── */
+    int action_inference_interval;     /* frames between ST-GCN inference runs */
 } AIInferencePipeline;
 
 AIInferencePipeline* inference_pipeline_create(void);

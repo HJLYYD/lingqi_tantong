@@ -232,6 +232,7 @@ set(PRESENTATION_SOURCES
     src/ar_renderer.c
     src/video_writer.c
     src/model_export.c
+    src/display_output.c
 )
 
 set(UTILS_SOURCES

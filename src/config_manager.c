@@ -52,6 +52,7 @@ static void config_set_defaults(ConfigManager* cm) {
     /* Cascade defaults */
     config_set_bool(cm, "detection.cascade_enabled", true);
     config_set_int(cm, "detection.cascade_validation_interval", 15);
+    config_set_int(cm, "detection.cascade_secondary_interval", 5);  /* secondary detector interval in TRACKING mode */
     config_set_int(cm, "detection.cascade_tracking_resolution.0", 320);
     config_set_int(cm, "detection.cascade_tracking_resolution.1", 320);
     /* Enhanced fallback filter defaults */
@@ -84,6 +85,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_int(cm, "action.num_persons", 1);
     config_set_int(cm, "action.num_classes", 7);    /* Auto-detected from model output shape at load time */
     config_set_float(cm, "action.confidence_threshold", 0.5f);
+    config_set_int(cm, "action.inference_interval", 10);  /* frames between ST-GCN inference runs */
 
     config_set_int(cm, "tracking.max_lost", 30);
     config_set_float(cm, "tracking.min_iou", 0.30f);

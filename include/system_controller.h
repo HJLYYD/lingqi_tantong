@@ -15,6 +15,7 @@
 #include "video_writer.h"
 #include "arrow_receiver.h"
 #include "ai_accel_adapter.h"
+#include "display_output.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,10 +37,22 @@ typedef struct {
     ResultManager* result_manager;
     ArrowReceiver* arrow_receiver;
     AIAcclContext* ai_context;
+    DisplayOutput* display_output;
 
     PipelineMode mode;
     int frame_count;
+    int max_frames;               /* 0 = unlimited */
+    int frame_timeout_s;          /* auto-exit after N seconds of no frames */
     double start_time;
+
+    /* ── Display / streaming config ── */
+    bool display_enabled;         /* framebuffer output */
+    char display_device[MAX_PATH_LEN];
+    bool stream_enabled;          /* RTSP / UDP-TS output */
+    char stream_url[MAX_PATH_LEN];
+    bool save_video_enabled;      /* MP4 file output */
+    char save_video_path[MAX_PATH_LEN];
+
     float fps_history[SC_MAX_FPS_HISTORY];
     int fps_history_count;
     float processing_times[SC_MAX_PROC_TIMES];

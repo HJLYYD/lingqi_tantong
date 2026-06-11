@@ -62,6 +62,18 @@ extern "C" {
 /* ── Hungarian algorithm ── */
 #define HUNGARIAN_MAX_DIM               256    /* max dimension of cost matrix */
 
+/* ── Hungarian workspace (pre-allocated, eliminates per-frame malloc/free) ── */
+typedef struct {
+    float* cost_padded;    /* [HUNGARIAN_MAX_DIM × HUNGARIAN_MAX_DIM] padded cost matrix */
+    float* u;              /* [HUNGARIAN_MAX_DIM + 1] row potentials */
+    float* v;              /* [HUNGARIAN_MAX_DIM + 1] column potentials */
+    int*   p;              /* [HUNGARIAN_MAX_DIM + 1] matching */
+    int*   way;            /* [HUNGARIAN_MAX_DIM + 1] augmenting path */
+    float* minv;           /* [HUNGARIAN_MAX_DIM + 1] minimum values per iteration */
+    bool*  used;           /* [HUNGARIAN_MAX_DIM + 1] visited columns */
+    bool   valid;          /* true if all allocations succeeded */
+} HungarianWorkspace;
+
 /* ── Kalman Box Tracker (7-state: [cx, cy, area, aspect, vx, vy, varea]) ── */
 typedef struct {
     float state[7];
@@ -182,6 +194,9 @@ typedef struct {
     int total_id_switches;
     int total_reidentifications;
     int total_partial_matches;
+
+    /* ── Hungarian workspace (pre-allocated) ── */
+    HungarianWorkspace hungarian_ws;
 } ObjectTracker;
 
 /* ── Lifecycle ── */

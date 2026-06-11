@@ -76,9 +76,13 @@ AIInferencePipeline* inference_pipeline_create(void) {
     pipeline->cascade_state = PIPELINE_CASCADE_SEARCHING;
     pipeline->cascade_frames_in_state = 0;
     pipeline->cascade_validation_interval = CASCADE_VALIDATION_INTERVAL_DEFAULT;
+    pipeline->cascade_secondary_interval = 5;  /* default: run secondary detector every 5 frames in TRACKING */
     pipeline->cascade_enabled = true;
     pipeline->cascade_tracking_w = CASCADE_TRACKING_W_DEFAULT;
     pipeline->cascade_tracking_h = CASCADE_TRACKING_H_DEFAULT;
+    pipeline->cascade_lost_counter = 0;
+    pipeline->confirmed_track_count = 0;
+    pipeline->total_track_count = 0;
 
     /* ── Keypoint validator init (created in load_models with config) ── */
     pipeline->keypoint_validator = NULL;
@@ -87,6 +91,9 @@ AIInferencePipeline* inference_pipeline_create(void) {
     /* ── Enhanced filter defaults ── */
     pipeline->fallback_conf_threshold = FILTER_FALLBACK_CONF_THRESHOLD;
     pipeline->fallback_area_ratio_min = FILTER_FALLBACK_AREA_RATIO_MIN;
+
+    /* ── Action recognition defaults ── */
+    pipeline->action_inference_interval = 10;  /* default: run ST-GCN every 10 frames */
 
     return pipeline;
 }
@@ -259,9 +266,17 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         pipeline->fallback_conf_threshold = config ? config_get_float(config, "detection.fallback_confidence", FILTER_FALLBACK_CONF_THRESHOLD) : FILTER_FALLBACK_CONF_THRESHOLD;
         pipeline->fallback_area_ratio_min = config ? config_get_float(config, "detection.fallback_area_ratio_min", FILTER_FALLBACK_AREA_RATIO_MIN) : FILTER_FALLBACK_AREA_RATIO_MIN;
 
-        log_info("Cascade: enabled=%d validation_interval=%d tracking_res=%dx%d",
+        /* Cascade secondary detector interval (configurable, default 5 in TRACKING mode) */
+        pipeline->cascade_secondary_interval = config ? config_get_int(config, "detection.cascade_secondary_interval", 5) : 5;
+
+        /* Action recognition inference interval */
+        pipeline->action_inference_interval = config ? config_get_int(config, "action.inference_interval", 10) : 10;
+
+        log_info("Cascade: enabled=%d validation_interval=%d secondary_interval=%d tracking_res=%dx%d",
                  pipeline->cascade_enabled, pipeline->cascade_validation_interval,
+                 pipeline->cascade_secondary_interval,
                  pipeline->cascade_tracking_w, pipeline->cascade_tracking_h);
+        log_info("Action: inference_interval=%d frames", pipeline->action_inference_interval);
     }
 
     int loaded = 0;
@@ -699,12 +714,9 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
      * scene wouldn't be detected until the next VALIDATING frame (every 15
      * frames).  Now we run it at reduced frequency (every 5 frames) to catch
      * new entries while still saving most of the inference time. */
-    #define CASCADE_SECONDARY_INTERVAL 3  /* run YOLO11n every N frames in TRACKING mode.
-                                             Reduced from 5: faster new-person detection at
-                                             cost of ~15% more inference time. */
     bool run_secondary = run_full_res ||
         (pipeline->cascade_state == PIPELINE_CASCADE_TRACKING &&
-         pipeline->frame_counter % CASCADE_SECONDARY_INTERVAL == 0);
+         pipeline->frame_counter % pipeline->cascade_secondary_interval == 0);
 
     /* infer_w/infer_h retained for future reduced-resolution inference path */
     (void)run_full_res;  /* used for diagnostics */
@@ -861,12 +873,14 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
     }
 
     /* ── Cascade state update (after detection, before face/action) ──
-     * Uses actual detection counts for multi-person awareness.
-     * num_tracks is approximated by num_detections (exact count comes
-     * from tracker, which hasn't run yet at this point). */
+     * Uses actual confirmed track count from the tracker (set externally
+     * before this call).  Falls back to detection-based approximation if
+     * tracker state hasn't been synchronized. */
     {
-        cascade_update_state(pipeline, result.num_detections > 0 ? 1 : 0,
-                            result.num_detections, result.num_detections);
+        int ctc = pipeline->confirmed_track_count;
+        int ttc = pipeline->total_track_count;
+        cascade_update_state(pipeline, ctc,
+                            result.num_detections, (ttc > 0 ? ttc : result.num_detections));
     }
 
     /* ── Step 3: Face detection (SUPPLEMENT, reduced frequency) ──
@@ -893,7 +907,7 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
         for (int p = 0; p < result.num_poses; p++) {
             stgcn_action_recognizer_push_pose(pipeline->action_recognizer, &result.poses[p], width, height);
         }
-        if (pipeline->frame_counter % 10 == 0) {
+        if (pipeline->frame_counter % pipeline->action_inference_interval == 0) {
             result.action = stgcn_action_recognizer_recognize(pipeline->action_recognizer);
             result.has_action = (result.action.num_actions > 0);
         }

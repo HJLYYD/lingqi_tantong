@@ -237,16 +237,40 @@ static BoundingBox kalman_get_bbox(const KalmanBoxTracker* kf) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static float hungarian_solve(const float* cost_matrix, int rows, int cols,
-                              int* assignment, float* final_cost) {
+                              int* assignment, float* final_cost,
+                              HungarianWorkspace* ws) {
     /* Pad to square */
     int n = rows > cols ? rows : cols;
     if (n < 1) { *final_cost = 0.0f; return 0.0f; }
     if (n > HUNGARIAN_MAX_DIM) n = HUNGARIAN_MAX_DIM;
 
-    /* Working matrix (n × n, padded with large values) */
-    float* a = (float*)calloc((size_t)n * n, sizeof(float));
-    if (!a) {
-        /* Fallback: identity assignment */
+    /* ── Use pre-allocated workspace if valid, fall back to dynamic ── */
+    float* a;
+    float* u;
+    float* v;
+    int*   p;
+    int*   way;
+    bool ws_valid = (ws && ws->valid);
+    if (ws_valid) {
+        a   = ws->cost_padded;
+        u   = ws->u;
+        v   = ws->v;
+        p   = ws->p;
+        way = ws->way;
+        memset(a, 0, (size_t)n * n * sizeof(float));
+        memset(u, 0, ((size_t)n + 1) * sizeof(float));
+        memset(v, 0, ((size_t)n + 1) * sizeof(float));
+        memset(p, 0, ((size_t)n + 1) * sizeof(int));
+        memset(way, 0, ((size_t)n + 1) * sizeof(int));
+    } else {
+        a = (float*)calloc((size_t)n * n, sizeof(float));
+        u = (float*)calloc((size_t)n + 1, sizeof(float));
+        v = (float*)calloc((size_t)n + 1, sizeof(float));
+        p = (int*)calloc((size_t)n + 1, sizeof(int));
+        way = (int*)calloc((size_t)n + 1, sizeof(int));
+    }
+    if (!a || !u || !v || !p || !way) {
+        if (!ws_valid) { free(a); free(u); free(v); free(p); free(way); }
         for (int i = 0; i < rows && i < cols; i++) assignment[i] = i;
         for (int i = cols; i < rows; i++) assignment[i] = -1;
         *final_cost = 0.0f;
@@ -263,27 +287,24 @@ static float hungarian_solve(const float* cost_matrix, int rows, int cols,
         }
     }
 
-    /* u/v potentials, p/way matching arrays */
-    float* u = (float*)calloc((size_t)n + 1, sizeof(float));
-    float* v = (float*)calloc((size_t)n + 1, sizeof(float));
-    int*   p = (int*)calloc((size_t)n + 1, sizeof(int));
-    int*   way = (int*)calloc((size_t)n + 1, sizeof(int));
-    if (!u || !v || !p || !way) {
-        free(a); free(u); free(v); free(p); free(way);
-        for (int i = 0; i < rows && i < cols; i++) assignment[i] = i;
-        for (int i = cols; i < rows; i++) assignment[i] = -1;
-        *final_cost = 0.0f;
-        return 0.0f;
-    }
+    /* u/v potentials, p/way matching arrays — already set above */
 
     for (int i = 1; i <= n; i++) {
         p[0] = i;
         int j0 = 0;
-        float* minv = (float*)calloc((size_t)n + 1, sizeof(float));
-        bool*  used = (bool*)calloc((size_t)n + 1, sizeof(bool));
+
+        float* minv;
+        bool*  used;
+        if (ws_valid) {
+            minv = ws->minv;
+            used = ws->used;
+        } else {
+            minv = (float*)calloc((size_t)n + 1, sizeof(float));
+            used = (bool*)calloc((size_t)n + 1, sizeof(bool));
+        }
         if (!minv || !used) {
-            free(minv); free(used);
-            free(a); free(u); free(v); free(p); free(way);
+            if (!ws_valid) { free(minv); free(used); }
+            if (!ws_valid) { free(a); free(u); free(v); free(p); free(way); }
             for (int k = 0; k < rows && k < cols; k++) assignment[k] = k;
             for (int k = cols; k < rows; k++) assignment[k] = -1;
             *final_cost = 0.0f;
@@ -332,8 +353,7 @@ static float hungarian_solve(const float* cost_matrix, int rows, int cols,
             j0 = j1_prev;
         } while (j0 != 0);
 
-        free(minv);
-        free(used);
+        if (!ws_valid) { free(minv); free(used); }
     }
 
     /* Extract assignment */
@@ -357,7 +377,7 @@ static float hungarian_solve(const float* cost_matrix, int rows, int cols,
     }
     *final_cost = cost;
 
-    free(a); free(u); free(v); free(p); free(way);
+    if (!ws_valid) { free(a); free(u); free(v); free(p); free(way); }
     return cost;
 }
 
@@ -640,6 +660,24 @@ ObjectTracker* object_tracker_create(int max_lost, float min_iou, float max_dist
     tracker->reid_pool_count = 0;
     tracker->reid_pool_max_age = 90;  /* keep deleted tracks for 90 frames (~3 sec at 30fps) */
 
+    /* ── Hungarian workspace pre-allocation ── */
+    tracker->hungarian_ws.valid = false;
+    {
+        size_t n = HUNGARIAN_MAX_DIM;
+        size_t np1 = n + 1;
+        tracker->hungarian_ws.cost_padded = (float*)calloc(n * n, sizeof(float));
+        tracker->hungarian_ws.u = (float*)calloc(np1, sizeof(float));
+        tracker->hungarian_ws.v = (float*)calloc(np1, sizeof(float));
+        tracker->hungarian_ws.p = (int*)calloc(np1, sizeof(int));
+        tracker->hungarian_ws.way = (int*)calloc(np1, sizeof(int));
+        tracker->hungarian_ws.minv = (float*)calloc(np1, sizeof(float));
+        tracker->hungarian_ws.used = (bool*)calloc(np1, sizeof(bool));
+        tracker->hungarian_ws.valid = (tracker->hungarian_ws.cost_padded &&
+                                        tracker->hungarian_ws.u && tracker->hungarian_ws.v &&
+                                        tracker->hungarian_ws.p && tracker->hungarian_ws.way &&
+                                        tracker->hungarian_ws.minv && tracker->hungarian_ws.used);
+    }
+
     /* Diagnostics */
     tracker->total_id_switches = 0;
     tracker->total_reidentifications = 0;
@@ -649,6 +687,14 @@ ObjectTracker* object_tracker_create(int max_lost, float min_iou, float max_dist
 }
 
 void object_tracker_destroy(ObjectTracker* tracker) {
+    if (!tracker) return;
+    free(tracker->hungarian_ws.cost_padded);
+    free(tracker->hungarian_ws.u);
+    free(tracker->hungarian_ws.v);
+    free(tracker->hungarian_ws.p);
+    free(tracker->hungarian_ws.way);
+    free(tracker->hungarian_ws.minv);
+    free(tracker->hungarian_ws.used);
     free(tracker);
 }
 
@@ -992,7 +1038,7 @@ static void cascade_matching(ObjectTracker* tracker,
         if (assign) {
             for (int i = 0; i < nr; i++) assign[i] = -1;
             float final_cost;
-            hungarian_solve(cost, nr, nc, assign, &final_cost);
+            hungarian_solve(cost, nr, nc, assign, &final_cost, &tracker->hungarian_ws);
 
             /* Process assignments */
             for (int i = 0; i < nr; i++) {

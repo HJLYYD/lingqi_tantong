@@ -49,6 +49,7 @@ arrow:
   dual_link: true
   reconnect_max_delay_s: 16
   reconnect_initial_delay_s: 1
+  frame_timeout_s: 10              # auto-exit after N seconds of no frames in realtime mode
 
 detection:
   # SECONDARY person detector (YOLO11n INT8-quantized xquant-split).
@@ -78,6 +79,7 @@ detection:
   # validation frame runs both models to catch new entries.
   cascade_enabled: true
   cascade_validation_interval: 15  # frames between full-res re-validation
+  cascade_secondary_interval: 5    # frames between YOLO11n runs in TRACKING mode (5 = ~15% of frames)
   cascade_tracking_resolution: [320, 320]  # reduced input when tracking (not yet used by fixed-input models)
   # ── Stricter fallback when no pose data available ──
   fallback_confidence: 0.20       # conf threshold when YOLO11n runs without pose model
@@ -123,6 +125,7 @@ action:
   num_persons: 1
   num_classes: 7    # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
   confidence_threshold: 0.50
+  inference_interval: 10   # frames between ST-GCN inference runs (10 frames @ ~3.5 FPS = ~3s)
 
 tracking:
   max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
@@ -229,9 +232,12 @@ visualization:
   show_fps: true
   show_depth: true
   show_imu_overlay: true
-  record_to_video: true
-  display_enabled: false
+  record_to_video: false            # explicit opt-in via --save-video CLI flag
+  display_enabled: false            # enable via --display CLI flag
   display_device: "/dev/fb0"
+  rtsp_enabled: false               # enable via --rtsp CLI flag
+  rtsp_url: "rtsp://0.0.0.0:8554/live"
+  video_output_path: "output/realtime_output.mp4"
   colors:
     - [0, 255, 0]
     - [255, 0, 0]

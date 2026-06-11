@@ -52,9 +52,20 @@ static void print_usage(const char* program_name) {
     printf("  --uart-C <path>             Arrow UART device C (default: /dev/ttyS1)\n");
     printf("  --baudrate <rate>           UART baudrate (default: 3000000)\n");
     printf("  --camera <path>             Camera device (default: /dev/video0)\n");
+    printf("  --display                   Enable framebuffer display (/dev/fb0)\n");
+    printf("  --display-device <path>     Framebuffer device (default: /dev/fb0)\n");
+    printf("  --rtsp <url>                RTSP streaming (e.g. rtsp://0.0.0.0:8554/live)\n");
+    printf("  --udp-stream <addr>         UDP MPEG-TS streaming (e.g. udp://192.168.1.100:1234)\n");
+    printf("  --rtmp <url>                RTMP streaming\n");
+    printf("  --save-video                Save output to MP4 video file\n");
+    printf("  --max-frames <N>            Max frames to process in realtime mode (0=unlimited)\n");
+    printf("  --frame-timeout <S>         Auto-exit after S seconds of no frames (default: 10)\n");
     printf("  --help                      Show this help\n");
     printf("\nExamples:\n");
     printf("  %s --realtime\n", program_name);
+    printf("  %s --realtime --display\n", program_name);
+    printf("  %s --realtime --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
+    printf("  %s --realtime --udp-stream udp://192.168.1.100:1234 --save-video\n", program_name);
     printf("  %s --realtime --uart-A /dev/ttyS0 --uart-C /dev/ttyS1 --baudrate 3000000\n", program_name);
     printf("  %s --video_path test.mp4 --save_frame_interval 1\n", program_name);
     printf("  %s --video_path test.mp4 --max_frames 100\n", program_name);
@@ -71,6 +82,15 @@ int main(int argc, char* argv[]) {
     int save_frame_interval = 0;  /* 0 = use config value */
     int baudrate = 3000000;
     bool realtime_mode = false;
+
+    /* Display / streaming options (override config) */
+    bool cli_display_enabled = false;
+    const char* cli_display_device = NULL;
+    bool cli_stream_enabled = false;
+    const char* cli_stream_url = NULL;
+    bool cli_save_video = false;
+    int cli_max_frames = 0;
+    int cli_frame_timeout = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -96,6 +116,25 @@ int main(int argc, char* argv[]) {
             baudrate = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
             camera_dev = argv[++i];
+        } else if (strcmp(argv[i], "--display") == 0) {
+            cli_display_enabled = true;
+        } else if (strcmp(argv[i], "--display-device") == 0 && i + 1 < argc) {
+            cli_display_device = argv[++i];
+        } else if (strcmp(argv[i], "--rtsp") == 0 && i + 1 < argc) {
+            cli_stream_enabled = true;
+            cli_stream_url = argv[++i];
+        } else if (strcmp(argv[i], "--udp-stream") == 0 && i + 1 < argc) {
+            cli_stream_enabled = true;
+            cli_stream_url = argv[++i];
+        } else if (strcmp(argv[i], "--rtmp") == 0 && i + 1 < argc) {
+            cli_stream_enabled = true;
+            cli_stream_url = argv[++i];
+        } else if (strcmp(argv[i], "--save-video") == 0) {
+            cli_save_video = true;
+        } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
+            cli_max_frames = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--frame-timeout") == 0 && i + 1 < argc) {
+            cli_frame_timeout = atoi(argv[++i]);
         }
     }
 
@@ -132,6 +171,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     g_sc = sc;
+
+    /* ── CLI overrides for display / streaming / frame limits ── */
+    if (cli_display_enabled) {
+        sc->display_enabled = true;
+        log_info("CLI override: display enabled");
+    }
+    if (cli_display_device) {
+        strncpy(sc->display_device, cli_display_device, sizeof(sc->display_device) - 1);
+        sc->display_enabled = true;
+        log_info("CLI override: display device = %s", cli_display_device);
+    }
+    if (cli_stream_enabled && cli_stream_url) {
+        sc->stream_enabled = true;
+        strncpy(sc->stream_url, cli_stream_url, sizeof(sc->stream_url) - 1);
+        log_info("CLI override: stream = %s", cli_stream_url);
+    }
+    if (cli_save_video) {
+        sc->save_video_enabled = true;
+        log_info("CLI override: save video enabled");
+    }
+    if (cli_max_frames > 0) {
+        sc->max_frames = cli_max_frames;
+        log_info("CLI override: max_frames = %d", cli_max_frames);
+    }
+    if (cli_frame_timeout > 0) {
+        sc->frame_timeout_s = cli_frame_timeout;
+        log_info("CLI override: frame_timeout = %ds", cli_frame_timeout);
+    }
 
     if (realtime_mode) {
         sc->running = true;

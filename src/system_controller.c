@@ -286,6 +286,8 @@ static void* k1_capture_thread(void* arg) {
         return NULL;
     }
 
+    double last_frame_time = k1_get_time_ms() / 1000.0;
+
     while (pl->running) {
         int slot = k1_pipeline_slot_acquire(pl);
         if (slot < 0) break;
@@ -337,6 +339,21 @@ static void* k1_capture_thread(void* arg) {
         }
 
         if (!got_frame) {
+            /* ── Frame timeout check ── */
+            double now_s = k1_get_time_ms() / 1000.0;
+            double idle_s = now_s - last_frame_time;
+            if (idle_s > sc->frame_timeout_s) {
+                log_info("[K1 Pipeline] No frames received for %.0fs (timeout=%ds), shutting down",
+                         idle_s, sc->frame_timeout_s);
+                sc->running = false;
+                pl->running = false;
+                pthread_mutex_lock(&pl->ring_mutex);
+                pl->active_slots--;
+                pl->capture_idx = (pl->capture_idx - 1 + K1_RING_SIZE) % K1_RING_SIZE;
+                pthread_cond_signal(&pl->post_done_cond);
+                pthread_mutex_unlock(&pl->ring_mutex);
+                break;
+            }
             pthread_mutex_lock(&pl->ring_mutex);
             pl->active_slots--;
             pl->capture_idx = (pl->capture_idx - 1 + K1_RING_SIZE) % K1_RING_SIZE;
@@ -347,6 +364,7 @@ static void* k1_capture_thread(void* arg) {
             continue;
         }
 
+        last_frame_time = k1_get_time_ms() / 1000.0;
         k1_pipeline_slot_capture_done(pl, slot);
     }
 
@@ -428,6 +446,14 @@ static void* k1_postprocess_thread(void* arg) {
 
         object_tracker_associate_poses(sc->tracking_manager, inference->poses, inference->num_poses);
 
+        /* ── Sync confirmed track counts to inference pipeline for cascade state machine ── */
+        if (sc->inference_pipeline) {
+            sc->inference_pipeline->confirmed_track_count =
+                object_tracker_get_confirmed_count(sc->tracking_manager);
+            sc->inference_pipeline->total_track_count =
+                object_tracker_get_all_track_count(sc->tracking_manager);
+        }
+
         associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
                                       inference->poses, inference->num_poses);
         associate_faces_with_objects(tracking.tracked_objects, tracking.num_tracked,
@@ -474,9 +500,20 @@ static void* k1_postprocess_thread(void* arg) {
                                           sc->frame_count, avg_fps,
                                           vis_buffer);
 
+        /* ── Output to display / stream / video file ── */
+        if (sc->display_output) {
+            display_output_write_frame(sc->display_output, vis_buffer);
+        }
+
         if (sc->frame_count % 30 == 0) {
             log_info("[K1 Pipeline] Frame %d: %d objects, %.1f FPS",
                      sc->frame_count, tracking.num_tracked, avg_fps);
+        }
+
+        /* ── Max frames check (signal shutdown via controller) ── */
+        if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
+            log_info("[K1 Pipeline] Reached max_frames=%d, shutting down", sc->max_frames);
+            sc->running = false;
         }
 
         k1_pipeline_slot_release(pl, slot);
@@ -544,6 +581,29 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
         log_warning("[K1 Pipeline] AI accel context unavailable, ONNX CPU path only");
     }
 
+    /* ── Create display output ── */
+    {
+        uint32_t disp_channels = DISPLAY_CHANNEL_NONE;
+        if (sc->display_enabled && sc->display_device[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_FRAMEBUFFER;
+        if (sc->stream_enabled && sc->stream_url[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_RTSP;
+        if (sc->save_video_enabled && sc->save_video_path[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_VIDEO_FILE;
+
+        if (disp_channels != DISPLAY_CHANNEL_NONE) {
+            sc->display_output = display_output_create(
+                cam_w, cam_h, cam_fps,
+                disp_channels,
+                sc->display_device,
+                sc->stream_url,
+                sc->save_video_path);
+            if (sc->display_output) {
+                log_info("[K1 Pipeline] Display output active");
+            }
+        }
+    }
+
     K1Pipeline pl;
     k1_pipeline_init(&pl, sc);
     if (!k1_ring_init_slots(&pl, cam_w, cam_h)) {
@@ -609,6 +669,10 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     if (sc->arrow_receiver) {
         arrow_receiver_destroy(sc->arrow_receiver);
         sc->arrow_receiver = NULL;
+    }
+    if (sc->display_output) {
+        display_output_destroy(sc->display_output);
+        sc->display_output = NULL;
     }
 
     sc->running = false;
@@ -724,14 +788,46 @@ SystemController* system_controller_create(const char* config_path) {
 
     sc->arrow_receiver = NULL;
     sc->ai_context = NULL;
+    sc->display_output = NULL;
     sc->mode = PIPELINE_MODE_OFFLINE;
 
     sc->frame_count = 0;
+    sc->max_frames = config_get_int(sc->config, "system.max_frames", 0);
+    sc->frame_timeout_s = config_get_int(sc->config, "arrow.frame_timeout_s", 10);
     sc->start_time = (double)utils_get_time_ms() / 1000.0;
     sc->fps_history_count = 0;
     sc->proc_times_count = 0;
     sc->detection_count = 0;
     sc->running = false;
+
+    /* Display / streaming config */
+    sc->display_enabled = config_get_bool(sc->config, "visualization.display_enabled", false);
+    {
+        const char* fb_dev = config_get_string(sc->config, "visualization.display_device", "/dev/fb0");
+        if (fb_dev) {
+            strncpy(sc->display_device, fb_dev, sizeof(sc->display_device) - 1);
+        } else {
+            sc->display_device[0] = '\0';
+        }
+    }
+    sc->stream_enabled = config_get_bool(sc->config, "visualization.rtsp_enabled", false);
+    {
+        const char* rtsp_u = config_get_string(sc->config, "visualization.rtsp_url", "");
+        if (rtsp_u) {
+            strncpy(sc->stream_url, rtsp_u, sizeof(sc->stream_url) - 1);
+        } else {
+            sc->stream_url[0] = '\0';
+        }
+    }
+    sc->save_video_enabled = config_get_bool(sc->config, "visualization.record_to_video", false);
+    {
+        const char* vp = config_get_string(sc->config, "visualization.video_output_path", "output/realtime_output.mp4");
+        if (vp) {
+            strncpy(sc->save_video_path, vp, sizeof(sc->save_video_path) - 1);
+        } else {
+            sc->save_video_path[0] = '\0';
+        }
+    }
 
     log_info("System Controller initialized");
     return sc;
@@ -752,6 +848,7 @@ void system_controller_destroy(SystemController* sc) {
     if (sc->result_manager) result_manager_destroy(sc->result_manager);
     if (sc->arrow_receiver) arrow_receiver_destroy(sc->arrow_receiver);
     if (sc->ai_context) ai_accel_context_destroy(sc->ai_context);
+    if (sc->display_output) display_output_destroy(sc->display_output);
 
     free(sc);
 }
@@ -926,6 +1023,14 @@ SystemStatus system_controller_process_video(SystemController* sc,
         /* ── NEW: Pose association via tracker (updates appearance features) ── */
         object_tracker_associate_poses(sc->tracking_manager, inference.poses, inference.num_poses);
 
+        /* ── Sync confirmed track counts to inference pipeline ── */
+        if (sc->inference_pipeline) {
+            sc->inference_pipeline->confirmed_track_count =
+                object_tracker_get_confirmed_count(sc->tracking_manager);
+            sc->inference_pipeline->total_track_count =
+                object_tracker_get_all_track_count(sc->tracking_manager);
+        }
+
         associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
                                       inference.poses, inference.num_poses);
         associate_faces_with_objects(tracking.tracked_objects, tracking.num_tracked,
@@ -1082,10 +1187,34 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
     const char* session_id2 = result_manager_start_session(sc->result_manager, "realtime_session");
     (void)session_id2;
 
+    /* ── Create display output ── */
+    {
+        uint32_t disp_channels = DISPLAY_CHANNEL_NONE;
+        if (sc->display_enabled && sc->display_device[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_FRAMEBUFFER;
+        if (sc->stream_enabled && sc->stream_url[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_RTSP;
+        if (sc->save_video_enabled && sc->save_video_path[0] != '\0')
+            disp_channels |= DISPLAY_CHANNEL_VIDEO_FILE;
+
+        if (disp_channels != DISPLAY_CHANNEL_NONE) {
+            sc->display_output = display_output_create(
+                cam_w, cam_h, cam_fps,
+                disp_channels,
+                sc->display_device,
+                sc->stream_url,
+                sc->save_video_path);
+            if (sc->display_output) {
+                log_info("[realtime] Display output active");
+            }
+        }
+    }
+
     sc->running = true;
     sc->start_time = (double)utils_get_time_ms() / 1000.0;
     double prev_time = sc->start_time;
     double last_imu_log = sc->start_time;
+    double last_frame_time = sc->start_time;
 
     uint8_t* frame_rgb = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
     if (!frame_rgb) {
@@ -1146,11 +1275,20 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
         }
 
         if (!got_frame) {
-            log_debug("No frame available, waiting...");
+            /* ── Frame timeout: exit if no frames for too long ── */
+            double now_s = (double)utils_get_time_ms() / 1000.0;
+            double idle_s = now_s - last_frame_time;
+            if (idle_s > sc->frame_timeout_s) {
+                log_info("[realtime] No frames received for %.0fs (timeout=%ds), exiting",
+                         idle_s, sc->frame_timeout_s);
+                sc->running = false;
+                break;
+            }
             struct timespec ts = {0, 10000000L};
             nanosleep(&ts, NULL);
             continue;
         }
+        last_frame_time = (double)utils_get_time_ms() / 1000.0;
 
         sc->frame_count++;
 
@@ -1173,6 +1311,16 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
         TrackingResult tracking = object_tracker_update(
             sc->tracking_manager, inference.detections, inference.num_detections,
             positions, num_positions, sc->frame_count);
+
+        object_tracker_associate_poses(sc->tracking_manager, inference.poses, inference.num_poses);
+
+        /* ── Sync confirmed track counts to inference pipeline ── */
+        if (sc->inference_pipeline) {
+            sc->inference_pipeline->confirmed_track_count =
+                object_tracker_get_confirmed_count(sc->tracking_manager);
+            sc->inference_pipeline->total_track_count =
+                object_tracker_get_all_track_count(sc->tracking_manager);
+        }
 
         associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
                                       inference.poses, inference.num_poses);
@@ -1229,9 +1377,21 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
                                           sc->frame_count, avg_fps,
                                           vis_buffer);
 
+        /* ── Output to display / stream / video file ── */
+        if (sc->display_output) {
+            display_output_write_frame(sc->display_output, vis_buffer);
+        }
+
         if (sc->frame_count % 30 == 0) {
             log_info("Realtime frame %d: %d objects, %.1f FPS, %.1fms/frame",
                      sc->frame_count, tracking.num_tracked, avg_fps, frame_time * 1000.0f);
+        }
+
+        /* ── Max frames check ── */
+        if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
+            log_info("[realtime] Reached max_frames=%d, exiting", sc->max_frames);
+            sc->running = false;
+            break;
         }
     }
 
@@ -1263,6 +1423,10 @@ SystemStatus system_controller_process_realtime(SystemController* sc,
     if (sc->arrow_receiver) {
         arrow_receiver_destroy(sc->arrow_receiver);
         sc->arrow_receiver = NULL;
+    }
+    if (sc->display_output) {
+        display_output_destroy(sc->display_output);
+        sc->display_output = NULL;
     }
 
     sc->running = false;

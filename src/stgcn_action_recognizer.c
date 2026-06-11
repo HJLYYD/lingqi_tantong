@@ -78,6 +78,9 @@ void stgcn_action_recognizer_destroy(STGCNActionRecognizer* recognizer) {
     if (recognizer->session && g_ort) {
         g_ort->ReleaseSession(recognizer->session);
     }
+    free(recognizer->prealloc_pts);
+    free(recognizer->prealloc_mot);
+    free(recognizer->prealloc_padded);
     free(recognizer);
 }
 
@@ -179,6 +182,34 @@ bool stgcn_action_recognizer_load_model(STGCNActionRecognizer* recognizer, const
     }
 
     recognizer->model_loaded = true;
+
+    /* ── Pre-allocate inference tensors ──
+     * Eliminates per-frame malloc/free in stgcn_action_recognizer_recognize().
+     * Sizes are fixed at creation time: T × C × V × M for pts, T × 2 × V × M for mot. */
+    {
+        size_t pts_cnt = (size_t)recognizer->num_frames * STGCN_NUM_CHANNELS *
+                          recognizer->num_keypoints * recognizer->num_persons;
+        size_t mot_cnt  = (size_t)recognizer->num_frames * 2 *
+                          recognizer->num_keypoints * recognizer->num_persons;
+
+        recognizer->prealloc_pts = (float*)calloc(pts_cnt, sizeof(float));
+        recognizer->prealloc_mot = (float*)calloc(mot_cnt, sizeof(float));
+        recognizer->prealloc_padded = (float*)calloc(pts_cnt, sizeof(float));
+
+        if (recognizer->prealloc_pts && recognizer->prealloc_mot && recognizer->prealloc_padded) {
+            recognizer->prealloc_pts_size = pts_cnt;
+            recognizer->prealloc_mot_size = mot_cnt;
+            recognizer->prealloc_valid = true;
+        } else {
+            /* At least pts must succeed for inference to work.
+             * mot and padded are optional — will use dynamic alloc as fallback. */
+            if (!recognizer->prealloc_pts) {
+                log_error("ST-GCN: failed to pre-allocate pts tensor (%zu floats)", pts_cnt);
+            }
+            recognizer->prealloc_valid = (recognizer->prealloc_pts != NULL);
+        }
+    }
+
     log_info("ST-GCN action model loaded: %s (%.2f MB) classes=%d inputs=%zu (mot=%s) input_names=[%s,%s]",
              model_path, file_size / (1024.0 * 1024.0), recognizer->num_classes,
              num_inputs, recognizer->has_mot_input ? "yes" : "no",
@@ -245,8 +276,18 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     size_t frame_size = (size_t)C * V * M;
     size_t tensor_count = (size_t)T * frame_size;
 
-    /* ── Prepare pts input tensor ── */
-    float* pts_tensor = (float*)calloc(tensor_count, sizeof(float));
+    /* ── Prepare pts input tensor ──
+     * Use pre-allocated buffer when available; fall back to dynamic
+     * allocation only if pre-allocation failed at load time. */
+    float* pts_tensor;
+    bool pts_dynamic = false;
+    if (recognizer->prealloc_valid && recognizer->prealloc_pts) {
+        pts_tensor = recognizer->prealloc_pts;
+        memset(pts_tensor, 0, tensor_count * sizeof(float));
+    } else {
+        pts_tensor = (float*)calloc(tensor_count, sizeof(float));
+        pts_dynamic = true;
+    }
     if (!pts_tensor) return result;
 
     int valid_frames = (recognizer->buffer_frames < T) ? recognizer->buffer_frames : T;
@@ -269,7 +310,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
         pts_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &pts_ort);
     if (status) {
         g_ort->ReleaseStatus(status);
-        free(pts_tensor);
+        if (pts_dynamic) free(pts_tensor);
         return result;
     }
 
@@ -278,13 +319,32 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     const int MOT_C = 2;
     size_t mot_frame_size = (size_t)MOT_C * V * M;
     size_t mot_count = (size_t)T * mot_frame_size;
-    float* mot_tensor = (float*)calloc(mot_count, sizeof(float));
+
+    float* mot_tensor = NULL;
+    bool mot_dynamic = false;
+    if (recognizer->has_mot_input) {
+        if (recognizer->prealloc_valid && recognizer->prealloc_mot) {
+            mot_tensor = recognizer->prealloc_mot;
+            memset(mot_tensor, 0, mot_count * sizeof(float));
+        } else {
+            mot_tensor = (float*)calloc(mot_count, sizeof(float));
+            mot_dynamic = true;
+        }
+    }
 
     OrtValue* mot_ort = NULL;
     if (mot_tensor && recognizer->has_mot_input) {
         if (valid_frames > 0) {
             /* Compute mot from pts in the sliding window */
-            float* padded_pts = (float*)calloc(tensor_count, sizeof(float));
+            float* padded_pts;
+            bool padded_dynamic = false;
+            if (recognizer->prealloc_valid && recognizer->prealloc_padded) {
+                padded_pts = recognizer->prealloc_padded;
+                memset(padded_pts, 0, tensor_count * sizeof(float));
+            } else {
+                padded_pts = (float*)calloc(tensor_count, sizeof(float));
+                padded_dynamic = true;
+            }
             if (padded_pts) {
                 int offset = T - valid_frames;
                 memcpy(padded_pts + (size_t)offset * frame_size,
@@ -305,7 +365,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
                         mot[mot_idx_1] = nxt[pts_idx_y] - cur[pts_idx_y];
                     }
                 }
-                free(padded_pts);
+                if (padded_dynamic) free(padded_pts);
             }
         }
 
@@ -318,8 +378,8 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
             mot_ort = NULL;
         }
     }
-    free(pts_tensor);
-    free(mot_tensor);
+    if (pts_dynamic) free(pts_tensor);
+    if (mot_dynamic) free(mot_tensor);
 
     /* ── Run dual-input inference ── */
     const char* input_names[2];

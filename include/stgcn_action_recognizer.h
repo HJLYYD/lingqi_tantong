@@ -35,6 +35,14 @@ typedef struct {
 
     bool has_mot_input;                     /* true if model requires motion vector input (2-input ST-GCN) */
     bool model_loaded;
+
+    /* ── Pre-allocated inference tensors (eliminates per-frame malloc/free) ── */
+    float* prealloc_pts;                    /* [C * T * V * M] input keypoints tensor */
+    float* prealloc_mot;                    /* [2 * T * V * M] input motion tensor */
+    float* prealloc_padded;                 /* [C * T * V * M] padded pts for mot computation */
+    size_t prealloc_pts_size;               /* element count of pts tensor */
+    size_t prealloc_mot_size;               /* element count of mot tensor */
+    bool prealloc_valid;                    /* true if all pre-allocations succeeded */
 } STGCNActionRecognizer;
 
 STGCNActionRecognizer* stgcn_action_recognizer_create(const char* model_path,
