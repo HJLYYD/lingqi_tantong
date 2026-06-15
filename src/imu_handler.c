@@ -21,6 +21,7 @@ IMUHandler* imu_handler_create(int window_size, float gyro_noise_std, float acce
     handler->accel_noise_std = accel_noise_std;
     handler->buffer_count = 0;
     handler->is_calibrated = false;
+    pthread_mutex_init(&handler->pose_mutex, NULL);
     memset(&handler->latest_pose, 0, sizeof(handler->latest_pose));
     handler->has_external_pose = false;
 
@@ -28,6 +29,8 @@ IMUHandler* imu_handler_create(int window_size, float gyro_noise_std, float acce
 }
 
 void imu_handler_destroy(IMUHandler* handler) {
+    if (!handler) return;
+    pthread_mutex_destroy(&handler->pose_mutex);
     free(handler);
 }
 
@@ -109,6 +112,7 @@ void imu_handler_reset(IMUHandler* handler) {
 void imu_handler_set_external_pose(IMUHandler* handler, float qw, float qx, float qy, float qz, float pitch, float roll, float yaw, float altitude, float temp, uint32_t ts) {
     if (!handler) return;
 
+    pthread_mutex_lock(&handler->pose_mutex);
     handler->latest_pose.qw = qw;
     handler->latest_pose.qx = qx;
     handler->latest_pose.qy = qy;
@@ -121,12 +125,19 @@ void imu_handler_set_external_pose(IMUHandler* handler, float qw, float qx, floa
     handler->latest_pose.timestamp_ms = ts;
     handler->latest_pose.is_valid = true;
     handler->has_external_pose = true;
+    pthread_mutex_unlock(&handler->pose_mutex);
 }
 
 bool imu_handler_get_latest_pose(const IMUHandler* handler, IMUExternalPose* out_pose) {
     if (!handler || !out_pose) return false;
-    if (!handler->has_external_pose || !handler->latest_pose.is_valid) return false;
+
+    pthread_mutex_lock(&((IMUHandler*)handler)->pose_mutex);
+    if (!handler->has_external_pose || !handler->latest_pose.is_valid) {
+        pthread_mutex_unlock(&((IMUHandler*)handler)->pose_mutex);
+        return false;
+    }
 
     *out_pose = handler->latest_pose;
+    pthread_mutex_unlock(&((IMUHandler*)handler)->pose_mutex);
     return true;
 }

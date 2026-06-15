@@ -161,22 +161,75 @@ static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" P
 static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+static int client_count = 0;
+
 esp_err_t camera_handler(httpd_req_t *req) {
+  client_count++;
+  int my_id = client_count;
+  Serial.printf("[CAM#%d] 客户端已连接\n", my_id);
+
   httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
   camera_fb_t *fb = NULL;
+  esp_err_t res;
+  int frame_cnt = 0;
 
   while (true) {
     fb = esp_camera_fb_get();
-    if (!fb) break;
+    if (!fb) {
+      Serial.printf("[CAM#%d] esp_camera_fb_get 返回 NULL，退出\n", my_id);
+      break;
+    }
 
-    char buf[64];
-    size_t hlen = snprintf(buf, 64, STREAM_PART, fb->len);
-    httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-    httpd_resp_send_chunk(req, buf, hlen);
-    httpd_resp_send_chunk(req, (char*)fb->buf, fb->len);
+    // 构造 IMU JSON
+    char imu_json[128];
+    int imu_len = snprintf(imu_json, sizeof(imu_json),
+      "{\"ax\":%.4f,\"ay\":%.4f,\"az\":%.4f,\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f}\r\n",
+      ax, ay, az, gx, gy, gz);
 
+    // Content-Length = IMU JSON 长度 + JPEG 长度
+    size_t total = imu_len + fb->len;
+    char part_hdr[128];
+    size_t hlen = snprintf(part_hdr, sizeof(part_hdr), STREAM_PART, total);
+
+    // 发送 boundary
+    res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+    if (res != ESP_OK) {
+      Serial.printf("[CAM#%d] boundary 发送失败，客户端断开\n", my_id);
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    // 发送 part header
+    res = httpd_resp_send_chunk(req, part_hdr, hlen);
+    if (res != ESP_OK) {
+      Serial.printf("[CAM#%d] part header 发送失败\n", my_id);
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    // 发送 IMU JSON
+    res = httpd_resp_send_chunk(req, imu_json, imu_len);
+    if (res != ESP_OK) {
+      Serial.printf("[CAM#%d] IMU JSON 发送失败\n", my_id);
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    // 发送 JPEG
+    res = httpd_resp_send_chunk(req, (char*)fb->buf, fb->len);
     esp_camera_fb_return(fb);
+    if (res != ESP_OK) {
+      Serial.printf("[CAM#%d] JPEG 发送失败\n", my_id);
+      break;
+    }
+
+    frame_cnt++;
+    Serial.printf("[CAM#%d] 第%d帧 | IMU: ax=%.4f ay=%.4f az=%.4f gx=%.4f gy=%.4f gz=%.4f | JPEG=%uB\n",
+      my_id, frame_cnt, ax, ay, az, gx, gy, gz, fb->len);
   }
+
+  Serial.printf("[CAM#%d] 退出，共发送 %d 帧\n", my_id, frame_cnt);
+  httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }
 
@@ -195,6 +248,8 @@ esp_err_t imu_handler(httpd_req_t *req) {
 httpd_handle_t start_server(void) {
   httpd_handle_t server = NULL;
   httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
+  conf.lru_purge_enable = true;      // 客户端断开后自动清理占用的 socket
+  conf.max_open_sockets = 4;         // 允许多个连接，重连时可踢掉旧 socket
 
   httpd_uri_t uri_cam = {"/", HTTP_GET, camera_handler, NULL};
   httpd_uri_t uri_imu = {"/imu", HTTP_GET, imu_handler, NULL};

@@ -15,10 +15,10 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-set(MUSE_PI_ARCH "rv64gcv0p7" CACHE STRING "Target RISC-V arch: rv64gcv0p7 (K1 X60) or rv64gcv1p0")
+set(MUSE_PI_ARCH "rv64gcv1p0" CACHE STRING "Target RISC-V arch: rv64gcv1p0 (K1 X60) or rv64gcv0p7 (legacy)")
 
 if(MUSE_PI_ARCH STREQUAL "rv64gcv1p0")
-    set(RISCV_ARCH_FLAGS "-march=rv64gcv")
+    set(RISCV_ARCH_FLAGS "-mcpu=spacemit-x60")
 else()
     set(RISCV_ARCH_FLAGS "-march=rv64gcv_zicsr_zifencei -menable-experimental-extensions")
 endif()

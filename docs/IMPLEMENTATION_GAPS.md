@@ -195,9 +195,10 @@ src/vins/
 ### 11. RISC-V Cross-Compilation Toolchain Configuration
 
 CMakeLists.txt has integrated RISC-V multi-version RVV vector extension detection and compilation configuration:
-- RVV 1.0 (`-march=rv64gcv1p0`) — preferred
-- RVV 1.0 fallback (`-march=rv64gcv`)
-- RVV 0.7.1 (`-march=rv64gcv0p7`) — X60 core compatible
+- GCC 14+ K1 native (`-mcpu=spacemit-x60`) — preferred, auto-sets rv64gcv1p0 + X60 tuning + zvl256b
+- GCC 14+ fallback (`-mrvv-vector-bits=zvl`) — use ISA-defined VLEN (256-bit on X60)
+- GCC 13 / legacy (`-march=rv64gcv`) — no X60-specific tuning
+- RVV 0.7.1 (`-march=rv64gcv0p7`) — deprecated, X60 is RVV 1.0
 - Bianbu sysroot path configured via `-DBIANBU_SYSROOT`
 
 Still needed:

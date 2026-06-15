@@ -33,13 +33,10 @@ ModelStore* model_store_create(const char* base_path);
 void model_store_destroy(ModelStore* store);
 
 const char* model_store_resolve_path(const ModelStore* store, const char* model_name);
-const char* model_store_get_path(const ModelStore* store, const char* model_name);
 bool model_store_validate(const ModelStore* store, const char* model_name);
 
 OrtSession* model_store_load_onnx(ModelStore* store, const char* model_name);
 void model_store_clear_cache(ModelStore* store);
-
-void model_store_list_available(const ModelStore* store, char* out_names, int max_names, int name_len);
 
 #ifdef __cplusplus
 }

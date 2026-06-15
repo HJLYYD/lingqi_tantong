@@ -38,7 +38,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_string(cm, "system.log_level", "INFO");
 
     config_set_string(cm, "detection.backend", "ai_accel");
-    config_set_string(cm, "detection.model_path", "models/Human Recognition/yolo11n.q.onnx");
+    config_set_string(cm, "detection.model_path", "");  /* empty = disabled (unified mode: yolo11n-pose handles both) */
     config_set_float(cm, "detection.confidence_threshold", 0.12f);  /* DFL peakiness for quantized models */
     config_set_float(cm, "detection.iou_threshold", 0.40f);         /* NMS for secondary detector */
     config_set_int(cm, "detection.input_size", 640);
@@ -50,7 +50,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_float(cm, "detection.keypoint_min_confidence", 0.30f);
     config_set_float(cm, "detection.keypoint_validity_threshold", 0.50f);
     /* Cascade defaults */
-    config_set_bool(cm, "detection.cascade_enabled", true);
+    config_set_bool(cm, "detection.cascade_enabled", false);  /* unified single-model mode: no cascade needed */
     config_set_int(cm, "detection.cascade_validation_interval", 15);
     config_set_int(cm, "detection.cascade_secondary_interval", 5);  /* secondary detector interval in TRACKING mode */
     config_set_int(cm, "detection.cascade_tracking_resolution.0", 320);
@@ -60,7 +60,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_float(cm, "detection.fallback_area_ratio_min", 0.008f);
 
     config_set_string(cm, "pose.backend", "ai_accel");
-    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
+    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx");
     config_set_float(cm, "pose.confidence_threshold", 0.10f);  /* DFL peakiness for quantized pose model */
     config_set_float(cm, "pose.iou_threshold", 0.40f);
     config_set_int(cm, "pose.input_size.0", 640);
@@ -385,7 +385,22 @@ int config_load_from_file(ConfigManager* cm, const char* path) {
         while (*val_start == ' ' || *val_start == '\t') val_start++;
         strncpy(value_part, val_start, sizeof(value_part) - 1);
 
-        if (value_part[0] == '\0') {
+        /* Check for quoted empty-string literal before stripping */
+        bool was_quoted = false;
+        {
+            int vlen = (int)strlen(value_part);
+            if (vlen >= 2) {
+                if ((value_part[0] == '"'  && value_part[vlen-1] == '"') ||
+                    (value_part[0] == '\'' && value_part[vlen-1] == '\'')) {
+                    was_quoted = true;
+                    memmove(value_part, value_part + 1, vlen - 2);
+                    value_part[vlen - 2] = '\0';
+                }
+            }
+        }
+
+        /* Section header = empty value AND not an explicit "" empty string */
+        if (value_part[0] == '\0' && !was_quoted) {
             int target_depth = indent / 2;
             if (target_depth >= MAX_CONFIG_DEPTH) target_depth = MAX_CONFIG_DEPTH - 1;
 
@@ -430,19 +445,9 @@ int config_load_from_file(ConfigManager* cm, const char* path) {
 
         if (full_key[0] == '\0') continue;
 
-        if (value_part[0] == '"' || value_part[0] == '\'') {
-            char str_val[MAX_VALUE_LEN];
-            int v_len = (int)strlen(value_part);
-            int start = 1;
-            int end = v_len - 1;
-            if (end > start && (value_part[end] == '"' || value_part[end] == '\'')) {
-                end--;
-            }
-            int copy_len = end - start + 1;
-            if (copy_len >= MAX_VALUE_LEN) copy_len = MAX_VALUE_LEN - 1;
-            memcpy(str_val, value_part + start, copy_len);
-            str_val[copy_len] = '\0';
-            config_set_string(cm, full_key, str_val);
+        /* was_quoted (set above by the new quote-stripper) → string value */
+        if (was_quoted) {
+            config_set_string(cm, full_key, value_part);
             parsed_count++;
         }
         else if (strcmp(value_part, "true") == 0 || strcmp(value_part, "True") == 0 ||

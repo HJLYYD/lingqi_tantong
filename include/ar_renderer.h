@@ -31,15 +31,6 @@ int ar_renderer_render_frame(ARRenderer* renderer,
                               const ARMarker* markers, int num_markers,
                               uint8_t* output_frame);
 
-int ar_renderer_compensate_motion(ARRenderer* renderer,
-                                   const uint8_t* frame, int width, int height,
-                                   const float euler[3],
-                                   uint8_t* output_frame);
-
-int ar_renderer_resize_to_render_size(ARRenderer* renderer,
-                                       const uint8_t* frame, int width, int height,
-                                       uint8_t* output_frame);
-
 #ifdef __cplusplus
 }
 #endif

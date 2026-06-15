@@ -64,59 +64,51 @@ mjpeg:
   wifi_ssid: "ESP32-Camera-AP"
   # ESP32 AP password
   wifi_password: "12345678"
-  # Poll /imu endpoint for accel/gyro data
+  # IMU data is embedded inline in MJPEG stream (Python test-ov-imu.py style)
+  # ESP32 sends {"ax":...,"ay":...,"az":...,"gx":...,"gy":...,"gz":...} before each JPEG
   imu_enabled: true
-  # IMU poll interval in milliseconds
-  imu_poll_interval_ms: 100
+  # IMU data arrives with each MJPEG frame (no separate polling needed)
   # Exponential backoff cap in seconds
   reconnect_max_delay_s: 16
 
 detection:
-  # SECONDARY person detector (YOLO11n INT8-quantized xquant-split).
-  # PRIMARY person detection is done by the pose model (yolov8n-pose).
-  # INT8 quantization breaks cls/obj heads (~0.5 sigmoid for ALL classes),
-  # so detection relies on DFL peakiness + person geometry filtering.
-  # DFL signal: uniform=0.0625, weak=0.10, clear=0.25+, peak=0.70+.
-  # Use this as the secondary detector to supplement pose detections.
-  # Model from: https://archive.spacemit.com/spacemit-ai/model_zoo/vision/yolo11/yolo11n.q.onnx
+  # SECONDARY person detector — DISABLED in unified mode.
+  # yolo11n-pose (pose section below) does BOTH person detection AND 17-keypoint
+  # pose estimation in a single forward pass — no separate detector needed.
+  # This saves ~150ms/frame (one full EP inference) and one TCM slot.
+  # Set model_path to a valid .q.onnx file to re-enable the secondary detector.
   backend: ai_accel
-  model_path: "models/Human Recognition/yolo11n.q.onnx"
-  confidence_threshold: 0.12   # DFL peakiness: uniform=0.0625, weak=0.10, clear=0.25+, peak=0.70+
-  iou_threshold: 0.40           # tighter NMS to suppress overlapping boxes on same person
-  input_size: [640, 640]
-  classes: 80
-  # ── Keypoint-based anatomical validation ──
-  # Rejects detections whose keypoints fail anatomical plausibility checks
-  # (shoulder symmetry, torso proportions, limb ratios, head position).
-  # Set keypoint_min_count to 0 to disable keypoint filtering.
-  keypoint_min_count: 6           # raised from 5: minimum valid keypoints for human detection
-  keypoint_min_confidence: 0.30   # per-keypoint confidence threshold
-  keypoint_validity_threshold: 0.50  # raised from 0.40: overall anatomical score for acceptance
-  # ── Cascade optimization ──
-  # When tracking is stable (confirmed tracks exist), the pipeline enters
-  # TRACKING mode: skip YOLO11n secondary detector, reduce face detection
-  # frequency. Every cascade_validation_interval frames, a full-resolution
-  # validation frame runs both models to catch new entries.
-  cascade_enabled: true
-  cascade_validation_interval: 15  # frames between full-res re-validation
-  cascade_secondary_interval: 5    # frames between YOLO11n runs in TRACKING mode (5 = ~15% of frames)
-  cascade_tracking_resolution: [320, 320]  # reduced input when tracking (not yet used by fixed-input models)
-  # ── Stricter fallback when no pose data available ──
-  fallback_confidence: 0.20       # conf threshold when YOLO11n runs without pose model
-  fallback_area_ratio_min: 0.008  # min bbox area ratio without pose validation
-
-pose:
-  # PRIMARY person detector + pose estimator (YOLOv8n-pose, xquant-split).
-  # This model detects people AND estimates 17 COCO keypoints in one pass.
-  # The cls head is broken by INT8 quantization (same as YOLO11 detector),
-  # so we use DFL peakiness as confidence. Keypoints may also be partially
-  # broken but bounding boxes from DFL are the primary output for tracking.
-  # DFL: uniform=0.0625, real signal=0.20-0.70.
-  backend: ai_accel
-  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
-  confidence_threshold: 0.10   # DFL peakiness for xquant-split models (uniform=0.0625)
+  model_path: ""
+  confidence_threshold: 0.12
   iou_threshold: 0.40
   input_size: [640, 640]
+  classes: 80
+  keypoint_min_count: 4           # lowered from 6: accept partial-body detections
+  keypoint_min_confidence: 0.15    # lowered from 0.30: INT8 model keypoint conf is lower
+  keypoint_validity_threshold: 0.30 # lowered from 0.50: less strict overall validity
+  # ── Cascade optimization (single-model mode) ──
+  # With only one model, the cascade simply throttles face detection
+  # when tracks are stable. No secondary detector to schedule.
+  cascade_enabled: false
+  cascade_validation_interval: 15
+  cascade_secondary_interval: 5
+  cascade_tracking_resolution: [320, 320]
+  fallback_confidence: 0.20
+  fallback_area_ratio_min: 0.008
+
+pose:
+  # UNIFIED person detector + pose estimator (YOLO11n-pose, xquant-split INT8).
+  # Replaces both YOLOv8n-pose + YOLO11n with a SINGLE model.
+  # YOLO11n-pose: 2.9M params, 7.4 GFLOPs, AP 50.0 on COCO-Pose.
+  # vs YOLOv8n-pose: 3.3M params, 9.2 GFLOPs, AP 48.0.
+  # Output format: {reg(64ch), cls(1ch), kpt(51ch)} × 3 FPN strides.
+  # DFL peakiness used as confidence (cls head broken by INT8 quantization).
+  # 480×480: 44% fewer pixels than 640, ~40% faster inference.
+  backend: ai_accel
+  model_path: "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx"
+  confidence_threshold: 0.06   # lowered: catch more detections
+  iou_threshold: 0.40
+  input_size: [480, 480]       # model's actual input is 640x640 (overridden at load)
   num_keypoints: 17
   skeleton_type: coco
 
@@ -145,7 +137,7 @@ action:
   num_persons: 1
   num_classes: 7    # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
   confidence_threshold: 0.50
-  inference_interval: 10   # frames between ST-GCN inference runs (10 frames @ ~3.5 FPS = ~3s)
+  inference_interval: 25   # was 10: run ST-GCN less often for higher overall FPS
 
 tracking:
   max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
@@ -195,6 +187,12 @@ spatial:
   camera_tilt_deg: 0.0
   earth_radius: 6371000.0
   coordinate_type: enu_local
+  # ── Depth estimation (2024-2026 academic refinements) ──
+  # Uses multi-point anatomical sampling + tilt correction + MAD fusion.
+  # EMA smooths frame-to-frame jitter per tracked person.
+  depth_ema_alpha: 0.30          # EMA smoothing factor (0=no smoothing, 1=instant)
+  depth_outlier_mad_mult: 2.5    # MAD multiplier for outlier rejection (higher=more tolerant)
+  depth_min_keypoint_conf: 0.25  # minimum per-keypoint confidence for depth sampling
 
 imu:
   source: arrow_uart

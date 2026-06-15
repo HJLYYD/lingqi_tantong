@@ -36,14 +36,6 @@
                                                ByteTrack best practice: detector NMS should be tighter
                                                than tracker IOU to avoid passing duplicate boxes. */
 #define MAX_FILTERED_DETECTIONS     20      /* lowered from 25: real scenes rarely exceed 15 people */
-#define MERGE_IOU_DUPLICATE         0.35f   /* lowered from 0.50: aggressively merge overlapping detections
-                                               from pose model + YOLO model.  Two models detecting the same
-                                               person at slightly different scales should be merged, not
-                                               both kept. 0.35 catches 85%+ of duplicate pairs. */
-#define FINAL_NMS_IOU_THRESHOLD     0.35f   /* lowered from 0.45: final cleanup after merge.
-                                               At 0.35, any two boxes with >35% overlap are considered
-                                               the same person. This is the standard COCO NMS default. */
-
 /* ── Cascade state machine constants ── */
 #define CASCADE_VALIDATION_INTERVAL_DEFAULT  15    /* frames between full-res re-validation */
 #define CASCADE_TRACKING_W_DEFAULT           320   /* reduced width when tracking */
@@ -68,8 +60,7 @@ AIInferencePipeline* inference_pipeline_create(void) {
      * SECONDARY: YOLO11n for supplementary person detection.
      * SUPPLEMENT: Face detection/recognition (reduced frequency).
      * Action recognition runs from pose keypoints. */
-    pipeline->enabled_stages = PIPELINE_ENABLE_DETECTION | PIPELINE_ENABLE_POSE
-                             | PIPELINE_ENABLE_FACE | PIPELINE_ENABLE_ACTION;
+    pipeline->enabled_stages = PIPELINE_ENABLE_POSE | PIPELINE_ENABLE_FACE | PIPELINE_ENABLE_ACTION;
     pipeline->frame_counter = 0;
 
     /* ── Cascade state init ── */
@@ -101,9 +92,6 @@ AIInferencePipeline* inference_pipeline_create(void) {
 void inference_pipeline_destroy(AIInferencePipeline* pipeline) {
     if (!pipeline) return;
 
-    if (pipeline->detector) {
-        yolov8_detector_destroy(pipeline->detector);
-    }
     if (pipeline->pose_estimator) {
         yolov8_pose_estimator_destroy(pipeline->pose_estimator);
     }
@@ -124,152 +112,125 @@ void inference_pipeline_destroy(AIInferencePipeline* pipeline) {
 }
 
 int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* model_dir, const ConfigManager* config) {
-    if (!pipeline || !model_dir) return -1;
+    if (!pipeline || !config) return -1;
+    (void)model_dir;  /* all model paths come from config */
 
     char path_buf[MAX_PATH_LEN];
 
     /*
-     * EP slot allocation (SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD=1 → shared pool):
-     *   1. YOLOv8-Pose — PRIMARY person detector + keypoints (runs every frame) → EP slot 1
-     *   2. YOLO11      — SECONDARY person detector (runs every frame)           → EP slot 2
-     *   3. Face det    — face detection (runs every 10 frames)                  → EP slot 3
-     *   4. ArcFace     — face recognition (runs per-face, small model)          → EP slot 4
-     *   5. ST-GCN      — CPU only (FP32 model, can't use EP)                    → CPU
-     *
-     * All 4 quantized models share one global EP intra-op thread pool.
-     * Models run sequentially → no TCM contention.
+     * K1 EP slot allocation (SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD=1):
+     *   1. YOLO11n-pose — person detector + keypoints in one pass (every frame)
+     *   2. (reserved for future use — secondary detector disabled in unified mode)
+     *   3. Face det      — face detection (every 10-120 frames)
+     *   4. ArcFace       — face recognition (per-face)
+     *   5. ST-GCN        — CPU EP only (FP32)
      */
 
-    /* ── Step 1: YOLOv8-Pose (PRIMARY person detector + keypoints, REQUIRED) ── */
-    int pose_w = config ? config_get_int(config, "pose.input_size.0", 640) : 640;
-    int pose_h = config ? config_get_int(config, "pose.input_size.1", 640) : 640;
-    float pose_conf = config ? config_get_float(config, "pose.confidence_threshold", 0.3f) : 0.3f;
-    float pose_iou = config ? config_get_float(config, "pose.iou_threshold", 0.45f) : 0.45f;
-
-    const char* pose_model = config ? config_get_string(config, "pose.model_path", NULL) : NULL;
-    if (pose_model) {
-        strncpy(path_buf, pose_model, sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    } else {
-        snprintf(path_buf, sizeof(path_buf), "%s/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx", model_dir);
-    }
-    pipeline->pose_estimator = yolov8_pose_estimator_create(path_buf, pose_w, pose_h, pose_conf, pose_iou);
-    if (pipeline->pose_estimator) {
+    /* ── Step 1: YOLO11n-pose (PRIMARY, REQUIRED) ── */
+    {
+        const char* m = config_get_string(config, "pose.model_path", NULL);
+        if (!m || m[0] == '\0') {
+            log_critical("pose.model_path not set in config — PRIMARY model is REQUIRED");
+            return -1;
+        }
+        strncpy(path_buf, m, sizeof(path_buf) - 1);
+        int w = config_get_int(config, "pose.input_size.0", 640);
+        int h = config_get_int(config, "pose.input_size.1", 640);
+        float conf = config_get_float(config, "pose.confidence_threshold", 0.08f);
+        float iou  = config_get_float(config, "pose.iou_threshold", 0.40f);
+        pipeline->pose_estimator = yolov8_pose_estimator_create(path_buf, w, h, conf, iou);
+        if (!pipeline->pose_estimator) {
+            log_critical("Failed to load PRIMARY pose model: %s", path_buf);
+            return -1;
+        }
         pipeline->models_loaded[1] = true;
-        log_info("Pose estimator loaded (PRIMARY, EP): %s", path_buf);
-    } else {
-        log_error("PRIMARY pose model not found: %s", path_buf);
-        return -1;
+        log_info("Pose estimator loaded (PRIMARY): %s", path_buf);
     }
 
-    /* ── Step 2: YOLO11 (SECONDARY person detector) ── */
-    int det_w = config ? config_get_int(config, "detection.input_size.0", 320) : 320;
-    int det_h = config ? config_get_int(config, "detection.input_size.1", 320) : 320;
-    float det_conf = config ? config_get_float(config, "detection.confidence_threshold", 0.25f) : 0.25f;
-    float det_iou = config ? config_get_float(config, "detection.iou_threshold", 0.45f) : 0.45f;
-
-    const char* det_model = config ? config_get_string(config, "detection.model_path", NULL) : NULL;
-    if (det_model) {
-        strncpy(path_buf, det_model, sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    } else {
-        snprintf(path_buf, sizeof(path_buf), "%s/Human Recognition/yolo11n.q.onnx", model_dir);
-    }
-    pipeline->detector = yolov8_detector_create(path_buf, det_w, det_h, det_conf, det_iou);
-    if (pipeline->detector) {
-        pipeline->models_loaded[0] = true;
-        log_info("Detector loaded (SECONDARY, EP): %s", path_buf);
-    } else {
-        log_warning("Secondary detector model not found: %s (pose-only mode)", path_buf);
-    }
-
-    int face_w = config ? config_get_int(config, "face.input_size.0", 320) : 320;
-    int face_h = config ? config_get_int(config, "face.input_size.1", 320) : 320;
-    float face_conf = config ? config_get_float(config, "face.confidence_threshold", 0.5f) : 0.5f;
-    float face_iou = config ? config_get_float(config, "face.iou_threshold", 0.4f) : 0.4f;
-
-    const char* face_det_model = config ? config_get_string(config, "face.detection_model_path", NULL) : NULL;
-    if (face_det_model) {
-        strncpy(path_buf, face_det_model, sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    } else {
-        snprintf(path_buf, sizeof(path_buf), "%s/Face Recognition/yolov5n-face_cut.q.onnx", model_dir);
-    }
-    pipeline->face_detector = yolov5_face_detector_create(path_buf, face_w, face_h, face_conf, face_iou);
-    if (pipeline->face_detector) {
-        pipeline->models_loaded[2] = true;
-        log_info("Face detector loaded (EP slot 3): %s", path_buf);
-    } else {
-        log_warning("Face detector model not found: %s", path_buf);
+    /* ── Step 3: Face detection ── */
+    {
+        const char* m = config_get_string(config, "face.detection_model_path", NULL);
+        if (m && m[0] != '\0') {
+            strncpy(path_buf, m, sizeof(path_buf) - 1);
+            int w = config_get_int(config, "face.input_size.0", 320);
+            int h = config_get_int(config, "face.input_size.1", 320);
+            float conf = config_get_float(config, "face.confidence_threshold", 0.5f);
+            float iou  = config_get_float(config, "face.iou_threshold", 0.4f);
+            pipeline->face_detector = yolov5_face_detector_create(path_buf, w, h, conf, iou);
+            if (pipeline->face_detector) {
+                pipeline->models_loaded[2] = true;
+                log_info("Face detector loaded: %s", path_buf);
+            } else {
+                log_warning("Face detector failed: %s", path_buf);
+            }
+        } else {
+            pipeline->face_detector = NULL;
+            log_info("Face detection: DISABLED (no model_path)");
+        }
     }
 
-    const char* face_rec_model = config ? config_get_string(config, "face.recognition_model_path", NULL) : NULL;
-    if (face_rec_model) {
-        strncpy(path_buf, face_rec_model, sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    } else {
-        snprintf(path_buf, sizeof(path_buf), "%s/Face Recognition/arcface_mobilefacenet_cut.q.onnx", model_dir);
-    }
-    pipeline->face_recognizer = arcface_recognizer_create(path_buf, 112, 112, 0.55f);
-    if (pipeline->face_recognizer) {
-        pipeline->models_loaded[3] = true;
-        log_info("Face recognizer loaded (EP slot 4): %s", path_buf);
-    } else {
-        log_warning("Face recognizer model not found: %s", path_buf);
+    /* ── Step 4: Face recognition ── */
+    {
+        const char* m = config_get_string(config, "face.recognition_model_path", NULL);
+        if (m && m[0] != '\0') {
+            strncpy(path_buf, m, sizeof(path_buf) - 1);
+            pipeline->face_recognizer = arcface_recognizer_create(path_buf, 112, 112, 0.55f);
+            if (pipeline->face_recognizer) {
+                pipeline->models_loaded[3] = true;
+                log_info("Face recognizer loaded: %s", path_buf);
+            } else {
+                log_warning("Face recognizer failed: %s", path_buf);
+            }
+        } else {
+            pipeline->face_recognizer = NULL;
+            log_info("Face recognition: DISABLED (no model_path)");
+        }
     }
 
-    int action_num_frames = config ? config_get_int(config, "action.num_frames", 300) : 300;
-    int action_num_keypoints = config ? config_get_int(config, "action.num_keypoints", 17) : 17;
-    int action_num_persons = config ? config_get_int(config, "action.num_persons", 2) : 2;
-    int action_num_classes = config ? config_get_int(config, "action.num_classes", 60) : 60;
-    float action_conf = config ? config_get_float(config, "action.confidence_threshold", 0.5f) : 0.5f;
-
-    const char* action_model = config ? config_get_string(config, "action.model_path", NULL) : NULL;
-    if (action_model) {
-        strncpy(path_buf, action_model, sizeof(path_buf) - 1);
-        path_buf[sizeof(path_buf) - 1] = '\0';
-    } else {
-        snprintf(path_buf, sizeof(path_buf), "%s/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx", model_dir);
-    }
-    pipeline->action_recognizer = stgcn_action_recognizer_create(path_buf, action_num_frames,
-                                                                   action_num_keypoints, action_num_persons,
-                                                                   action_num_classes, action_conf);
-    if (pipeline->action_recognizer) {
-        pipeline->models_loaded[4] = true;
-        log_info("Action recognizer loaded: %s", path_buf);
-    } else {
-        log_warning("Action recognizer model not found: %s", path_buf);
+    /* ── Step 5: Action recognition ── */
+    {
+        const char* m = config_get_string(config, "action.model_path", NULL);
+        if (m && m[0] != '\0') {
+            strncpy(path_buf, m, sizeof(path_buf) - 1);
+            int nf = config_get_int(config, "action.num_frames", 30);
+            int nk = config_get_int(config, "action.num_keypoints", 14);
+            int np = config_get_int(config, "action.num_persons", 1);
+            int nc = config_get_int(config, "action.num_classes", 7);
+            float conf = config_get_float(config, "action.confidence_threshold", 0.5f);
+            pipeline->action_recognizer = stgcn_action_recognizer_create(path_buf, nf, nk, np, nc, conf);
+            if (pipeline->action_recognizer) {
+                pipeline->models_loaded[4] = true;
+                log_info("Action recognizer loaded: %s", path_buf);
+            } else {
+                log_warning("Action recognizer failed: %s", path_buf);
+            }
+        } else {
+            pipeline->action_recognizer = NULL;
+            log_info("Action recognition: DISABLED (no model_path)");
+        }
     }
 
     /* ── Step 6: Keypoint validator + cascade config ── */
     {
         KeypointValidatorConfig kv_cfg;
         memset(&kv_cfg, 0, sizeof(kv_cfg));
-        kv_cfg.min_keypoints = config ? config_get_int(config, "detection.keypoint_min_count", KV_DEFAULT_MIN_KEYPOINTS) : KV_DEFAULT_MIN_KEYPOINTS;
-        kv_cfg.kpt_conf_threshold = config ? config_get_float(config, "detection.keypoint_min_confidence", KV_DEFAULT_KPT_CONF_THRESHOLD) : KV_DEFAULT_KPT_CONF_THRESHOLD;
-        kv_cfg.validity_threshold = config ? config_get_float(config, "detection.keypoint_validity_threshold", KV_DEFAULT_VALIDITY_THRESHOLD) : KV_DEFAULT_VALIDITY_THRESHOLD;
+        kv_cfg.min_keypoints = config_get_int(config, "detection.keypoint_min_count", KV_DEFAULT_MIN_KEYPOINTS);
+        kv_cfg.kpt_conf_threshold = config_get_float(config, "detection.keypoint_min_confidence", KV_DEFAULT_KPT_CONF_THRESHOLD);
+        kv_cfg.validity_threshold = config_get_float(config, "detection.keypoint_validity_threshold", KV_DEFAULT_VALIDITY_THRESHOLD);
         kv_cfg.in_bbox_ratio = KV_DEFAULT_IN_BBOX_RATIO;
         kv_cfg.symmetry_tolerance = KV_DEFAULT_SYMMETRY_TOLERANCE;
-        kv_cfg.debug_frame_interval = 0;  /* set to 30 for debug logging */
+        kv_cfg.debug_frame_interval = 0;
         pipeline->keypoint_validator = keypoint_validator_create(&kv_cfg);
         pipeline->keypoint_filter_enabled = (pipeline->keypoint_validator != NULL);
 
-        /* Cascade config */
-        pipeline->cascade_enabled = config ? config_get_bool(config, "detection.cascade_enabled", true) : true;
-        pipeline->cascade_validation_interval = config ? config_get_int(config, "detection.cascade_validation_interval", CASCADE_VALIDATION_INTERVAL_DEFAULT) : CASCADE_VALIDATION_INTERVAL_DEFAULT;
-        int tracking_w = config ? config_get_int(config, "detection.cascade_tracking_resolution.0", CASCADE_TRACKING_W_DEFAULT) : CASCADE_TRACKING_W_DEFAULT;
-        int tracking_h = config ? config_get_int(config, "detection.cascade_tracking_resolution.1", CASCADE_TRACKING_H_DEFAULT) : CASCADE_TRACKING_H_DEFAULT;
-        pipeline->cascade_tracking_w = tracking_w > 0 ? tracking_w : CASCADE_TRACKING_W_DEFAULT;
-        pipeline->cascade_tracking_h = tracking_h > 0 ? tracking_h : CASCADE_TRACKING_H_DEFAULT;
-
-        /* Enhanced fallback filter thresholds */
-        pipeline->fallback_conf_threshold = config ? config_get_float(config, "detection.fallback_confidence", FILTER_FALLBACK_CONF_THRESHOLD) : FILTER_FALLBACK_CONF_THRESHOLD;
-        pipeline->fallback_area_ratio_min = config ? config_get_float(config, "detection.fallback_area_ratio_min", FILTER_FALLBACK_AREA_RATIO_MIN) : FILTER_FALLBACK_AREA_RATIO_MIN;
-
-        /* Cascade secondary detector interval (configurable, default 5 in TRACKING mode) */
-        pipeline->cascade_secondary_interval = config ? config_get_int(config, "detection.cascade_secondary_interval", 5) : 5;
-
-        /* Action recognition inference interval */
+        pipeline->cascade_enabled = config_get_bool(config, "detection.cascade_enabled", false);
+        pipeline->cascade_validation_interval = config_get_int(config, "detection.cascade_validation_interval", 15);
+        pipeline->cascade_tracking_w = config_get_int(config, "detection.cascade_tracking_resolution.0", 320);
+        pipeline->cascade_tracking_h = config_get_int(config, "detection.cascade_tracking_resolution.1", 320);
+        pipeline->fallback_conf_threshold = config_get_float(config, "detection.fallback_confidence", FILTER_FALLBACK_CONF_THRESHOLD);
+        pipeline->fallback_area_ratio_min = config_get_float(config, "detection.fallback_area_ratio_min", FILTER_FALLBACK_AREA_RATIO_MIN);
+        pipeline->cascade_secondary_interval = config_get_int(config, "detection.cascade_secondary_interval", 5);
+        pipeline->action_inference_interval = config_get_int(config, "action.inference_interval", 10);
         pipeline->action_inference_interval = config ? config_get_int(config, "action.inference_interval", 10) : 10;
 
         log_info("Cascade: enabled=%d validation_interval=%d secondary_interval=%d tracking_res=%dx%d",
@@ -504,43 +465,6 @@ static int poses_to_detections(const PoseEstimation* poses, int num_poses,
     return out_count;
 }
 
-static int merge_detection_sets(Detection* primary, int num_primary,
-                                 Detection* secondary, int num_secondary,
-                                 Detection* out, int max_out,
-                                 float iou_thresh) {
-    int count = 0;
-    bool* sec_used = (bool*)calloc((size_t)num_secondary, sizeof(bool));
-    if (!sec_used) {
-        int n = UTILS_MIN(num_primary + num_secondary, max_out);
-        if (num_primary > 0) memcpy(out, primary, (size_t)num_primary * sizeof(Detection));
-        if (num_secondary > 0 && num_primary < n) {
-            memcpy(out + num_primary, secondary,
-                   (size_t)UTILS_MIN(num_secondary, n - num_primary) * sizeof(Detection));
-        }
-        return n;
-    }
-
-    for (int i = 0; i < num_primary && count < max_out; i++) {
-        out[count++] = primary[i];
-    }
-
-    for (int j = 0; j < num_secondary && count < max_out; j++) {
-        bool duplicate = false;
-        for (int i = 0; i < num_primary; i++) {
-            if (bbox_iou(&secondary[j].bbox, &primary[i].bbox) > iou_thresh) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            out[count++] = secondary[j];
-        }
-    }
-
-    free(sec_used);
-    return count;
-}
-
 static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* face_recognizer,
                         const uint8_t* frame, int width, int height,
                         const Detection* person_dets, int num_person_dets,
@@ -704,24 +628,8 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
      *   → Triggered by: validation_interval timer OR multi-person detection trigger.
      */
 
-    /* ── Determine cascade state for THIS frame ── */
-    bool run_full_res = (pipeline->cascade_state == PIPELINE_CASCADE_SEARCHING ||
-                         pipeline->cascade_state == PIPELINE_CASCADE_VALIDATING);
-
-    /* ── NEW: In TRACKING mode, run secondary detector every N frames ──
-     * This is the key fix for multi-person detection.  Previously, YOLO11n
-     * was skipped entirely in TRACKING mode, meaning new people entering the
-     * scene wouldn't be detected until the next VALIDATING frame (every 15
-     * frames).  Now we run it at reduced frequency (every 5 frames) to catch
-     * new entries while still saving most of the inference time. */
-    bool run_secondary = run_full_res ||
-        (pipeline->cascade_state == PIPELINE_CASCADE_TRACKING &&
-         pipeline->frame_counter % pipeline->cascade_secondary_interval == 0);
-
-    /* infer_w/infer_h retained for future reduced-resolution inference path */
-    (void)run_full_res;  /* used for diagnostics */
-
-    /* ── Step 1: Pose estimation (PRIMARY, always runs) ── */
+    /* ── Step 1: Pose estimation (single unified model, always runs) ── */
+    bool run_full_res = (pipeline->cascade_state != PIPELINE_CASCADE_TRACKING);
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_POSE) && pipeline->pose_estimator) {
         /*
          * When tracking at reduced resolution, we still pass the full frame
@@ -749,127 +657,9 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                                                pipeline->fallback_conf_threshold,
                                                pipeline->fallback_area_ratio_min);
 
-        /* ── Step 2: YOLO11 detection (SECONDARY — only in SEARCHING/VALIDATING) ── */
-        if (run_secondary &&
-            (pipeline->enabled_stages & PIPELINE_ENABLE_DETECTION) && pipeline->detector) {
-            Detection yolo_dets[MAX_DETECTIONS_PER_FRAME];
-            int num_yolo = yolov8_detector_detect_persons(pipeline->detector, frame_data, width, height,
-                                                           yolo_dets, MAX_DETECTIONS_PER_FRAME);
-            /* YOLO-only detections have no pose data → stricter geometry thresholds */
-            Detection filtered_yolo[MAX_DETECTIONS_PER_FRAME];
-            int num_yolo_filt = filter_detections(yolo_dets, num_yolo, width, height,
-                                                   filtered_yolo, MAX_DETECTIONS_PER_FRAME,
-                                                   NULL, 0,  /* no pose data for YOLO dets */
-                                                   pipeline->keypoint_validator,
-                                                   pipeline->keypoint_filter_enabled,
-                                                   pipeline->fallback_conf_threshold,
-                                                   pipeline->fallback_area_ratio_min);
-
-            /* ── NEW: Dual-consensus filter ──
-             * When both models ran, each detection must either:
-             *   (a) pass keypoint anatomical validation (already handled above), OR
-             *   (b) be confirmed by BOTH models (IoU ≥ 0.35 between pose_det and yolo_det).
-             * Solo detections without keypoint validation are rejected.
-             * This eliminates objects that fool only one DFL-based detector. */
-            Detection consensus_pose[MAX_POSES_PER_FRAME];
-            int num_consensus_pose = 0;
-            Detection consensus_yolo[MAX_DETECTIONS_PER_FRAME];
-            int num_consensus_yolo = 0;
-            bool yolo_has_consensus[MAX_DETECTIONS_PER_FRAME];
-            memset(yolo_has_consensus, 0, sizeof(yolo_has_consensus));
-
-            /* Find pose detections that have YOLO consensus.
-             * Pose detections ALREADY passed keypoint validation — these are
-             * trusted.  We just check for YOLO consensus to boost confidence
-             * and mark which YOLO dets are confirmed. */
-            for (int pi = 0; pi < num_pose_filt; pi++) {
-                if (num_consensus_pose >= MAX_POSES_PER_FRAME) break;
-
-                bool found = false;
-                for (int yi = 0; yi < num_yolo_filt; yi++) {
-                    float iou = bbox_iou(&filtered_pose[pi].bbox, &filtered_yolo[yi].bbox);
-                    if (iou >= 0.35f) {
-                        found = true;
-                        yolo_has_consensus[yi] = true;
-                        break;
-                    }
-                }
-                /* Always keep pose detections (keypoint-validated) */
-                consensus_pose[num_consensus_pose] = filtered_pose[pi];
-                /* Boost confidence when BOTH models agree */
-                if (found) {
-                    consensus_pose[num_consensus_pose].confidence =
-                        UTILS_MIN(consensus_pose[num_consensus_pose].confidence * 1.15f, 1.0f);
-                }
-                num_consensus_pose++;
-            }
-            /* Keep YOLO-only detections that have consensus with a pose detection */
-            for (int yi = 0; yi < num_yolo_filt; yi++) {
-                if (yolo_has_consensus[yi]) {
-                    if (num_consensus_yolo < MAX_DETECTIONS_PER_FRAME) {
-                        consensus_yolo[num_consensus_yolo++] = filtered_yolo[yi];
-                    }
-                }
-                /* ── YOLO-only detections WITHOUT consensus are DISCARDED ──
-                 * Rationale: YOLO11n's broken cls head cannot distinguish
-                 * person from chair. Without pose keypoint confirmation,
-                 * these are overwhelmingly false positives. */
-            }
-
-            /* Merge confirmed detections */
-            Detection merged[MAX_DETECTIONS_PER_FRAME];
-            result.num_detections = merge_detection_sets(consensus_pose, num_consensus_pose,
-                                                          consensus_yolo, num_consensus_yolo,
-                                                          merged, MAX_DETECTIONS_PER_FRAME,
-                                                          MERGE_IOU_DUPLICATE);
-
-            /* ── Final NMS pass after merge ── */
-            {
-                bool* final_suppressed = (bool*)calloc((size_t)result.num_detections, sizeof(bool));
-                if (final_suppressed) {
-                    int final_keep = 0;
-                    for (int i = 0; i < result.num_detections; i++) {
-                        if (final_suppressed[i]) continue;
-                        merged[final_keep++] = merged[i];
-                        for (int j = i + 1; j < result.num_detections; j++) {
-                            if (final_suppressed[j]) continue;
-                            if (bbox_iou(&merged[i].bbox, &merged[j].bbox) > FINAL_NMS_IOU_THRESHOLD) {
-                                final_suppressed[j] = true;
-                            }
-                        }
-                    }
-                    result.num_detections = final_keep;
-                    free(final_suppressed);
-                }
-            }
-            memcpy(result.detections, merged, (size_t)result.num_detections * sizeof(Detection));
-
-            log_debug("Cascade[%s]: pose=%d(filt=%d) yolo=%d(raw=%d) merged=%d",
-                      run_full_res ? "FULL" : "TRACK",
-                      num_pose_dets, num_pose_filt,
-                      num_yolo_filt, num_yolo, result.num_detections);
-        } else {
-            /* TRACKING mode or no YOLO detector — use filtered pose detections directly */
-            result.num_detections = num_pose_filt;
-            memcpy(result.detections, filtered_pose, (size_t)result.num_detections * sizeof(Detection));
-
-            log_debug("Cascade[%s]: pose=%d(filt=%d) — YOLO skipped",
-                      run_full_res ? "FULL" : "TRACK",
-                      num_pose_dets, num_pose_filt);
-        }
-    } else if ((pipeline->enabled_stages & PIPELINE_ENABLE_DETECTION) && pipeline->detector) {
-        /* Fallback: YOLO11 only (no pose model available) */
-        Detection raw_dets[MAX_DETECTIONS_PER_FRAME];
-        int num_raw = yolov8_detector_detect_persons(pipeline->detector, frame_data, width, height,
-                                                      raw_dets, MAX_DETECTIONS_PER_FRAME);
-        result.num_detections = filter_detections(raw_dets, num_raw, width, height,
-                                                   result.detections, MAX_DETECTIONS_PER_FRAME,
-                                                   NULL, 0,
-                                                   pipeline->keypoint_validator,
-                                                   pipeline->keypoint_filter_enabled,
-                                                   pipeline->fallback_conf_threshold,
-                                                   pipeline->fallback_area_ratio_min);
-        log_debug("YOLO only (no pose): raw=%d, filtered=%d", num_raw, result.num_detections);
+        /* Pose detections (keypoint-validated by filter above) → final detections */
+        result.num_detections = num_pose_filt;
+        memcpy(result.detections, filtered_pose, (size_t)result.num_detections * sizeof(Detection));
     }
 
     /* ── Cascade state update (after detection, before face/action) ──

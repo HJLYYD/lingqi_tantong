@@ -6,12 +6,8 @@
 #include "utils.h"
 #include "k1_platform.h"
 #include "video_processor.h"
-#ifdef HAS_ONNX_RUNTIME
 #include "ort_common.h"
-#ifdef HAS_SPACEMIT_EP
 #include "spacemit_ort_bridge.h"
-#endif
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -25,7 +21,6 @@ static void associate_faces_with_objects(TrackedObject* objects, int num_objects
                                           FaceIdentity* faces, int num_faces);
 static float get_current_fps(const SystemController* sc);
 
-#ifdef HAS_K1_PIPELINE
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -72,6 +67,13 @@ typedef struct {
     int num_threads;
     volatile bool running;
     volatile bool shutdown;
+
+    /* ── Heartbeat monitoring ──
+     * Each worker thread bumps its heartbeat every loop iteration.
+     * Main thread checks hearts are still beating; if a thread dies,
+     * it shuts down the pipeline to prevent deadlocks. */
+    volatile int thread_heartbeats[3];  /* [0]=capture, [1]=inference, [2]=postprocess */
+    volatile bool thread_alive[3];
 
     SystemController* controller;
 } K1Pipeline;
@@ -272,6 +274,7 @@ static void* k1_capture_thread(void* arg) {
 
     k1_pin_current_to_cpu(ta->cpu_core);
     k1_apply_rt_priority("Capture");
+    pl->thread_alive[0] = true;
     log_info("[K1 Pipeline] Capture thread on CPU %d", ta->cpu_core);
 
     int cam_w = pl->slots[0].width;
@@ -280,7 +283,7 @@ static void* k1_capture_thread(void* arg) {
     bool use_v4l2 = (sc->video_processor != NULL &&
                     video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
                     video_processor_is_opened(sc->video_processor));
-    bool use_arrow = (sc->arrow_receiver != NULL);
+    bool use_arrow = (sc->arrow_receiver != NULL && !sc->mjpeg_enabled);
     bool use_mjpeg = (sc->mjpeg_receiver != NULL);
     if (!use_v4l2 && !use_arrow && !use_mjpeg) {
         log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera, Arrow UART, or MJPEG)");
@@ -291,6 +294,7 @@ static void* k1_capture_thread(void* arg) {
     int cap_attempts = 0, cap_mjpeg_ok = 0;
 
     while (pl->running) {
+        pl->thread_heartbeats[0]++;
         int slot = k1_pipeline_slot_acquire(pl);
         if (slot < 0) break;
 
@@ -345,15 +349,20 @@ static void* k1_capture_thread(void* arg) {
             ArrowSourceFrame mjpeg_frame;
             if (mjpeg_receiver_get_latest_frame(sc->mjpeg_receiver, &mjpeg_frame)) {
                 cap_mjpeg_ok++;
+                double decode_start = k1_get_time_ms();
                 if (soft_jpeg_decode_to_rgb(mjpeg_frame.jpeg_data, mjpeg_frame.jpeg_len,
                                             s->rgb_data, cam_w, cam_h) == 0) {
+                    double decode_ms = k1_get_time_ms() - decode_start;
                     got_frame = true;
-                    s->timestamp_us = (int64_t)(mjpeg_frame.timestamp * 1000.0);
+                    s->timestamp_us = (int64_t)mjpeg_frame.timestamp;  /* already in µs */
                     s->frame_index = mjpeg_frame.frame_index;
-                    if (mjpeg_frame.frame_index <= 3) {
-                        log_info("[K1 Pipeline] Capture got MJPEG frame#%d: %zu bytes (ok=%d/%d attempts)",
+                    // 每 30 帧打印一次捕获详情
+                    if (mjpeg_frame.frame_index <= 3 ||
+                        mjpeg_frame.frame_index % 30 == 0) {
+                        log_info("[Capture] MJPEG frame#%d | JPEG=%zuB decode=%.1fms "
+                                 "| ok=%d/%d attempts",
                                  mjpeg_frame.frame_index, mjpeg_frame.jpeg_len,
-                                 cap_mjpeg_ok, cap_attempts);
+                                 decode_ms, cap_mjpeg_ok, cap_attempts);
                     }
                 } else {
                     log_warning("[K1 Pipeline] MJPEG decode failed frame#%d: %zu bytes",
@@ -383,7 +392,7 @@ static void* k1_capture_thread(void* arg) {
             if (idle_s > sc->frame_timeout_s) {
                 log_info("[K1 Pipeline] No frames received for %.0fs (timeout=%ds), shutting down",
                          idle_s, sc->frame_timeout_s);
-                sc->running = false;
+                sc->running = 0;
                 pl->running = false;
                 pthread_mutex_lock(&pl->ring_mutex);
                 pl->active_slots--;
@@ -416,9 +425,11 @@ static void* k1_inference_thread(void* arg) {
 
     k1_pin_current_to_cpu(ta->cpu_core);
     k1_apply_rt_priority("Inference");
+    pl->thread_alive[1] = true;
     log_info("[K1 Pipeline] Inference thread on CPU %d (Cluster0)", ta->cpu_core);
 
     while (pl->running) {
+        pl->thread_heartbeats[1]++;
         int slot = k1_pipeline_slot_wait_captured(pl);
         if (slot < 0) {
             if (pl->shutdown) break;
@@ -447,6 +458,7 @@ static void* k1_postprocess_thread(void* arg) {
 
     k1_pin_current_to_cpu(ta->cpu_core);
     k1_apply_rt_priority("PostProcess");
+    pl->thread_alive[2] = true;
     log_info("[K1 Pipeline] Post-process thread on CPU %d (Cluster0)", ta->cpu_core);
 
     int cam_w = pl->slots[0].width;
@@ -457,6 +469,7 @@ static void* k1_postprocess_thread(void* arg) {
     if (!vis_buffer) return NULL;
 
     while (pl->running) {
+        pl->thread_heartbeats[2]++;
         int slot = k1_pipeline_slot_wait_inferred(pl);
         if (slot < 0) break;
 
@@ -473,7 +486,7 @@ static void* k1_postprocess_thread(void* arg) {
         int num_positions = 0;
         for (int i = 0; i < inference->num_detections && num_positions < MAX_DETECTIONS_PER_FRAME; i++) {
             SpatialResult sr = spatial_engine_calculate_position(
-                sc->spatial_engine, &inference->detections[i], cam_w, cam_h, NULL, 0, 0);
+                sc->spatial_engine, &inference->detections[i], cam_w, cam_h, NULL, 0, 0, NULL, -1);
             s->positions[num_positions++] = sr.position;
         }
         s->num_positions = num_positions;
@@ -520,38 +533,60 @@ static void* k1_postprocess_thread(void* arg) {
 
         sc->detection_count += tracking.num_tracked;
 
-        double frame_time = (k1_get_time_ms() - (s->timestamp_us / 1000.0));
+        /* ── Per-frame pipeline timing ── */
+        double proc_start_ms = k1_get_time_ms();
+        double frame_time = (proc_start_ms - (s->timestamp_us / 1000.0));
         if (sc->proc_times_count < SC_MAX_PROC_TIMES) {
             sc->processing_times[sc->proc_times_count++] = (float)(frame_time / 1000.0);
         }
 
+        /* ── Real FPS from elapsed wall-clock time (was hardcoded 1.0) ── */
+        static double last_fps_time_ms = 0;
+        double now_ms = k1_get_time_ms();
         float current_fps = 1.0f;
+        if (last_fps_time_ms > 0) {
+            double elapsed_s = (now_ms - last_fps_time_ms) / 1000.0;
+            if (elapsed_s > 0.001) current_fps = 1.0f / (float)elapsed_s;
+        }
+        last_fps_time_ms = now_ms;
         if (sc->fps_history_count < SC_MAX_FPS_HISTORY) {
             sc->fps_history[sc->fps_history_count++] = current_fps;
         }
 
         float avg_fps = get_current_fps(sc);
 
+        /* ── Phase timing breakdown ── */
+        double t0 = k1_get_time_ms();
+
         visualizer_render_detection_view(sc->visualizer,
                                           s->rgb_data, cam_w, cam_h,
                                           tracking.tracked_objects, tracking.num_tracked,
                                           sc->frame_count, avg_fps,
                                           vis_buffer);
+        double t_vis = k1_get_time_ms();
 
         /* ── Output to display / stream / video file ── */
         if (sc->display_output) {
             display_output_write_frame(sc->display_output, vis_buffer);
         }
+        double t_display = k1_get_time_ms();
 
+        // 每 30 帧打印一次详细管道耗时分解
         if (sc->frame_count % 30 == 0) {
-            log_info("[K1 Pipeline] Frame %d: %d objects, %.1f FPS",
-                     sc->frame_count, tracking.num_tracked, avg_fps);
+            double t_total = t_display - proc_start_ms;
+            double t_track_spatial = t0 - proc_start_ms;
+            double t_vis_ms = t_vis - t0;
+            double t_disp_ms = t_display - t_vis;
+            log_info("[K1 Pipeline] Frame %d: %d objs, %.1f FPS | "
+                     "track+spatial=%.0fms vis=%.0fms display=%.0fms total=%.0fms",
+                     sc->frame_count, tracking.num_tracked, avg_fps,
+                     t_track_spatial, t_vis_ms, t_disp_ms, t_total);
         }
 
         /* ── Max frames check (signal shutdown via controller) ── */
         if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
             log_info("[K1 Pipeline] Reached max_frames=%d, shutting down", sc->max_frames);
-            sc->running = false;
+            sc->running = 0;
             pl->running = false;
         }
 
@@ -582,8 +617,9 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
 
     K1Platform* plat = k1_platform_init();
     if (!plat || !k1_platform_is_k1()) {
-        log_warning("K1 platform not available, falling back to single-threaded mode");
-        return system_controller_process_realtime(sc, uart_device_A, uart_device_C, baudrate);
+        log_critical("K1 platform NOT detected — this build requires K1 hardware");
+        strncpy(status.message, "K1 platform required", sizeof(status.message) - 1);
+        return status;
     }
 
     int cam_w = config_get_int(sc->config, "video.camera_width", 640);
@@ -625,13 +661,6 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
         }
     }
 
-    sc->ai_context = ai_accel_context_create();
-    if (sc->ai_context) {
-        log_info("[K1 Pipeline] %s", ai_accel_describe(sc->ai_context));
-    } else {
-        log_warning("[K1 Pipeline] AI accel context unavailable, ONNX CPU path only");
-    }
-
     /* ── Create display output ── */
     {
         uint32_t disp_channels = DISPLAY_CHANNEL_NONE;
@@ -660,7 +689,7 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     if (!k1_ring_init_slots(&pl, cam_w, cam_h)) {
         strncpy(status.message, "Failed to init ring buffer", sizeof(status.message) - 1);
         k1_pipeline_destroy(&pl);
-        return status;
+        goto k1_cleanup;
     }
 
     const char* session_id = result_manager_start_session(sc->result_manager, "realtime_k1");
@@ -687,15 +716,56 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
              pl.num_threads,
              K1_CPU_CLUSTER1_CAPTURE, K1_CPU_CLUSTER0_INFERENCE, K1_CPU_CLUSTER0_AI);
 
-    sc->running = true;
+    sc->running = 1;
     sc->start_time = k1_get_time_ms() / 1000.0;
 
-    while (sc->running) {
-        usleep(100000);
+    /* ── Main thread: startup wait + heartbeat monitor ── */
+    {
+        int prev_hearts[3] = {0, 0, 0};
+        int stuck_count = 0;
+        int startup_ticks = 0;
+        while (sc->running) {
+            usleep(500000);  /* 500ms poll interval */
+
+            /* ── Startup grace: wait up to 30s for all threads to come alive ── */
+            int all_alive = 1;
+            for (int i = 0; i < pl.num_threads; i++) {
+                if (!pl.thread_alive[i]) { all_alive = 0; break; }
+            }
+            if (!all_alive) {
+                startup_ticks++;
+                if (startup_ticks > 60) {  /* 30s timeout */
+                    log_error("[K1 Pipeline] Worker threads failed to start within 30s");
+                    sc->running = 0;
+                    pl.running = false; pl.shutdown = true;
+                }
+                continue;
+            }
+
+            /* ── Check capture thread liveness (driver of the pipeline).
+             * Inference/postprocess legitimately wait for frames —
+             * only the capture thread must keep running. 30 checks
+             * × 500ms = 15s timeout. ── */
+            if (pl.thread_heartbeats[0] == prev_hearts[0]) stuck_count++;
+            else                                          stuck_count = 0;
+            for (int i = 0; i < pl.num_threads; i++)
+                prev_hearts[i] = pl.thread_heartbeats[i];
+
+            if (stuck_count >= 30) {
+                log_error("[K1 Pipeline] Capture thread stuck (%d checks), shutting down",
+                          stuck_count);
+                sc->running = 0;
+                pl.running = false; pl.shutdown = true;
+                pthread_cond_broadcast(&pl.capture_done_cond);
+                pthread_cond_broadcast(&pl.infer_done_cond);
+                pthread_cond_broadcast(&pl.post_done_cond);
+            }
+        }
     }
 
     k1_pipeline_destroy(&pl);
 
+k1_cleanup:
     float avg_fps = 0.0f;
     if (sc->fps_history_count > 0) {
         float sum = 0.0f;
@@ -713,10 +783,6 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
     result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
     result_manager_end_session(sc->result_manager);
 
-    if (sc->ai_context) {
-        ai_accel_context_destroy(sc->ai_context);
-        sc->ai_context = NULL;
-    }
     if (sc->arrow_receiver) {
         arrow_receiver_destroy(sc->arrow_receiver);
         sc->arrow_receiver = NULL;
@@ -730,10 +796,9 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
         sc->display_output = NULL;
     }
 
-    sc->running = false;
+    sc->running = 0;
     return system_controller_get_final_status(sc);
 }
-#endif
 
 SystemController* system_controller_create(const char* config_path) {
     log_info("============================================================");
@@ -744,17 +809,13 @@ SystemController* system_controller_create(const char* config_path) {
     if (!sc) return NULL;
 
     sc->config = config_manager_create(config_path);
-#ifdef HAS_ONNX_RUNTIME
     {
         bool ep_pref = config_get_bool(sc->config, "system.use_spacemit_ep", true);
         ort_set_ep_enabled(ep_pref);
-#ifdef HAS_SPACEMIT_EP
         int ep_threads = config_get_int(sc->config, "system.spacemit_ep_intra_threads", 1);
         spacemit_ort_set_ep_intra_threads(ep_threads);
         log_info("SpacemiT EP config: enabled=%d, intra_threads=%d", ep_pref, ep_threads);
-#endif
     }
-#endif
     sc->model_store = model_store_create("models");
     if (!sc->model_store) {
         log_warning("Model store creation failed");
@@ -762,16 +823,19 @@ SystemController* system_controller_create(const char* config_path) {
     sc->video_processor = NULL;
     sc->imu_handler = imu_handler_create(10, 0.01f, 0.1f);
 
-    const char* detection_backend = config_get_string(sc->config, "detection.backend", "cpu");
-    bool use_ai_accel = (detection_backend != NULL && strcmp(detection_backend, "ai_accel") == 0);
-    (void)use_ai_accel;
     sc->inference_pipeline = inference_pipeline_create();
     if (!sc->inference_pipeline) {
         log_warning("Inference pipeline creation failed");
     }
 
     if (sc->inference_pipeline) {
-        inference_pipeline_load_models(sc->inference_pipeline, "models", sc->config);
+        int ret = inference_pipeline_load_models(sc->inference_pipeline, "models", sc->config);
+        if (ret < 0) {
+            log_critical("Model loading failed — PRIMARY pose model is required");
+            system_controller_destroy(sc);
+            return NULL;
+        }
+        log_info("Models loaded: %d/%d", ret, 5);
     }
 
     sc->tracking_manager = object_tracker_create(
@@ -829,6 +893,14 @@ SystemController* system_controller_create(const char* config_path) {
     float cam_mat[9] = {fx, 0.0f, cx, 0.0f, fy, cy, 0.0f, 0.0f, 1.0f};
     sc->spatial_engine = spatial_engine_create(cam_mat, NULL, fx, avg_height);
 
+    /* ── Depth estimation tuning (2024-2026 academic refinements) ── */
+    if (sc->spatial_engine) {
+        sc->spatial_engine->depth_ema_alpha =
+            config_get_float(sc->config, "spatial.depth_ema_alpha", DEPTH_EMA_ALPHA);
+        sc->spatial_engine->depth_outlier_mad_mult =
+            config_get_float(sc->config, "spatial.depth_outlier_mad_mult", DEPTH_OUTLIER_MAD_MULT);
+    }
+
     sc->visualizer = visualizer_create(
         config_get_bool(sc->config, "visualization.show_info_bar", true),
         config_get_bool(sc->config, "visualization.corner_markers", true),
@@ -842,7 +914,6 @@ SystemController* system_controller_create(const char* config_path) {
     sc->result_manager = result_manager_create("output");
 
     sc->arrow_receiver = NULL;
-    sc->ai_context = NULL;
     sc->display_output = NULL;
     sc->mode = PIPELINE_MODE_OFFLINE;
 
@@ -853,7 +924,7 @@ SystemController* system_controller_create(const char* config_path) {
     sc->fps_history_count = 0;
     sc->proc_times_count = 0;
     sc->detection_count = 0;
-    sc->running = false;
+    sc->running = 0;
 
     /* Display / streaming config */
     sc->display_enabled = config_get_bool(sc->config, "visualization.display_enabled", false);
@@ -920,7 +991,6 @@ void system_controller_destroy(SystemController* sc) {
     if (sc->result_manager) result_manager_destroy(sc->result_manager);
     if (sc->arrow_receiver) arrow_receiver_destroy(sc->arrow_receiver);
     if (sc->mjpeg_receiver) mjpeg_receiver_destroy(sc->mjpeg_receiver);
-    if (sc->ai_context) ai_accel_context_destroy(sc->ai_context);
     if (sc->display_output) display_output_destroy(sc->display_output);
 
     free(sc);
@@ -1059,7 +1129,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
         }
     }
 
-    sc->running = true;
+    sc->running = 1;
     sc->start_time = (double)utils_get_time_ms() / 1000.0;
     double prev_time = sc->start_time;
 
@@ -1085,7 +1155,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
         int num_positions = 0;
         for (int i = 0; i < inference.num_detections && num_positions < MAX_DETECTIONS_PER_FRAME; i++) {
             SpatialResult sr = spatial_engine_calculate_position(
-                sc->spatial_engine, &inference.detections[i], frame->width, frame->height, NULL, 0, 0);
+                sc->spatial_engine, &inference.detections[i], frame->width, frame->height, NULL, 0, 0, NULL, -1);
             positions[num_positions++] = sr.position;
         }
 
@@ -1192,359 +1262,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
     result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
     result_manager_end_session(sc->result_manager);
 
-    sc->running = false;
-    return system_controller_get_final_status(sc);
-}
-
-SystemStatus system_controller_process_realtime(SystemController* sc,
-                                                 const char* uart_device_A,
-                                                 const char* uart_device_C,
-                                                 int baudrate) {
-    SystemStatus status;
-    memset(&status, 0, sizeof(SystemStatus));
-
-    if (!sc) {
-        strncpy(status.message, "Invalid system controller", sizeof(status.message) - 1);
-        return status;
-    }
-
-    sc->mode = PIPELINE_MODE_REALTIME;
-    log_info("============================================================");
-    log_info("Starting REAL-TIME pipeline on Muse Pi Pro");
-    log_info("============================================================");
-
-    sc->ai_context = ai_accel_context_create();
-    if (sc->ai_context) {
-        log_info("[realtime] %s", ai_accel_describe(sc->ai_context));
-    } else {
-        log_warning("AI acceleration not available, using CPU inference via ONNX Runtime");
-    }
-
-    int cam_w = config_get_int(sc->config, "video.camera_width", 640);
-    int cam_h = config_get_int(sc->config, "video.camera_height", 480);
-    float cam_fps = (float)config_get_float(sc->config, "video.camera_fps", 15.0f);
-
-    const char* camera_dev = config_get_string(sc->config, "video.camera_device", "/dev/video0");
-    const char* camera_format = config_get_string(sc->config, "video.camera_format", "MJPEG");
-
-    if (camera_dev) {
-        sc->video_processor = video_processor_create_from_camera(camera_dev, cam_w, cam_h, cam_fps, camera_format);
-        if (sc->video_processor) {
-            log_info("Camera device opened: %s (%dx%d @ %.1f FPS)", camera_dev, cam_w, cam_h, cam_fps);
-        } else {
-            log_warning("Camera device %s unavailable, will rely on Arrow UART for frames", camera_dev);
-        }
-    }
-
-    if (uart_device_A) {
-        sc->arrow_receiver = arrow_receiver_create(uart_device_A, baudrate);
-        if (sc->arrow_receiver) {
-            log_info("Arrow UART receiver initialized: %s @ %d bps", uart_device_A, baudrate);
-
-            if (uart_device_C) {
-                arrow_receiver_add_secondary_link(sc->arrow_receiver, uart_device_C, baudrate);
-                log_info("Dual-link mode: secondary UART %s", uart_device_C);
-            }
-        } else {
-            log_warning("Arrow UART init failed, continuing with camera-only mode");
-        }
-    }
-
-    /* ── MJPEG HTTP receiver (WiFi from ESP32) ── */
-    if (sc->mjpeg_enabled && sc->mjpeg_esp_ip[0] != '\0') {
-        sc->mjpeg_receiver = mjpeg_receiver_create(
-            sc->mjpeg_esp_ip, sc->mjpeg_esp_port,
-            sc->mjpeg_wifi_ssid[0] != '\0' ? sc->mjpeg_wifi_ssid : NULL,
-            sc->mjpeg_wifi_password[0] != '\0' ? sc->mjpeg_wifi_password : NULL);
-        if (sc->mjpeg_receiver) {
-            log_info("MJPEG receiver initialized: %s:%d",
-                     sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
-        } else {
-            log_warning("MJPEG receiver init failed for %s:%d",
-                        sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
-        }
-    }
-
-    uint8_t* vis_buffer = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
-    if (!vis_buffer) {
-        strncpy(status.message, "Failed to allocate vis buffer", sizeof(status.message) - 1);
-        result_manager_end_session(sc->result_manager);
-        return status;
-    }
-
-    const char* session_id2 = result_manager_start_session(sc->result_manager, "realtime_session");
-    (void)session_id2;
-
-    /* ── Create display output ── */
-    {
-        uint32_t disp_channels = DISPLAY_CHANNEL_NONE;
-        if (sc->display_enabled && sc->display_device[0] != '\0')
-            disp_channels |= DISPLAY_CHANNEL_FRAMEBUFFER;
-        if (sc->stream_enabled && sc->stream_url[0] != '\0')
-            disp_channels |= DISPLAY_CHANNEL_RTSP;
-        if (sc->save_video_enabled && sc->save_video_path[0] != '\0')
-            disp_channels |= DISPLAY_CHANNEL_VIDEO_FILE;
-
-        if (disp_channels != DISPLAY_CHANNEL_NONE) {
-            sc->display_output = display_output_create(
-                cam_w, cam_h, cam_fps,
-                disp_channels,
-                sc->display_device,
-                sc->stream_url,
-                sc->save_video_path);
-            if (sc->display_output) {
-                log_info("[realtime] Display output active");
-            }
-        }
-    }
-
-    sc->running = true;
-    sc->start_time = (double)utils_get_time_ms() / 1000.0;
-    double prev_time = sc->start_time;
-    double last_imu_log = sc->start_time;
-    double last_frame_time = sc->start_time;
-
-    uint8_t* frame_rgb = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
-    if (!frame_rgb) {
-        free(vis_buffer);
-        strncpy(status.message, "Failed to allocate frame buffer", sizeof(status.message) - 1);
-        result_manager_end_session(sc->result_manager);
-        return status;
-    }
-
-    log_info("Realtime pipeline running. Press Ctrl+C to stop.");
-    log_info("Resolution: %dx%d, Target FPS: %.1f", cam_w, cam_h, cam_fps);
-
-    while (sc->running) {
-        double frame_start = (double)utils_get_time_ms() / 1000.0;
-
-        if (sc->arrow_receiver) {
-            arrow_receiver_update(sc->arrow_receiver);
-        }
-        if (sc->mjpeg_receiver) {
-            mjpeg_receiver_update(sc->mjpeg_receiver);
-        }
-
-        bool got_frame = false;
-
-        if (sc->video_processor &&
-            video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
-            video_processor_is_opened(sc->video_processor)) {
-            FrameData* fd = video_processor_read_frame_raw(sc->video_processor);
-            if (fd && fd->data) {
-                if (fd->width == cam_w && fd->height == cam_h) {
-                    memcpy(frame_rgb, fd->data, (size_t)cam_w * cam_h * 3);
-                } else {
-                    utils_resize_image(fd->data, fd->width, fd->height,
-                                       frame_rgb, cam_w, cam_h, 3);
-                }
-                got_frame = true;
-                frame_data_destroy(fd);
-            } else if (fd) {
-                frame_data_destroy(fd);
-            }
-        }
-
-        if (!got_frame && sc->arrow_receiver) {
-            ArrowSourceFrame arrow_frame;
-            if (arrow_receiver_get_latest_frame(sc->arrow_receiver, &arrow_frame)) {
-                if (soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
-                                            frame_rgb, cam_w, cam_h) == 0) {
-                    got_frame = true;
-                }
-
-                if (arrow_frame.has_pose) {
-                    imu_handler_set_external_pose(sc->imu_handler,
-                        arrow_frame.pose.qw, arrow_frame.pose.qx,
-                        arrow_frame.pose.qy, arrow_frame.pose.qz,
-                        arrow_frame.pose.pitch, arrow_frame.pose.roll,
-                        arrow_frame.pose.yaw, arrow_frame.pose.altitude_m,
-                        arrow_frame.pose.temperature_c,
-                        arrow_frame.pose.timestamp_ms);
-                }
-            }
-        }
-
-        if (!got_frame && sc->mjpeg_receiver) {
-            ArrowSourceFrame mjpeg_frame;
-            if (mjpeg_receiver_get_latest_frame(sc->mjpeg_receiver, &mjpeg_frame)) {
-                if (soft_jpeg_decode_to_rgb(mjpeg_frame.jpeg_data, mjpeg_frame.jpeg_len,
-                                            frame_rgb, cam_w, cam_h) == 0) {
-                    got_frame = true;
-                }
-
-                if (mjpeg_frame.has_pose) {
-                    imu_handler_set_external_pose(sc->imu_handler,
-                        mjpeg_frame.pose.qw, mjpeg_frame.pose.qx,
-                        mjpeg_frame.pose.qy, mjpeg_frame.pose.qz,
-                        mjpeg_frame.pose.pitch, mjpeg_frame.pose.roll,
-                        mjpeg_frame.pose.yaw, mjpeg_frame.pose.altitude_m,
-                        mjpeg_frame.pose.temperature_c,
-                        mjpeg_frame.pose.timestamp_ms);
-                }
-            }
-        }
-
-        if (!got_frame) {
-            /* ── Frame timeout: exit if no frames for too long ── */
-            double now_s = (double)utils_get_time_ms() / 1000.0;
-            double idle_s = now_s - last_frame_time;
-            if (idle_s > sc->frame_timeout_s) {
-                log_info("[realtime] No frames received for %.0fs (timeout=%ds), exiting",
-                         idle_s, sc->frame_timeout_s);
-                sc->running = false;
-                break;
-            }
-            struct timespec ts = {0, 10000000L};
-            nanosleep(&ts, NULL);
-            continue;
-        }
-        last_frame_time = (double)utils_get_time_ms() / 1000.0;
-
-        sc->frame_count++;
-
-        InferenceResult inference = inference_pipeline_process_frame(
-            sc->inference_pipeline, frame_rgb, cam_w, cam_h);
-
-        if (sc->frame_count == 1 && inference.num_detections > 0) {
-            spatial_engine_initialize_coordinate_system(
-                sc->spatial_engine, cam_h, cam_w, &inference.detections[0]);
-        }
-
-        SpatialPosition positions[MAX_DETECTIONS_PER_FRAME];
-        int num_positions = 0;
-        for (int i = 0; i < inference.num_detections && num_positions < MAX_DETECTIONS_PER_FRAME; i++) {
-            SpatialResult sr = spatial_engine_calculate_position(
-                sc->spatial_engine, &inference.detections[i], cam_w, cam_h, NULL, 0, 0);
-            positions[num_positions++] = sr.position;
-        }
-
-        TrackingResult tracking = object_tracker_update(
-            sc->tracking_manager, inference.detections, inference.num_detections,
-            positions, num_positions, sc->frame_count);
-
-        object_tracker_associate_poses(sc->tracking_manager, inference.poses, inference.num_poses);
-
-        /* ── Sync confirmed track counts to inference pipeline ── */
-        if (sc->inference_pipeline) {
-            sc->inference_pipeline->confirmed_track_count =
-                object_tracker_get_confirmed_count(sc->tracking_manager);
-            sc->inference_pipeline->total_track_count =
-                object_tracker_get_all_track_count(sc->tracking_manager);
-        }
-
-        associate_poses_with_objects(tracking.tracked_objects, tracking.num_tracked,
-                                      inference.poses, inference.num_poses);
-        associate_faces_with_objects(tracking.tracked_objects, tracking.num_tracked,
-                                      inference.faces, inference.num_faces);
-
-        for (int i = 0; i < tracking.num_tracked; i++) {
-            TrackedObject* obj = &tracking.tracked_objects[i];
-            spatial_engine_update_trajectory(sc->spatial_engine, obj->track_id, &obj->spatial_pos);
-
-            float velocity[3];
-            if (spatial_engine_get_velocity(sc->spatial_engine, obj->track_id, 1.0f / cam_fps, velocity)) {
-                memcpy(obj->velocity, velocity, sizeof(velocity));
-                obj->has_velocity = true;
-            }
-
-            float height = spatial_engine_calculate_height(sc->spatial_engine, &obj->detection,
-                                                            obj->has_pose ? &obj->pose : NULL);
-            obj->height_meters = height;
-            obj->has_height = true;
-        }
-
-        IMUExternalPose imu_pose;
-        if (imu_handler_get_latest_pose(sc->imu_handler, &imu_pose)) {
-            spatial_engine_set_camera_pose(sc->spatial_engine, imu_pose.pitch, imu_pose.roll, imu_pose.yaw);
-
-            double now = (double)utils_get_time_ms() / 1000.0;
-            if (now - last_imu_log > 2.0) {
-                log_debug("IMU: pitch=%.1f roll=%.1f yaw=%.1f alt=%.1fm",
-                          imu_pose.pitch, imu_pose.roll, imu_pose.yaw, imu_pose.altitude_m);
-                last_imu_log = now;
-            }
-        }
-
-        sc->detection_count += tracking.num_tracked;
-
-        double frame_time = (double)utils_get_time_ms() / 1000.0 - frame_start;
-        if (sc->proc_times_count < SC_MAX_PROC_TIMES) {
-            sc->processing_times[sc->proc_times_count++] = (float)frame_time;
-        }
-
-        double elapsed = (double)utils_get_time_ms() / 1000.0 - prev_time;
-        float current_fps = elapsed > 0.0f ? 1.0f / (float)elapsed : 0.0f;
-        if (sc->fps_history_count < SC_MAX_FPS_HISTORY) {
-            sc->fps_history[sc->fps_history_count++] = current_fps;
-        }
-        prev_time = (double)utils_get_time_ms() / 1000.0;
-
-        float avg_fps = get_current_fps(sc);
-
-        visualizer_render_detection_view(sc->visualizer,
-                                          frame_rgb, cam_w, cam_h,
-                                          tracking.tracked_objects, tracking.num_tracked,
-                                          sc->frame_count, avg_fps,
-                                          vis_buffer);
-
-        /* ── Output to display / stream / video file ── */
-        if (sc->display_output) {
-            display_output_write_frame(sc->display_output, vis_buffer);
-        }
-
-        if (sc->frame_count % 30 == 0) {
-            log_info("Realtime frame %d: %d objects, %.1f FPS, %.1fms/frame",
-                     sc->frame_count, tracking.num_tracked, avg_fps, frame_time * 1000.0f);
-        }
-
-        /* ── Max frames check ── */
-        if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
-            log_info("[realtime] Reached max_frames=%d, exiting", sc->max_frames);
-            sc->running = false;
-            break;
-        }
-    }
-
-    free(vis_buffer);
-    free(frame_rgb);
-
-    float avg_fps = 0.0f;
-    if (sc->fps_history_count > 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < sc->fps_history_count; i++) sum += sc->fps_history[i];
-        avg_fps = sum / sc->fps_history_count;
-    }
-
-    float avg_time_ms = 0.0f;
-    if (sc->proc_times_count > 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < sc->proc_times_count; i++) sum += sc->processing_times[i];
-        avg_time_ms = (sum / sc->proc_times_count) * 1000.0f;
-    }
-
-    result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
-    result_manager_end_session(sc->result_manager);
-
-    if (sc->ai_context) {
-        ai_accel_context_destroy(sc->ai_context);
-        sc->ai_context = NULL;
-    }
-
-    if (sc->arrow_receiver) {
-        arrow_receiver_destroy(sc->arrow_receiver);
-        sc->arrow_receiver = NULL;
-    }
-    if (sc->mjpeg_receiver) {
-        mjpeg_receiver_destroy(sc->mjpeg_receiver);
-        sc->mjpeg_receiver = NULL;
-    }
-    if (sc->display_output) {
-        display_output_destroy(sc->display_output);
-        sc->display_output = NULL;
-    }
-
-    sc->running = false;
+    sc->running = 0;
     return system_controller_get_final_status(sc);
 }
 

@@ -46,13 +46,14 @@ VideoWriter* video_writer_create(const char* output_path, int width, int height,
     snprintf(cmd, sizeof(cmd),
         "ffmpeg -y -loglevel quiet "
         "-f rawvideo -vcodec rawvideo "
-        "-s %dx%d -pix_fmt rgb24 -r %.0f "
+        "-s %dx%d -pix_fmt rgb24 "
+        "-use_wallclock_as_timestamps 1 "
         "-i - "
         "-c:v libx264 -preset ultrafast -crf 23 "
         "-pix_fmt yuv420p "
-        "\"%s\"",   /* stderr suppressed: -loglevel quiet already silences ffmpeg;
-                       no 2>/dev/null needed — that breaks pipe error reporting */
-        vw->width, vw->height, vw->fps, output_path);
+        "-vsync vfr "
+        "\"%s\"",
+        vw->width, vw->height, output_path);
 
     log_info("VideoWriter: launching ffmpeg pipe -> %s", output_path);
 
@@ -73,7 +74,7 @@ VideoWriter* video_writer_create(const char* output_path, int width, int height,
     /* Default stdio buffering is fine.  _IONBF would issue one write()
      * syscall per byte, killing performance for 2.76MB frames. */
 
-    log_info("VideoWriter: ready — %dx%d @ %.1f FPS (H.264 MP4)", width, height, fps);
+    log_info("VideoWriter: ready — %dx%d VFR (H.264 MP4, wallclock PTS)", width, height);
     return vw;
 }
 

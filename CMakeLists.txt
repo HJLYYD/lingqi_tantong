@@ -12,6 +12,7 @@ option(ENABLE_K1_PIPELINE "Enable K1 dual-cluster pipeline parallelism" ON)
 option(ENABLE_K1_TCM "Enable K1 TCM (Tightly Coupled Memory) for AI weights" ON)
 option(ENABLE_K1_VPU "Enable K1 VPU hardware video/JPEG acceleration" ON)
 option(ENABLE_K1_JPU "Enable K1 JPU hardware JPEG decode" ON)
+option(ENABLE_SDL2_DISPLAY "Enable SDL2 desktop window display (auto if available)" ON)
 
 set(MUSE_PI_ARCH "rv64gcv0p7" CACHE STRING "Target RISC-V arch: rv64gcv0p7 (K1) or rv64gcv1p0")
 set(BIANBU_SYSROOT "" CACHE PATH "Bianbu OS sysroot path (for cross-compilation)")
@@ -91,17 +92,18 @@ if(BUILDING_FOR_RISCV64)
     set(RISCV_ARCH_FLAGS "-march=${DETECTED_RISCV_ARCH}")
 
     if(DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
-        # -mtune=x60 only supported by GCC 14+; probe instead of assuming.
+        # -mcpu=spacemit-x60 sets both -march and -mtune for X60 (GCC 14+).
         execute_process(
-            COMMAND ${CMAKE_C_COMPILER} -march=${DETECTED_RISCV_ARCH} -mtune=x60 -E -x c ${DEV_NULL}
-            RESULT_VARIABLE TEST_MTUNE_X60_RESULT
+            COMMAND ${CMAKE_C_COMPILER} -mcpu=spacemit-x60 -E -x c ${DEV_NULL}
+            RESULT_VARIABLE TEST_MCPU_X60_RESULT
             ERROR_QUIET OUTPUT_QUIET
         )
-        if(TEST_MTUNE_X60_RESULT EQUAL 0)
-            set(RISCV_ARCH_FLAGS "${RISCV_ARCH_FLAGS} -mtune=x60")
-            message(STATUS "K1 -mtune=x60 supported by GCC ${CMAKE_C_COMPILER_VERSION}")
+        if(TEST_MCPU_X60_RESULT EQUAL 0)
+            set(RISCV_ARCH_FLAGS "-mcpu=spacemit-x60")
+            message(STATUS "K1 -mcpu=spacemit-x60 supported by GCC ${CMAKE_C_COMPILER_VERSION}")
         else()
-            message(STATUS "GCC ${CMAKE_C_COMPILER_VERSION} does NOT support -mtune=x60 (need GCC 14+); using default tuning")
+            set(RISCV_ARCH_FLAGS "-march=${DETECTED_RISCV_ARCH}")
+            message(STATUS "GCC ${CMAKE_C_COMPILER_VERSION} does NOT support -mcpu=spacemit-x60; falling back to -march=${DETECTED_RISCV_ARCH}")
         endif()
 
         # -fprefetch-loop-arrays is unsupported on RISC-V backend; probe.
@@ -116,7 +118,7 @@ if(BUILDING_FOR_RISCV64)
         set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -funroll-loops")
 
         if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0")
-            set(K1_EXTRA_FLAGS "-mrvv-vector-bits=256")
+            set(K1_EXTRA_FLAGS "-mrvv-vector-bits=zvl")
         else()
             set(K1_EXTRA_FLAGS "")
             message(STATUS "GCC ${CMAKE_C_COMPILER_VERSION} < 14, -mrvv-vector-bits not available")
@@ -129,15 +131,12 @@ if(BUILDING_FOR_RISCV64)
             message(STATUS "K1 dual-cluster pipeline parallelism enabled")
         endif()
         if(ENABLE_K1_TCM)
-            add_compile_definitions(HAS_K1_TCM)
             message(STATUS "K1 TCM memory management enabled")
         endif()
         if(ENABLE_K1_VPU)
-            add_compile_definitions(HAS_K1_VPU)
             message(STATUS "K1 VPU hardware acceleration enabled")
         endif()
         if(ENABLE_K1_JPU)
-            add_compile_definitions(HAS_K1_JPU)
             message(STATUS "K1 JPU hardware JPEG decode enabled")
         endif()
     endif()
@@ -159,19 +158,24 @@ if(BUILDING_FOR_RISCV64)
     endif()
 
     if(USE_OPENMP)
-        find_package(OpenMP)
-        if(OpenMP_C_FOUND)
-            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_C_FLAGS}")
+        # find_package(OpenMP) fails on some RISC-V sysroots even when
+        # -fopenmp works; probe directly with the compiler.
+        execute_process(
+            COMMAND ${CMAKE_C_COMPILER} -fopenmp -x c ${DEV_NULL} -c -o ${DEV_NULL}
+            RESULT_VARIABLE TEST_OPENMP_RESULT
+            ERROR_QUIET OUTPUT_QUIET
+        )
+        if(TEST_OPENMP_RESULT EQUAL 0)
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fopenmp")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fopenmp")
             add_compile_definitions(HAS_OPENMP)
-            message(STATUS "OpenMP enabled for RISC-V multi-core")
+            message(STATUS "OpenMP enabled for RISC-V multi-core (-fopenmp)")
         else()
             message(WARNING "OpenMP not found, using single-core mode")
         endif()
     endif()
 
     if(ENABLE_RVV_OPT)
-        add_compile_definitions(HAS_RVV_OPT)
         message(STATUS "RVV ${RVV_VERSION} vector optimization enabled")
     endif()
 else()
@@ -209,7 +213,6 @@ set(DATA_SOURCES
 )
 
 set(MODEL_SOURCES
-    src/yolov8_detector.c
     src/yolov8_pose_estimator.c
     src/yolov5_face_detector.c
     src/arcface_recognizer.c
@@ -223,16 +226,10 @@ set(BUSINESS_SOURCES
     src/result_manager.c
 )
 
-set(FUSION_SOURCES
-    src/mahony_filter.c
-    src/kcp_lite.c
-)
-
 set(PRESENTATION_SOURCES
     src/visualizer.c
     src/ar_renderer.c
     src/video_writer.c
-    src/model_export.c
     src/display_output.c
 )
 
@@ -240,16 +237,8 @@ set(UTILS_SOURCES
     src/system_controller.c
 )
 
-set(AI_ACCEL_SOURCES
-    src/ai_accel_adapter.c
-)
-
 set(MAIN_SOURCE
     src/main.c
-)
-
-set(BENCHMARK_SOURCE
-    src/benchmark.c
 )
 
 set(ALL_LIB_SOURCES
@@ -257,10 +246,8 @@ set(ALL_LIB_SOURCES
     ${DATA_SOURCES}
     ${MODEL_SOURCES}
     ${BUSINESS_SOURCES}
-    ${FUSION_SOURCES}
     ${PRESENTATION_SOURCES}
     ${UTILS_SOURCES}
-    ${AI_ACCEL_SOURCES}
 )
 
 set(ALL_LIB_CXX_SOURCES "")
@@ -420,20 +407,25 @@ else()
         "  Install on RHEL/Fedora:   sudo dnf install turbojpeg-devel")
 endif()
 
-include(CheckIncludeFile)
-check_include_file("linux/videodev2.h" HAVE_V4L2)
-if(HAVE_V4L2)
-    add_compile_definitions(HAS_V4L2)
-    message(STATUS "V4L2 enabled (Linux video capture)")
-else()
-    if(BUILDING_FOR_RISCV64)
-        message(WARNING
-            "V4L2 header <linux/videodev2.h> NOT found - local camera capture disabled.\n"
-            "  Arrow UART JPEG path still works, but /dev/video0 will not be used.\n"
-            "  To enable: sudo apt install linux-libc-dev\n"
-            "  Then re-run cmake.")
+    # check_include_file fails on some RISC-V sysroots; probe with shell echo.
+    execute_process(
+        COMMAND sh -c "echo '#include <linux/videodev2.h>' | ${CMAKE_C_COMPILER} -E -x c - > /dev/null 2>&1"
+        RESULT_VARIABLE TEST_V4L2_RESULT
+    )
+    if(TEST_V4L2_RESULT EQUAL 0)
+        set(HAVE_V4L2 TRUE)
+        add_compile_definitions(HAS_V4L2)
+        message(STATUS "V4L2 enabled (Linux video capture)")
+    else()
+        set(HAVE_V4L2 FALSE)
+        if(BUILDING_FOR_RISCV64)
+            message(WARNING
+                "V4L2 header <linux/videodev2.h> NOT found - local camera capture disabled.\n"
+                "  Arrow UART JPEG path still works, but /dev/video0 will not be used.\n"
+                "  To enable: sudo apt install linux-libc-dev\n"
+                "  Then re-run cmake.")
+        endif()
     endif()
-endif()
 
 if(USE_SPACENGINE_AI AND BUILDING_FOR_RISCV64)
     if(SPACENGINE_DIR)
@@ -455,7 +447,6 @@ if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
         target_include_directories(lingqi_tantong_core PRIVATE "${K1_MPP_DIR}/include")
         target_link_directories(lingqi_tantong PRIVATE "${K1_MPP_DIR}/lib")
         target_link_libraries(lingqi_tantong PRIVATE mpp)
-        add_compile_definitions(HAS_K1_MPP)
         message(STATUS "K1 MPP hardware video pipeline: ${K1_MPP_DIR}")
     elseif(ENABLE_K1_VPU)
         message(STATUS "K1 VPU: MPP SDK not set, video acceleration disabled")
@@ -471,6 +462,37 @@ if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
         message(STATUS "K1 JPU: SDK not set, JPEG hardware decode disabled")
         message(STATUS "  Set -DK1_JPU_DIR=/path/to/k1x-jpu for HW JPEG decode")
     endif()
+endif()
+
+# ── SDL2 desktop window display ──────────────────────────────────────────
+set(HAS_SDL2_DISPLAY FALSE)
+if(ENABLE_SDL2_DISPLAY)
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        set(HAS_SDL2_DISPLAY TRUE)
+        target_include_directories(lingqi_tantong_core PRIVATE ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(lingqi_tantong PRIVATE ${SDL2_LIBRARIES})
+        target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SDL2)
+        message(STATUS "SDL2 display:       YES (desktop window)")
+    else()
+        find_package(PkgConfig QUIET)
+        if(PKG_CONFIG_FOUND)
+            pkg_check_modules(SDL2_PC sdl2)
+            if(SDL2_PC_FOUND)
+                set(HAS_SDL2_DISPLAY TRUE)
+                target_include_directories(lingqi_tantong_core PRIVATE ${SDL2_PC_INCLUDE_DIRS})
+                target_link_libraries(lingqi_tantong PRIVATE ${SDL2_PC_LIBRARIES})
+                target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SDL2)
+                message(STATUS "SDL2 display:       YES (pkg-config)")
+            endif()
+        endif()
+    endif()
+    if(NOT HAS_SDL2_DISPLAY)
+        message(STATUS "SDL2 display:       NO — fbdev fallback (sudo apt install libsdl2-dev for window)")
+    endif()
+endif()
+if(HAS_SDL2_DISPLAY)
+    target_sources(lingqi_tantong_core PRIVATE src/display_sdl2.c)
 endif()
 
 install(TARGETS lingqi_tantong DESTINATION bin)

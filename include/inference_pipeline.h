@@ -3,7 +3,6 @@
 
 #include "core_types.h"
 #include "config_manager.h"
-#include "yolov8_detector.h"
 #include "yolov8_pose_estimator.h"
 #include "yolov5_face_detector.h"
 #include "arcface_recognizer.h"
@@ -37,7 +36,6 @@ typedef enum {
 } PipelineCascadeState;
 
 typedef struct {
-    YOLO11Detector* detector;
     YOLOv8PoseEstimator* pose_estimator;
     YOLOv5FaceDetector* face_detector;
     ArcFaceRecognizer* face_recognizer;
@@ -57,8 +55,12 @@ typedef struct {
     int cascade_tracking_w;            /* reduced resolution width when tracking */
     int cascade_tracking_h;            /* reduced resolution height when tracking */
     int cascade_lost_counter;          /* consecutive frames with 0 confirmed tracks */
-    int confirmed_track_count;         /* actual confirmed tracks from tracker (sync'ed externally) */
-    int total_track_count;             /* total tracks from tracker (sync'ed externally) */
+    /* Cross-thread in K1 pipeline: written by PostProcess thread, read by Inference thread.
+     * RISC-V 64-bit aligned int load/store is hardware-atomic. 'volatile' prevents
+     * compiler from hoisting/caching across the inference call.  Stale-by-1-frame is
+     * acceptable for the cascade state machine — no mutex needed. */
+    volatile int confirmed_track_count;
+    volatile int total_track_count;
 
     /* ── Keypoint validator ── */
     KeypointValidator* keypoint_validator;

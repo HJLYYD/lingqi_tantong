@@ -36,8 +36,6 @@ int ort_validate_onnx_file(const char* model_path, size_t* out_file_size);
 
 OrtSession* ort_create_session(const char* model_path, int num_threads, bool use_ep);
 
-size_t ort_get_model_input_size(OrtSession* session);
-
 /*
  * Query the model's first input tensor shape. Writes up to `max_dims`
  * dimension values into out_dims and returns the actual rank (number of

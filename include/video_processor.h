@@ -33,13 +33,7 @@ int   video_processor_get_frame_count(const VideoProcessor* vp);
 int   video_processor_get_width(const VideoProcessor* vp);
 int   video_processor_get_height(const VideoProcessor* vp);
 
-int video_processor_save_frame(const VideoProcessor* vp, const FrameData* frame, const char* output_path, int quality);
-int video_processor_save_video(const VideoProcessor* vp, const char* output_path, int width, int height, float fps,
-                               const char* codec_name, int bitrate);
-int video_processor_write_frame(const VideoProcessor* vp, const uint8_t* frame_data);
-
 VideoProcessor* video_processor_create_from_camera(const char* device_path, int width, int height, float fps, const char* camera_format);
-VideoProcessor* video_processor_create_from_arrow(void);
 
 int video_processor_get_source_type(const VideoProcessor* vp);
 

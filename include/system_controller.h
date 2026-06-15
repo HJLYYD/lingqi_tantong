@@ -1,6 +1,7 @@
 #ifndef SYSTEM_CONTROLLER_H
 #define SYSTEM_CONTROLLER_H
 
+#include <signal.h>
 #include "core_types.h"
 #include "config_manager.h"
 #include "model_store.h"
@@ -15,7 +16,6 @@
 #include "video_writer.h"
 #include "arrow_receiver.h"
 #include "mjpeg_receiver.h"
-#include "ai_accel_adapter.h"
 #include "display_output.h"
 
 #ifdef __cplusplus
@@ -38,7 +38,6 @@ typedef struct {
     ResultManager* result_manager;
     ArrowReceiver* arrow_receiver;
     MjpegReceiver* mjpeg_receiver;
-    AIAcclContext* ai_context;
     DisplayOutput* display_output;
 
     PipelineMode mode;
@@ -67,7 +66,7 @@ typedef struct {
     float processing_times[SC_MAX_PROC_TIMES];
     int proc_times_count;
     int detection_count;
-    bool running;
+    volatile sig_atomic_t running;   /* sig_atomic_t: safe for signal handler + cross-thread with -O3 */
 } SystemController;
 
 SystemController* system_controller_create(const char* config_path);
@@ -80,17 +79,10 @@ SystemStatus system_controller_process_video(SystemController* sc,
                                               bool show_windows,
                                               int save_frame_interval);
 
-SystemStatus system_controller_process_realtime(SystemController* sc,
-                                                 const char* uart_device_A,
-                                                 const char* uart_device_C,
-                                                 int baudrate);
-
-#ifdef HAS_K1_PIPELINE
 SystemStatus system_controller_process_realtime_k1(SystemController* sc,
                                                     const char* uart_device_A,
                                                     const char* uart_device_C,
                                                     int baudrate);
-#endif
 
 SystemStatus system_controller_get_status(const SystemController* sc);
 SystemStatus system_controller_get_final_status(const SystemController* sc);

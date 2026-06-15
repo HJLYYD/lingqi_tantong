@@ -3,6 +3,7 @@
 
 #include "mjpeg_receiver.h"
 #include "logger.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -18,29 +19,34 @@
 #include <netinet/tcp.h>
 
 /*
- * MJPEG stream parser state machine.
+ * MJPEG receiver — Python test-ov-imu.py logic + HTTP chunked decode
  *
- * An MJPEG over HTTP stream looks like:
+ * ESP32's httpd_resp_send_chunk() uses Transfer-Encoding: chunked, so the
+ * raw TCP stream contains hex chunk-size headers that must be stripped
+ * before MJPEG parsing.  Python's requests library does this transparently;
+ * we replicate it here with a two-buffer pipeline:
  *
- *   HTTP/1.0 200 OK\r\n
- *   Content-Type: multipart/x-mixed-replace;boundary=123456789000000000000987654321\r\n
- *   \r\n
- *   --123456789000000000000987654321\r\n
- *   Content-Type: image/jpeg\r\n
- *   Content-Length: 12345\r\n
- *   \r\n
- *   <12345 bytes of JPEG data>
- *   --123456789000000000000987654321\r\n
- *   ...
+ *   socket → chunk_buf →[chunked_decode]→ recv_buf →[mjpeg_parse_data]→ frame
+ *
+ * Python reference (after requests transparently de-chunks):
+ *   buf = b''
+ *   for chunk in stream.iter_content(4096):
+ *       buf += chunk
+ *       s = buf.find(b'--123456789000000000000987654321')
+ *       if s == -1: continue
+ *       frame = buf[:s]
+ *       buf = buf[s + 67:]
+ *       imu_start = frame.find(b'{"ax":')
+ *       ...
  */
 
-typedef enum {
-    MJPEG_PARSE_HTTP_HEADER = 0,  /* reading HTTP response line + headers */
-    MJPEG_PARSE_FIND_BOUNDARY,    /* scanning for next boundary marker   */
-    MJPEG_PARSE_PART_HEADERS,     /* reading Content-Type/Length headers */
-    MJPEG_PARSE_PART_BODY,        /* reading JPEG payload bytes          */
-    MJPEG_PARSE_PART_DONE,        /* complete frame ready to consume     */
-} MjpegParseState;
+/* ── Fixed MJPEG boundary (hardcoded, same as Python) ── */
+#define BOUNDARY_STR    "123456789000000000000987654321"
+#define BOUNDARY_MARKER "--" BOUNDARY_STR
+#define BOUNDARY_SKIP   67   /* Python: buf[s + 67:] */
+
+/* ── HTTP chunked decoding buffer ── */
+#define CHUNK_BUF_SIZE  65536  /* large enough for one max JPEG chunk + overhead */
 
 struct MjpegReceiver {
     /* ── Connection ── */
@@ -54,27 +60,14 @@ struct MjpegReceiver {
     int    reconnect_delay_s;
     time_t last_reconnect_attempt;
 
-    /* ── IMU polling ── */
-    bool   imu_enabled;
-    int    imu_sock_fd;
-    time_t last_imu_poll;
+    /* ── Chunked-decoding staging buffer (raw TCP data with HTTP chunk framing) ── */
+    uint8_t chunk_buf[CHUNK_BUF_SIZE];
+    int     chunk_len;   /* bytes of raw chunked data waiting in chunk_buf */
 
-    /* ── Receive buffer ── */
+    /* ── De-chunked MJPEG linear buffer (Python: buf = b'') ── */
     uint8_t recv_buf[MJPEG_RECV_BUF_SIZE];
-    int     recv_head;    /* write position in recv_buf */
-    int     recv_tail;    /* read position (parse cursor) */
-
-    /* ── MJPEG parser state ── */
-    MjpegParseState parse_state;
-    char    boundary[MJPEG_BOUNDARY_MAX];
-    int     boundary_len;
-    int     boundary_match_pos;   /* chars matched so far (FIND_BOUNDARY) */
-    int     content_length;       /* expected JPEG payload size           */
-    int     content_read;         /* bytes read of current JPEG payload   */
-    bool    headers_done;         /* HTTP response headers fully parsed   */
-
-    /* ── Part body accumulation buffer ── */
-    uint8_t* part_body_buf;   /* accumulates partial JPEG across recv() calls */
+    int     recv_head;   /* write position (= len(buf) in Python) */
+    bool    http_done;   /* HTTP response headers stripped */
 
     /* ── Latest complete JPEG frame ── */
     uint8_t* jpeg_buf;
@@ -85,6 +78,9 @@ struct MjpegReceiver {
     /* ── Latest IMU data ── */
     IMUExternalPose latest_pose;
     bool   has_pose;
+    float  yaw_accum;       /* integrated yaw from gyro Z (rad) */
+    double last_imu_time;   /* CLOCK_MONOTONIC seconds of last IMU sample */
+    int    imu_log_cnt;     /* per-instance IMU log counter */
 
     /* ── Threading ── */
     pthread_t       reader_thread;
@@ -94,7 +90,7 @@ struct MjpegReceiver {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  WiFi auto-connect (only when --wifi-ssid is explicitly passed)
+ *  WiFi auto-connect
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static bool wifi_connect(const char* ssid, const char* password) {
@@ -102,23 +98,18 @@ static bool wifi_connect(const char* ssid, const char* password) {
         log_info("[MjpegRX] No WiFi SSID given, assuming user pre-connected");
         return true;
     }
-
     log_info("[MjpegRX] Auto-connecting to WiFi: %s", ssid);
-
     char cmd[512];
     if (password && password[0] != '\0') {
         snprintf(cmd, sizeof(cmd),
-            "nmcli dev wifi connect \"%s\" password \"%s\" 2>/dev/null",
-            ssid, password);
+            "nmcli dev wifi connect \"%s\" password \"%s\" 2>/dev/null", ssid, password);
     } else {
         snprintf(cmd, sizeof(cmd),
             "nmcli dev wifi connect \"%s\" 2>/dev/null", ssid);
     }
-
     int rc = system(cmd);
     if (rc != 0) {
-        log_warning("[MjpegRX] nmcli wifi connect returned %d — "
-                     "WiFi may already be connected or unavailable", rc);
+        log_warning("[MjpegRX] nmcli wifi connect returned %d", rc);
     }
     usleep(500000);
     return true;
@@ -130,12 +121,8 @@ static bool wifi_connect(const char* ssid, const char* password) {
 
 static int tcp_connect(const char* ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        log_error("[MjpegRX] socket() failed: %s", strerror(errno));
-        return -1;
-    }
+    if (fd < 0) { log_error("[MjpegRX] socket() failed: %s", strerror(errno)); return -1; }
 
-    /* Set non-blocking for connect (we'll switch back after) */
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -145,47 +132,34 @@ static int tcp_connect(const char* ip, int port) {
     addr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
         log_error("[MjpegRX] inet_pton(%s) failed", ip);
-        close(fd);
-        return -1;
+        close(fd); return -1;
     }
 
     int rc = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
     if (rc < 0 && errno != EINPROGRESS) {
         log_error("[MjpegRX] connect(%s:%d) failed: %s", ip, port, strerror(errno));
-        close(fd);
-        return -1;
+        close(fd); return -1;
     }
 
-    /* Wait for connect to complete (with timeout) */
     if (rc < 0 && errno == EINPROGRESS) {
-        struct timeval tv = {3, 0};  /* 3 second connect timeout */
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
+        struct timeval tv = {3, 0};
+        fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
         rc = select(fd + 1, NULL, &wfds, NULL, &tv);
         if (rc <= 0) {
             log_error("[MjpegRX] connect(%s:%d) timeout", ip, port);
-            close(fd);
-            return -1;
+            close(fd); return -1;
         }
-        int err = 0;
-        socklen_t len = sizeof(err);
+        int err = 0; socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-            log_error("[MjpegRX] connect(%s:%d) async error: %s",
-                      ip, port, err ? strerror(err) : "unknown");
-            close(fd);
-            return -1;
+            log_error("[MjpegRX] connect async error: %s", err ? strerror(err) : "unknown");
+            close(fd); return -1;
         }
     }
 
-    /* Restore blocking mode */
     fcntl(fd, F_SETFL, flags);
 
-    /* TCP_NODELAY for low-latency streaming */
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-    /* Set receive timeout to 1 second so we can check shutdown flag */
     struct timeval tv = {1, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -194,25 +168,17 @@ static int tcp_connect(const char* ip, int port) {
 }
 
 static void tcp_close(int* fd) {
-    if (*fd >= 0) {
-        shutdown(*fd, SHUT_RDWR);
-        close(*fd);
-        *fd = -1;
-    }
+    if (*fd >= 0) { shutdown(*fd, SHUT_RDWR); close(*fd); *fd = -1; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  HTTP request / response
+ *  HTTP request
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static int http_send_request(int fd, const char* host, const char* path) {
     char req[512];
     snprintf(req, sizeof(req),
-        "GET %s HTTP/1.0\r\n"
-        "Host: %s\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path, host);
+        "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
     size_t len = strlen(req);
     ssize_t n = send(fd, req, len, MSG_NOSIGNAL);
     if (n != (ssize_t)len) {
@@ -222,314 +188,324 @@ static int http_send_request(int fd, const char* host, const char* path) {
     return 0;
 }
 
-/*
- * Scan recv_buf for the boundary string.
- * Returns number of bytes to skip to be positioned right after the boundary
- * (including trailing \r\n if present), or -1 if boundary not found.
- */
-static int find_boundary_in_buf(const uint8_t* buf, int start, int end,
-                                 const char* boundary, int blen) {
-    for (int i = start; i <= end - blen; i++) {
-        if (memcmp(buf + i, boundary, blen) == 0) {
-            /* Skip past boundary + optional "\r\n" */
-            int skip = i + blen;
-            if (skip + 1 < end && buf[skip] == '\r' && buf[skip+1] == '\n')
-                skip += 2;
-            return skip;
-        }
-    }
-    return -1;
-}
-
-/*
- * Extract Content-Length value from a line like "Content-Length: 12345\r\n".
- * Returns the integer value, or -1 if not found.
- */
-static int parse_content_length(const uint8_t* buf, int start, int end) {
-    /* Find "Content-Length:" */
-    const char* marker = "Content-Length:";
-    int mlen = 15;
-    for (int i = start; i <= end - mlen; i++) {
-        if (memcmp(buf + i, marker, mlen) == 0) {
-            /* Skip optional space */
-            int j = i + mlen;
-            while (j < end && buf[j] == ' ') j++;
-            /* Parse digits */
-            int val = 0;
-            while (j < end && buf[j] >= '0' && buf[j] <= '9') {
-                val = val * 10 + (buf[j] - '0');
-                j++;
-            }
-            if (val > 0 && val < MJPEG_MAX_FRAME_LEN) return val;
-        }
-    }
-    return -1;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════
- *  MJPEG stream parser (called from reader thread)
+ *  Strip HTTP response headers from chunk_buf — find \r\n\r\n, keep
+ *  everything after (i.e. the raw chunked-encoded body).
+ *  Equivalent to Python's requests library consuming the HTTP headers.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/*
- * Process available data in recv_buf[recv_tail .. recv_head].
- * Advances recv_tail as data is consumed.
- * When a complete JPEG frame is extracted, stores it in receiver->jpeg_buf.
- */
-static void mjpeg_parse_data(MjpegReceiver* r) {
-    static int parse_call_count = 0;
-    parse_call_count++;
-    int buf_avail = r->recv_head - r->recv_tail;
-
-    while (r->recv_tail < r->recv_head) {
-        switch (r->parse_state) {
-
-        case MJPEG_PARSE_HTTP_HEADER: {
-            /* Scan for the double-CRLF that ends HTTP headers */
-            const uint8_t* p = r->recv_buf + r->recv_tail;
-            int remaining = r->recv_head - r->recv_tail;
-            int found = -1;
-            for (int i = 0; i < remaining - 3; i++) {
-                if (p[i] == '\r' && p[i+1] == '\n' &&
-                    p[i+2] == '\r' && p[i+3] == '\n') {
-                    found = i + 4;
-                    break;
-                }
+static void strip_http_headers(MjpegReceiver* r) {
+    if (r->http_done) return;
+    for (int i = 0; i < r->chunk_len - 3; i++) {
+        if (r->chunk_buf[i] == '\r' && r->chunk_buf[i+1] == '\n' &&
+            r->chunk_buf[i+2] == '\r' && r->chunk_buf[i+3] == '\n') {
+            int body_start = i + 4;
+            int body_len   = r->chunk_len - body_start;
+            if (body_len > 0) {
+                memmove(r->chunk_buf, r->chunk_buf + body_start, body_len);
             }
-            if (found < 0) return;  /* need more data */
-
-            /* Extract boundary from Content-Type header */
-            const char* bmarker = "boundary=";
-            int bmlen = 9;
-            for (int i = 0; i < found - bmlen; i++) {
-                if (memcmp(p + i, bmarker, bmlen) == 0) {
-                    int j = i + bmlen;
-                    int blen = 0;
-                    while (j + blen < found && p[j+blen] != '\r' &&
-                           p[j+blen] != '\n' && p[j+blen] != ';' &&
-                           blen < MJPEG_BOUNDARY_MAX - 1) {
-                        blen++;
-                    }
-                    if (blen > 0) {
-                        memcpy(r->boundary, p + j, blen);
-                        r->boundary[blen] = '\0';
-                        r->boundary_len = blen;
-                        log_info("[MjpegRX] MJPEG boundary: %s", r->boundary);
-                    }
-                    break;
-                }
-            }
-
-            if (r->boundary_len == 0) {
-                log_error("[MjpegRX] No boundary found in HTTP response");
-                /* Skip all data — connection will be reset */
-                r->recv_tail = r->recv_head;
-                return;
-            }
-
-            r->recv_tail += found;
-            r->parse_state = MJPEG_PARSE_FIND_BOUNDARY;
-            r->boundary_match_pos = 0;
-            log_info("[MjpegRX] HTTP headers parsed, searching for first boundary");
-            break;
-        }
-
-        case MJPEG_PARSE_FIND_BOUNDARY: {
-            /* Search for "--<boundary>" in the buffer */
-            char search[MJPEG_BOUNDARY_MAX + 4];
-            int slen = snprintf(search, sizeof(search), "--%s", r->boundary);
-            int skip = find_boundary_in_buf(r->recv_buf, r->recv_tail,
-                                             r->recv_head, search, slen);
-            if (skip < 0) {
-                /* No boundary found — keep last 128 bytes */
-                int avail = r->recv_head - r->recv_tail;
-                int keep = 128;
-                if (avail > keep) {
-                    r->recv_tail = r->recv_head - keep;
-                }
-                return;
-            }
-            r->recv_tail = skip;
-            r->parse_state = MJPEG_PARSE_PART_HEADERS;
-            r->content_length = -1;
-            r->content_read = 0;
-            log_debug("[MjpegRX] Found boundary, reading part headers");
-            break;
-        }
-
-        case MJPEG_PARSE_PART_HEADERS: {
-            /* Look for "\r\n\r\n" marking end of part headers */
-            const uint8_t* p = r->recv_buf + r->recv_tail;
-            int remaining = r->recv_head - r->recv_tail;
-            int hdr_end = -1;
-            for (int i = 0; i < remaining - 3; i++) {
-                if (p[i] == '\r' && p[i+1] == '\n' &&
-                    p[i+2] == '\r' && p[i+3] == '\n') {
-                    hdr_end = i;
-                    break;
-                }
-            }
-            if (hdr_end < 0) return;  /* need more data */
-
-            /* Parse Content-Length */
-            r->content_length = parse_content_length(p, 0, hdr_end);
-
-            /* Skip past the double-CRLF */
-            r->recv_tail += hdr_end + 4;
-
-            if (r->content_length > 0 && r->content_length < MJPEG_MAX_FRAME_LEN) {
-                r->parse_state = MJPEG_PARSE_PART_BODY;
-                r->content_read = 0;
-                log_debug("[MjpegRX] Part headers done, Content-Length=%d, entering PART_BODY",
-                          r->content_length);
-            } else {
-                log_debug("[MjpegRX] Part has no valid Content-Length (%d), skipping to next boundary",
-                          r->content_length);
-                r->parse_state = MJPEG_PARSE_FIND_BOUNDARY;
-            }
-            break;
-        }
-
-        case MJPEG_PARSE_PART_BODY: {
-            int available = r->recv_head - r->recv_tail;
-            int needed = r->content_length - r->content_read;
-            int take = (available < needed) ? available : needed;
-
-            /* Allocate accumulation buffer on first entry */
-            if (!r->part_body_buf && r->content_length > 0) {
-                r->part_body_buf = (uint8_t*)malloc(r->content_length);
-            }
-
-            if (take > 0 && r->part_body_buf) {
-                /* Copy into accumulation buffer (safe across recv() calls
-                 * because compact_buffer resets the ring buffer) */
-                memcpy(r->part_body_buf + r->content_read,
-                       r->recv_buf + r->recv_tail, take);
-                r->content_read += take;
-                r->recv_tail += take;
-            }
-
-            if (r->content_read >= r->content_length) {
-                /* Complete JPEG frame received — transfer ownership */
-                pthread_mutex_lock(&r->mutex);
-                free(r->jpeg_buf);
-                r->jpeg_buf = r->part_body_buf;   /* transfer, don't copy */
-                r->part_body_buf = NULL;
-                r->jpeg_len = r->content_length;
-                r->frame_index++;
-                struct timespec ts;
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                r->frame_timestamp = (double)ts.tv_sec
-                                   + (double)ts.tv_nsec / 1e9;
-                pthread_mutex_unlock(&r->mutex);
-
-                if (r->frame_index == 1) {
-                    log_info("[MjpegRX] First JPEG frame extracted: %d bytes",
-                             (int)r->jpeg_len);
-                } else if (r->frame_index % 30 == 0) {
-                    log_debug("[MjpegRX] Frame #%d: %d bytes",
-                              r->frame_index, (int)r->jpeg_len);
-                }
-                r->parse_state = MJPEG_PARSE_FIND_BOUNDARY;
-            }
-            break;
-        }
-
-        case MJPEG_PARSE_PART_DONE:
-        default:
-            r->parse_state = MJPEG_PARSE_FIND_BOUNDARY;
-            break;
-        }
-    }
-}
-
-/* Discard buffered data that's already been parsed (shift remaining to front).
- * Must NOT be called while in PART_BODY state — partial JPEG data is
- * accumulated in part_body_buf, not the ring buffer. */
-static void mjpeg_compact_buffer(MjpegReceiver* r) {
-    if (r->parse_state == MJPEG_PARSE_PART_BODY) return;
-    if (r->recv_tail > 0 && r->recv_tail < r->recv_head) {
-        int remaining = r->recv_head - r->recv_tail;
-        memmove(r->recv_buf, r->recv_buf + r->recv_tail, remaining);
-        r->recv_head = remaining;
-        r->recv_tail = 0;
-    } else if (r->recv_tail >= r->recv_head) {
-        r->recv_head = 0;
-        r->recv_tail = 0;
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- *  IMU data poller
- * ═══════════════════════════════════════════════════════════════════════ */
-
-static void imu_poll(MjpegReceiver* r) {
-    time_t now = time(NULL);
-    if (now - r->last_imu_poll < (MJPEG_IMU_POLL_INTERVAL_MS + 999) / 1000) return;
-    r->last_imu_poll = now;
-
-    if (r->imu_sock_fd < 0) {
-        r->imu_sock_fd = tcp_connect(r->esp_ip, r->esp_port);
-        if (r->imu_sock_fd < 0) return;
-        if (http_send_request(r->imu_sock_fd, r->esp_ip, "/imu") != 0) {
-            tcp_close(&r->imu_sock_fd);
+            r->chunk_len = body_len;
+            r->http_done = true;
+            log_info("[MjpegRX] HTTP headers stripped, chunked body starts at offset 0");
             return;
         }
     }
+}
 
-    char buf[512];
-    ssize_t n = recv(r->imu_sock_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            tcp_close(&r->imu_sock_fd);
+/* ═══════════════════════════════════════════════════════════════════════
+ *  HTTP chunked transfer-encoding decoder
+ *
+ *  Reads raw chunked data from chunk_buf, writes de-chunked payload to
+ *  recv_buf.  Incomplete chunks stay in chunk_buf for the next recv().
+ *
+ *  Chunked format (RFC 7230 §4.1):
+ *    <hex-size>\r\n<data>\r\n  ...  0\r\n\r\n
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int chunked_decode(MjpegReceiver* r) {
+    int pos = 0;
+    int decoded_any = 0;
+
+    while (pos < r->chunk_len) {
+        int chunk_start = pos;
+
+        /* ── Find \r\n ending the hex-size line ── */
+        int nl = -1;
+        for (int i = pos; i < r->chunk_len - 1; i++) {
+            if (r->chunk_buf[i] == '\r' && r->chunk_buf[i+1] == '\n') {
+                nl = i;
+                break;
+            }
         }
-        return;
-    }
-    buf[n] = '\0';
+        if (nl < 0) {
+            /* Incomplete hex-size line — keep in chunk_buf */
+            pos = chunk_start;
+            break;
+        }
 
-    /* Parse JSON: {"accel":[ax,ay,az],"gyro":[gx,gy,gz]} */
-    float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
-    int parsed = sscanf(buf,
-        "{\"accel\":[%f,%f,%f],\"gyro\":[%f,%f,%f]}",
-        &ax, &ay, &az, &gx, &gy, &gz);
-    if (parsed == 6) {
-        pthread_mutex_lock(&r->mutex);
-        /* Store IMU data as an external pose.
-         * Raw accel/gyro values — no quaternion available from this ESP32. */
-        r->latest_pose.pitch = ay;   /* approximate tilt */
-        r->latest_pose.roll  = ax;
-        r->latest_pose.yaw   = gz;
-        r->latest_pose.qw = 1.0f;
-        r->latest_pose.qx = 0.0f;
-        r->latest_pose.qy = 0.0f;
-        r->latest_pose.qz = 0.0f;
-        r->latest_pose.altitude_m = az;
-        r->latest_pose.temperature_c = 0.0f;
-        r->latest_pose.timestamp_ms = (uint32_t)(now * 1000);
-        r->latest_pose.is_valid = true;
-        r->has_pose = true;
-        pthread_mutex_unlock(&r->mutex);
+        /* ── Parse hex chunk size ── */
+        int csize = 0;
+        for (int i = pos; i < nl; i++) {
+            char c = (char)r->chunk_buf[i];
+            if      (c >= '0' && c <= '9') csize = (csize << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') csize = (csize << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') csize = (csize << 4) | (c - 'A' + 10);
+            else {
+                log_warning("[MjpegRX] Bad hex in chunk size at offset %d: 0x%02x",
+                           i, r->chunk_buf[i]);
+                return -1;
+            }
+        }
+        pos = nl + 2;  /* skip hex-size + \r\n */
+
+        /* ── Last chunk (size == 0) ── */
+        if (csize == 0) {
+            /* Skip optional trailer \r\n */
+            if (pos + 1 < r->chunk_len &&
+                r->chunk_buf[pos] == '\r' && r->chunk_buf[pos+1] == '\n')
+                pos += 2;
+            /* Consume everything up to pos */
+            if (pos > 0) {
+                int remain = r->chunk_len - pos;
+                if (remain > 0) memmove(r->chunk_buf, r->chunk_buf + pos, remain);
+                r->chunk_len = remain;
+            } else {
+                r->chunk_len = 0;
+            }
+            log_debug("[MjpegRX] HTTP chunked stream ended (0-size chunk)");
+            return decoded_any;
+        }
+
+        /* ── Need complete chunk data + trailing \r\n ── */
+        if (pos + csize + 2 > r->chunk_len) {
+            /* Incomplete — rewind to chunk_start, wait for more data */
+            pos = chunk_start;
+            break;
+        }
+
+        /* ── Append de-chunked data to recv_buf ── */
+        if (r->recv_head + csize > MJPEG_RECV_BUF_SIZE) {
+            log_warning("[MjpegRX] recv_buf overflow, flushing");
+            r->recv_head = 0;
+        }
+        memcpy(r->recv_buf + r->recv_head, r->chunk_buf + pos, csize);
+        r->recv_head += csize;
+        decoded_any++;
+        pos += csize + 2;  /* skip data + trailing \r\n */
     }
 
-    /* Close IMU connection after each poll — re-open next cycle */
-    tcp_close(&r->imu_sock_fd);
+    /* ── Remove consumed data from chunk_buf ── */
+    if (pos > 0) {
+        int remain = r->chunk_len - pos;
+        if (remain > 0) memmove(r->chunk_buf, r->chunk_buf + pos, remain);
+        r->chunk_len = remain;
+    }
+
+    return decoded_any;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Frame parser — EXACT Python test-ov-imu.py logic
+ *
+ *  (recv_buf has already been de-chunked by chunked_decode() above)
+ *
+ *  Python:
+ *    s = buf.find(b'--123456789000000000000987654321')
+ *    if s == -1: continue
+ *    frame = buf[:s]
+ *    buf = buf[s + 67:]
+ *
+ *    imu_start = frame.find(b'{"ax":')
+ *    imu_end = frame.find(b'}', imu_start) + 1
+ *    if imu_start >= 0 and imu_end > 0: ...
+ *
+ *    jpg_s = frame.find(b'\xff\xd8')
+ *    jpg_e = frame.find(b'\xff\xd9')
+ *    if jpg_s != -1 and jpg_e != -1: ...
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void mjpeg_parse_data(MjpegReceiver* r) {
+    /* HTTP headers already stripped at chunk_buf level */
+    /* ── Python: s = buf.find(b'--123456789000000000000987654321') ── */
+    while (r->recv_head > 0) {
+        int s = -1;
+        int marker_len = strlen(BOUNDARY_MARKER);  /* = 32 */
+        for (int i = 0; i <= r->recv_head - marker_len; i++) {
+            if (memcmp(r->recv_buf + i, BOUNDARY_MARKER, marker_len) == 0) {
+                s = i;
+                break;
+            }
+        }
+
+        /* Python: if s == -1: continue */
+        if (s < 0) return;
+
+        /* Python: frame = buf[:s] */
+        int frame_len = s;  /* everything before boundary */
+        uint8_t* frame_data = r->recv_buf;
+
+        /* ── Only process non-empty frames ── */
+        if (frame_len > 0) {
+            /* ── Python: imu_start = frame.find(b'{"ax":') ── */
+            int imu_start = -1;
+            for (int i = 0; i <= frame_len - 6; i++) {
+                if (memcmp(frame_data + i, "{\"ax\":", 6) == 0) {
+                    imu_start = i;
+                    break;
+                }
+            }
+
+            /* Python: imu_end = frame.find(b'}', imu_start) + 1
+             *         if imu_start >= 0 and imu_end > 0:                   */
+            if (imu_start >= 0) {
+                int imu_end = -1;
+                for (int i = imu_start + 6; i < frame_len; i++) {
+                    if (frame_data[i] == '}') {
+                        imu_end = i + 1;
+                        break;
+                    }
+                }
+
+                if (imu_end > 0 && imu_end - imu_start < 256) {
+                    char json_buf[256];
+                    int json_len = imu_end - imu_start;
+                    memcpy(json_buf, frame_data + imu_start, json_len);
+                    json_buf[json_len] = '\0';
+
+                    /* Python: imu = json.loads(imu_str)
+                     *         imu['ax'], imu['ay'], imu['az'],
+                     *         imu['gx'], imu['gy'], imu['gz']              */
+                    float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+                    if (sscanf(json_buf,
+                        "{\"ax\":%f,\"ay\":%f,\"az\":%f,"
+                        "\"gx\":%f,\"gy\":%f,\"gz\":%f}",
+                        &ax, &ay, &az, &gx, &gy, &gz) == 6) {
+
+                        /* ── Compute tilt from accelerometer (gravity direction) ── */
+                        float roll_rad  = atan2f(ay, az);
+                        float pitch_rad = atan2f(-ax, sqrtf(ay*ay + az*az));
+
+                        /* ── Integrate gyro Z for yaw (CLOCK_MONOTONIC for µs dt) ── */
+                        struct timespec imu_ts;
+                        clock_gettime(CLOCK_MONOTONIC, &imu_ts);
+                        double now_s = (double)imu_ts.tv_sec
+                                     + (double)imu_ts.tv_nsec * 1e-9;
+                        double dt = (r->last_imu_time > 0.0)
+                                  ? (now_s - r->last_imu_time) : 0.04;
+                        /* Clamp dt to reasonable range (avoid spikes after pause) */
+                        if (dt > 0.001 && dt < 1.0) {
+                            r->yaw_accum += gz * (float)dt;
+                        }
+                        r->last_imu_time = now_s;
+
+                        /* ── Euler to quaternion (ZYX order: yaw→pitch→roll) ── */
+                        float cr = cosf(roll_rad * 0.5f), sr = sinf(roll_rad * 0.5f);
+                        float cp = cosf(pitch_rad * 0.5f), sp = sinf(pitch_rad * 0.5f);
+                        float cy = cosf(r->yaw_accum * 0.5f), sy = sinf(r->yaw_accum * 0.5f);
+                        float qw = cr*cp*cy + sr*sp*sy;
+                        float qx = sr*cp*cy - cr*sp*sy;
+                        float qy = cr*sp*cy + sr*cp*sy;
+                        float qz = cr*cp*sy - sr*sp*cy;
+
+                        /* monotonic timestamp_ms without overflow */
+                        uint64_t ts_ms = (uint64_t)imu_ts.tv_sec * 1000ULL
+                                       + (uint64_t)imu_ts.tv_nsec / 1000000ULL;
+
+                        pthread_mutex_lock(&r->mutex);
+                        r->latest_pose.pitch = pitch_rad;
+                        r->latest_pose.roll  = roll_rad;
+                        r->latest_pose.yaw   = r->yaw_accum;
+                        r->latest_pose.qw = qw;
+                        r->latest_pose.qx = qx;
+                        r->latest_pose.qy = qy;
+                        r->latest_pose.qz = qz;
+                        r->latest_pose.altitude_m = 0.0f;  /* not available from accel alone */
+                        r->latest_pose.temperature_c = 0.0f;
+                        r->latest_pose.timestamp_ms = (uint32_t)ts_ms;
+                        r->latest_pose.is_valid = true;
+                        r->has_pose = true;
+                        pthread_mutex_unlock(&r->mutex);
+
+                        /* Log IMU at INFO level every 30 frames */
+                        if (++r->imu_log_cnt % 30 == 0) {
+                            log_info("[MjpegRX] IMU#%d | accel: ax=%.4f ay=%.4f az=%.4f m/s² | "
+                                     "gyro: gx=%.4f gy=%.4f gz=%.4f rad/s | "
+                                     "pose: roll=%.2f° pitch=%.2f° yaw=%.1f° | q=(%.3f,%.3f,%.3f,%.3f)",
+                                     r->imu_log_cnt, ax, ay, az, gx, gy, gz,
+                                     roll_rad * 57.3f, pitch_rad * 57.3f, r->yaw_accum * 57.3f,
+                                     qw, qx, qy, qz);
+                        }
+                    }
+                }
+            }
+
+            /* ── Python: jpg_s = frame.find(b'\xff\xd8')
+             *         jpg_e = frame.find(b'\xff\xd9')
+             *         if jpg_s != -1 and jpg_e != -1: jpg = frame[jpg_s:jpg_e+2] ── */
+            int jpg_s = -1, jpg_e = -1;
+            for (int i = 0; i < frame_len - 1; i++) {
+                if (frame_data[i] == 0xff && frame_data[i+1] == 0xd8) {
+                    jpg_s = i;
+                    break;
+                }
+            }
+            if (jpg_s >= 0) {
+                for (int i = jpg_s + 2; i < frame_len - 1; i++) {
+                    if (frame_data[i] == 0xff && frame_data[i+1] == 0xd9) {
+                        jpg_e = i + 2;
+                        break;
+                    }
+                }
+            }
+
+            if (jpg_s >= 0 && jpg_e > jpg_s &&
+                jpg_e - jpg_s >= 100 &&
+                jpg_e - jpg_s < MJPEG_MAX_FRAME_LEN) {
+                int jpg_len = jpg_e - jpg_s;
+                pthread_mutex_lock(&r->mutex);
+                free(r->jpeg_buf);
+                r->jpeg_buf = (uint8_t*)malloc(jpg_len);
+                if (r->jpeg_buf) {
+                    memcpy(r->jpeg_buf, frame_data + jpg_s, jpg_len);
+                    r->jpeg_len = jpg_len;
+                    r->frame_index++;
+                    /* Store timestamp in microseconds (was seconds, lost precision) */
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    r->frame_timestamp = (double)ts.tv_sec * 1e6
+                                       + (double)ts.tv_nsec / 1e3;
+                    if (r->frame_index == 1) {
+                        log_info("[MjpegRX] First JPEG frame: %d bytes", jpg_len);
+                    } else if (r->frame_index % 30 == 0) {
+                        log_info("[MjpegRX] Frame #%d: %d bytes JPEG | "
+                                 "recv_buf=%d/%d chunk_buf=%d/%d",
+                                 r->frame_index, jpg_len,
+                                 r->recv_head, MJPEG_RECV_BUF_SIZE,
+                                 r->chunk_len, CHUNK_BUF_SIZE);
+                    }
+                }
+                pthread_mutex_unlock(&r->mutex);
+            }
+        }
+
+        /* ── Python: buf = buf[s + 67:] ── */
+        int skip = s + BOUNDARY_SKIP;
+        if (skip >= r->recv_head) {
+            /* Not enough data to skip — boundary at very end of buffer */
+            r->recv_head = 0;
+            return;
+        }
+        int remaining = r->recv_head - skip;
+        if (remaining > 0) {
+            memmove(r->recv_buf, r->recv_buf + skip, remaining);
+        }
+        r->recv_head = remaining;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Background reader thread
  * ═══════════════════════════════════════════════════════════════════════ */
-
-static void mjpeg_reset_parser(MjpegReceiver* r) {
-    r->parse_state = MJPEG_PARSE_HTTP_HEADER;
-    r->boundary_len = 0;
-    r->boundary_match_pos = 0;
-    r->content_length = -1;
-    r->content_read = 0;
-    r->recv_head = 0;
-    r->recv_tail = 0;
-    memset(r->boundary, 0, sizeof(r->boundary));
-    free(r->part_body_buf);
-    r->part_body_buf = NULL;
-}
 
 static bool mjpeg_connect_and_stream(MjpegReceiver* r) {
     tcp_close(&r->sock_fd);
@@ -545,14 +521,20 @@ static bool mjpeg_connect_and_stream(MjpegReceiver* r) {
     r->sock_fd = fd;
     r->connected = true;
     r->reconnect_delay_s = MJPEG_RECONNECT_INITIAL_S;
-    mjpeg_reset_parser(r);
-    log_info("[MjpegRX] Streaming MJPEG from %s:%d/", r->esp_ip, r->esp_port);
+    r->recv_head = 0;
+    r->chunk_len = 0;
+    r->http_done = false;
+    r->yaw_accum = 0.0f;
+    r->last_imu_time = 0.0;
+    r->imu_log_cnt = 0;
+    log_info("[MjpegRX] Streaming MJPEG from %s:%d/ (Python test-ov-imu.py logic)",
+             r->esp_ip, r->esp_port);
     return true;
 }
 
 static void* mjpeg_reader_thread(void* arg) {
     MjpegReceiver* r = (MjpegReceiver*)arg;
-    int loop_count = 0, recv_total = 0;
+    int recv_total = 0;
 
     log_info("[MjpegRX] Reader thread started, connecting to %s:%d",
              r->esp_ip, r->esp_port);
@@ -562,7 +544,6 @@ static void* mjpeg_reader_thread(void* arg) {
     }
 
     while (r->running) {
-        loop_count++;
         if (!r->connected) {
             time_t now = time(NULL);
             int wait = r->reconnect_delay_s;
@@ -576,8 +557,8 @@ static void* mjpeg_reader_thread(void* arg) {
             }
             r->last_reconnect_attempt = now;
 
-            log_info("[MjpegRX] Reconnect attempt #%d to %s:%d (backoff=%ds)",
-                     loop_count, r->esp_ip, r->esp_port, wait);
+            log_info("[MjpegRX] Reconnect attempt to %s:%d (backoff=%ds)",
+                     r->esp_ip, r->esp_port, wait);
 
             if (mjpeg_connect_and_stream(r)) {
                 recv_total = 0;
@@ -589,56 +570,57 @@ static void* mjpeg_reader_thread(void* arg) {
             continue;
         }
 
-        /* Read from socket into recv_buf */
-        mjpeg_compact_buffer(r);
-        int space = MJPEG_RECV_BUF_SIZE - r->recv_head - 1;
+        /* ── Step 1: recv raw TCP data into chunk_buf ── */
+        int space = CHUNK_BUF_SIZE - r->chunk_len - 1;
         if (space <= 0) {
-            log_warning("[MjpegRX] Recv buffer full (head=%d tail=%d), resetting",
-                        r->recv_head, r->recv_tail);
-            r->connected = false;
-            tcp_close(&r->sock_fd);
-            mjpeg_reset_parser(r);
-            continue;
+            log_warning("[MjpegRX] chunk_buf full (%d bytes), resetting", r->chunk_len);
+            r->chunk_len = 0;
+            space = CHUNK_BUF_SIZE - 1;
         }
 
-        ssize_t n = recv(r->sock_fd, r->recv_buf + r->recv_head, space, 0);
+        ssize_t n = recv(r->sock_fd, r->chunk_buf + r->chunk_len, space, 0);
         if (n > 0) {
             recv_total += (int)n;
-            r->recv_head += (int)n;
-            if (loop_count == 1 || loop_count % 100 == 0) {
-                log_debug("[MjpegRX] Loop#%d recv=%d total=%d parse_state=%d head=%d tail=%d",
-                          loop_count, (int)n, recv_total,
-                          (int)r->parse_state, r->recv_head, r->recv_tail);
+            r->chunk_len += (int)n;
+
+            /* ── Step 2: strip HTTP response headers once ── */
+            if (!r->http_done) {
+                strip_http_headers(r);
+                if (!r->http_done) continue;  /* need more data for headers */
             }
-            mjpeg_parse_data(r);
+
+            /* ── Step 3: de-chunk chunk_buf → recv_buf ── */
+            int decoded = chunked_decode(r);
+            if (decoded < 0) {
+                log_warning("[MjpegRX] Chunked decode error, resetting");
+                r->connected = false;
+                tcp_close(&r->sock_fd);
+                r->recv_head = 0;
+                r->chunk_len = 0;
+                r->http_done = false;
+                continue;
+            }
+
+            /* ── Step 4: parse MJPEG frames from de-chunked recv_buf ── */
+            if (r->recv_head > 0) {
+                mjpeg_parse_data(r);
+            }
         } else if (n == 0) {
-            log_warning("[MjpegRX] ESP32 closed connection (EOF) after %d loops, %d bytes",
-                        loop_count, recv_total);
+            log_warning("[MjpegRX] ESP32 closed connection (EOF) after %d bytes",
+                        recv_total);
             r->connected = false;
             tcp_close(&r->sock_fd);
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (loop_count <= 3) {
-                    log_debug("[MjpegRX] Loop#%d recv timeout (normal)", loop_count);
-                }
-            } else {
-                log_warning("[MjpegRX] recv error at loop#%d: %s (errno=%d)",
-                            loop_count, strerror(errno), errno);
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_warning("[MjpegRX] recv error: %s", strerror(errno));
                 r->connected = false;
                 tcp_close(&r->sock_fd);
             }
         }
-
-        /* Poll IMU data */
-        if (r->imu_enabled && r->connected) {
-            imu_poll(r);
-        }
     }
 
-    log_info("[MjpegRX] Reader thread exiting after %d loops, %d bytes total",
-             loop_count, recv_total);
+    log_info("[MjpegRX] Reader thread exiting, %d bytes total", recv_total);
     tcp_close(&r->sock_fd);
-    tcp_close(&r->imu_sock_fd);
     return NULL;
 }
 
@@ -649,44 +631,30 @@ static void* mjpeg_reader_thread(void* arg) {
 MjpegReceiver* mjpeg_receiver_create(const char* esp_ip, int esp_port,
                                      const char* wifi_ssid,
                                      const char* wifi_password) {
-    if (!esp_ip || esp_ip[0] == '\0' || esp_port <= 0) {
-        log_error("[MjpegRX] Invalid parameters: ip=%s port=%d",
-                  esp_ip ? esp_ip : "(null)", esp_port);
-        return NULL;
-    }
+    if (!esp_ip || esp_ip[0] == '\0' || esp_port <= 0) return NULL;
 
     MjpegReceiver* r = (MjpegReceiver*)calloc(1, sizeof(MjpegReceiver));
     if (!r) return NULL;
 
     strncpy(r->esp_ip, esp_ip, sizeof(r->esp_ip) - 1);
     r->esp_port = esp_port;
-
     if (wifi_ssid) strncpy(r->wifi_ssid, wifi_ssid, sizeof(r->wifi_ssid) - 1);
     if (wifi_password) strncpy(r->wifi_password, wifi_password, sizeof(r->wifi_password) - 1);
 
     r->sock_fd = -1;
-    r->imu_sock_fd = -1;
-    r->imu_enabled = true;
     r->connected = false;
     r->reconnect_delay_s = MJPEG_RECONNECT_INITIAL_S;
-    r->last_reconnect_attempt = 0;
     r->has_pose = false;
+    r->recv_head = 0;
+    r->http_done = false;
 
-    mjpeg_reset_parser(r);
+    if (pthread_mutex_init(&r->mutex, NULL) != 0) { free(r); return NULL; }
 
-    if (pthread_mutex_init(&r->mutex, NULL) != 0) {
-        free(r);
-        return NULL;
-    }
-
-    /* WiFi auto-connect (no-op if ssid is NULL) */
     wifi_connect(r->wifi_ssid, r->wifi_password);
 
-    /* Start background reader thread */
     r->running = true;
     r->shutdown = false;
     if (pthread_create(&r->reader_thread, NULL, mjpeg_reader_thread, r) != 0) {
-        log_error("[MjpegRX] Failed to create reader thread");
         pthread_mutex_destroy(&r->mutex);
         free(r);
         return NULL;
@@ -698,28 +666,17 @@ MjpegReceiver* mjpeg_receiver_create(const char* esp_ip, int esp_port,
 
 void mjpeg_receiver_destroy(MjpegReceiver* r) {
     if (!r) return;
-
     r->running = false;
     r->shutdown = true;
-
-    /* Wake up reader thread by shutting down socket */
-    if (r->sock_fd >= 0) {
-        shutdown(r->sock_fd, SHUT_RDWR);
-    }
-
+    if (r->sock_fd >= 0) shutdown(r->sock_fd, SHUT_RDWR);
     pthread_join(r->reader_thread, NULL);
-
     tcp_close(&r->sock_fd);
-    tcp_close(&r->imu_sock_fd);
     free(r->jpeg_buf);
-    free(r->part_body_buf);
     pthread_mutex_destroy(&r->mutex);
     free(r);
 }
 
 void mjpeg_receiver_update(MjpegReceiver* r) {
-    /* The reader thread handles all I/O continuously.
-     * This is a no-op — kept for API compatibility with arrow_receiver. */
     (void)r;
 }
 
@@ -727,9 +684,6 @@ bool mjpeg_receiver_get_latest_frame(MjpegReceiver* r, ArrowSourceFrame* out) {
     if (!r || !out) return false;
 
     bool has_data = false;
-    static int get_call_count = 0, get_ok_count = 0;
-    get_call_count++;
-
     pthread_mutex_lock(&r->mutex);
 
     if (r->jpeg_buf && r->jpeg_len > 0 && r->jpeg_len < MJPEG_MAX_FRAME_LEN) {
@@ -738,14 +692,6 @@ bool mjpeg_receiver_get_latest_frame(MjpegReceiver* r, ArrowSourceFrame* out) {
         out->frame_index = r->frame_index;
         out->timestamp = r->frame_timestamp;
         has_data = true;
-        get_ok_count++;
-
-        if (r->frame_index <= 3 || r->frame_index % 50 == 0) {
-            log_info("[MjpegRX] get_latest_frame #%d: frame_idx=%d size=%zu (ok=%d/%d calls)",
-                     get_call_count, r->frame_index, r->jpeg_len,
-                     get_ok_count, get_call_count);
-        }
-
         free(r->jpeg_buf);
         r->jpeg_buf = NULL;
         r->jpeg_len = 0;
@@ -760,9 +706,7 @@ bool mjpeg_receiver_get_latest_frame(MjpegReceiver* r, ArrowSourceFrame* out) {
     }
 
     out->is_valid = has_data;
-
     pthread_mutex_unlock(&r->mutex);
-
     return has_data;
 }
 

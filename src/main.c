@@ -32,7 +32,7 @@ static void signal_handler(int sig) {
         const char msg[] = "\nShutting down... (Ctrl+C again to force quit)\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         g_running_flag = 0;
-        if (g_sc) g_sc->running = false;
+        if (g_sc) g_sc->running = 0;
     } else {
         _exit(1);
     }
@@ -44,7 +44,7 @@ static void print_usage(const char* program_name) {
     printf("Options:\n");
     printf("  --video_path <path>         Input video file (offline mode)\n");
     printf("  --output_path <path>        Output directory (default: output)\n");
-    printf("  --max_frames <num>          Max frames to process (0 = all)\n");
+    printf("  --max-frames <N>            Max frames to process (0=unlimited, works for all modes)\n");
     printf("  --save_frame_interval <N>   Save frame every N frames (default: 10)\n");
     printf("  --config <path>             Configuration YAML file\n");
     printf("  --realtime                  Real-time pipeline mode (Muse Pi Pro)\n");
@@ -58,7 +58,6 @@ static void print_usage(const char* program_name) {
     printf("  --udp-stream <addr>         UDP MPEG-TS streaming (e.g. udp://192.168.1.100:1234)\n");
     printf("  --rtmp <url>                RTMP streaming\n");
     printf("  --save-video                Save output to MP4 video file\n");
-    printf("  --max-frames <N>            Max frames to process in realtime mode (0=unlimited)\n");
     printf("  --frame-timeout <S>         Auto-exit after S seconds of no frames (default: 10)\n");
     printf("  --mjpeg                     Enable MJPEG HTTP receiver (ESP32 WiFi)\n");
     printf("  --mjpeg-ip <ip>             ESP32 IP address (default: 192.168.4.1)\n");
@@ -67,14 +66,15 @@ static void print_usage(const char* program_name) {
     printf("  --wifi-password <pw>        WiFi password (default: 12345678)\n");
     printf("  --help                      Show this help\n");
     printf("\nExamples:\n");
+    printf("  # Arrow UART dual-link (primary path):\n");
+    printf("  %s --realtime\n", program_name);
+    printf("  %s --realtime --uart-A /dev/ttyS0 --uart-C /dev/ttyS1 --baudrate 3000000\n", program_name);
+    printf("  # MJPEG WiFi receiver (ESP32 camera):\n");
     printf("  %s --realtime --mjpeg --display\n", program_name);
     printf("  %s --realtime --mjpeg --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
-    printf("  %s --realtime --mjpeg --max-frames 300 --save-video\n", program_name);
-    printf("  %s --realtime --mjpeg --mjpeg-ip 192.168.4.1 --display\n", program_name);
-    printf("  %s --realtime --mjpeg --udp-stream udp://192.168.1.100:1234\n", program_name);
-    printf("  %s --realtime --uart-A /dev/ttyS0 --uart-C /dev/ttyS1 --baudrate 3000000\n", program_name);
+    printf("  # Offline video processing:\n");
     printf("  %s --video_path test.mp4 --save_frame_interval 1\n", program_name);
-    printf("  %s --video_path test.mp4 --max_frames 100\n", program_name);
+    printf("  %s --video_path test.mp4 --max-frames 100\n", program_name);
 }
 
 int main(int argc, char* argv[]) {
@@ -84,7 +84,6 @@ int main(int argc, char* argv[]) {
     const char* uart_a = "/dev/ttyS0";
     const char* uart_c = "/dev/ttyS1";
     const char* camera_dev = "/dev/video0";
-    int max_frames = 0;
     int save_frame_interval = 0;  /* 0 = use config value */
     int baudrate = 3000000;
     bool realtime_mode = false;
@@ -116,7 +115,7 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--output_path") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--max_frames") == 0 && i + 1 < argc) {
-            max_frames = atoi(argv[++i]);
+            cli_max_frames = atoi(argv[++i]);  /* also accept underscore variant */
         } else if (strcmp(argv[i], "--save_frame_interval") == 0 && i + 1 < argc) {
             save_frame_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -181,7 +180,7 @@ int main(int argc, char* argv[]) {
         log_info("Mode: OFFLINE");
         log_info("Video: %s", video_path);
         log_info("Output: %s", output_path);
-        log_info("Max frames: %d", max_frames);
+        log_info("Max frames: %d", cli_max_frames);
         log_info("Save interval: %d", save_frame_interval);
     }
     log_info("Config: %s", config_path ? config_path : "defaults");
@@ -245,62 +244,21 @@ int main(int argc, char* argv[]) {
     }
 
     if (realtime_mode) {
-        sc->running = true;
-#ifdef HAS_K1_PIPELINE
-        K1Platform* plat = k1_platform_init();
-        if (plat && k1_platform_is_k1()) {
-            log_info("K1 dual-cluster pipeline mode activated");
-            SystemStatus status = system_controller_process_realtime_k1(
-                sc, uart_a, uart_c, baudrate);
-
-            log_info("============================================================");
-            log_info("K1 Pipeline Session Complete");
-            log_info("============================================================");
-            log_info("Frames processed: %d", status.frame_count);
-            log_info("Average FPS: %.1f", status.fps);
-            log_info("Average proc time: %.1fms", status.processing_time_ms);
-            log_info("Message: %s", status.message);
-            log_info("============================================================");
-        } else
-#endif
-        {
-#ifdef PLATFORM_MUSE_PI_PRO
-            SystemStatus status = system_controller_process_realtime(
-                sc, uart_a, uart_c, baudrate);
-
-            log_info("============================================================");
-            log_info("Realtime Session Complete");
-            log_info("============================================================");
-            log_info("Frames processed: %d", status.frame_count);
-            log_info("Average FPS: %.1f", status.fps);
-            log_info("Average proc time: %.1fms", status.processing_time_ms);
-            log_info("Message: %s", status.message);
-            log_info("============================================================");
-#else
-            log_warning("============================================================");
-            log_warning("REALTIME mode requires SpacemiT K1 Muse Pi Pro hardware!");
-            log_warning("  - V4L2 camera (/dev/video0)");
-            log_warning("  - Arrow UART links (/dev/ttyS0, /dev/ttyS1)");
-            log_warning("  - SpacemiT K1 X60 SoC (RISC-V AI CPU, 2.0 TOPS)");
-            log_warning("Falling back to offline mode with video file.");
-            log_warning("============================================================");
-
-            SystemStatus status = system_controller_process_video(
-                sc, video_path, output_path, max_frames, false, save_frame_interval);
-
-            log_info("============================================================");
-            log_info("Offline Processing Complete");
-            log_info("============================================================");
-            log_info("Frames processed: %d", status.frame_count);
-            log_info("Average FPS: %.1f", status.fps);
-            log_info("Average proc time: %.1fms", status.processing_time_ms);
-            log_info("Message: %s", status.message);
-            log_info("============================================================");
-#endif
-        }
+        sc->running = 1;
+        log_info("K1 dual-cluster pipeline mode activated");
+        SystemStatus status = system_controller_process_realtime_k1(
+            sc, uart_a, uart_c, baudrate);
+        log_info("============================================================");
+        log_info("K1 Pipeline Session Complete");
+        log_info("============================================================");
+        log_info("Frames processed: %d", status.frame_count);
+        log_info("Average FPS: %.1f", status.fps);
+        log_info("Average proc time: %.1fms", status.processing_time_ms);
+        log_info("Message: %s", status.message);
+        log_info("============================================================");
     } else {
         SystemStatus status = system_controller_process_video(
-            sc, video_path, output_path, max_frames, false, save_frame_interval);
+            sc, video_path, output_path, cli_max_frames, false, save_frame_interval);
 
         log_info("============================================================");
         log_info("Offline Processing Complete");

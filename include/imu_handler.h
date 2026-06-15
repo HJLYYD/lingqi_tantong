@@ -2,6 +2,7 @@
 #define IMU_HANDLER_H
 
 #include "core_types.h"
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,11 @@ typedef struct {
     IMUData buffer[IMU_MAX_WINDOW_SIZE];
     int buffer_count;
     bool is_calibrated;
+
+    /* ── Thread-safe external pose ──
+     * Written by Capture thread (Arrow/MJPEG IMU), read by PostProcess thread.
+     * Mutex protects against torn reads of the 11-field struct. */
+    pthread_mutex_t pose_mutex;
     IMUExternalPose latest_pose;
     bool has_external_pose;
 } IMUHandler;

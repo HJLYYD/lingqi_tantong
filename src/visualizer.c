@@ -409,6 +409,21 @@ int visualizer_render_detection_view(Visualizer* vis,
         }
     }
 
+    /* Per-30-frames rendering stats */
+    {
+        static int vis_cnt = 0;
+        vis_cnt++;
+        if (vis_cnt % 30 == 0) {
+            int boxes = 0, skels = 0, labels = num_objects;
+            for (int i = 0; i < num_objects; i++) {
+                boxes++;
+                if (objects[i].has_pose) skels++;
+            }
+            log_info("[Vis] frame#%d | %d objects | boxes=%d skeletons=%d labels=%d",
+                     vis_cnt, num_objects, boxes, skels, labels);
+        }
+    }
+
     if (vis->show_info_bar) {
         for (int y = 0; y < VIS_INFO_BAR_HEIGHT && y < height; y++) {
             for (int x = 0; x < width; x++) {

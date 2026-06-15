@@ -645,38 +645,6 @@ int video_processor_get_height(const VideoProcessor* vp) {
     return vp ? (vp->target_height > 0 ? vp->target_height : vp->original_height) : 0;
 }
 
-int video_processor_save_frame(const VideoProcessor* vp, const FrameData* frame, const char* output_path, int quality) {
-    (void)quality;
-    if (!vp || !frame || !output_path) return -1;
-
-    int ret = utils_write_bmp(output_path, frame->data, frame->width, frame->height);
-    if (ret == 0) {
-        log_debug("Frame saved: %s", output_path);
-    }
-    return ret;
-}
-
-int video_processor_save_video(const VideoProcessor* vp, const char* output_path, int width, int height, float fps,
-                               const char* codec_name, int bitrate) {
-    (void)vp;
-    (void)output_path;
-    (void)width;
-    (void)height;
-    (void)fps;
-    (void)codec_name;
-    (void)bitrate;
-
-    log_info("Video output: %s (%dx%d @ %.1f FPS, %s, %d kbps)",
-             output_path, width, height, fps, codec_name, bitrate);
-    return 0;
-}
-
-int video_processor_write_frame(const VideoProcessor* vp, const uint8_t* frame_data) {
-    (void)vp;
-    (void)frame_data;
-    return 0;
-}
-
 VideoProcessor* video_processor_create_from_camera(const char* device_path, int width, int height, float fps, const char* camera_format) {
     VideoProcessor* vp = (VideoProcessor*)calloc(1, sizeof(VideoProcessor));
     if (!vp) return NULL;
@@ -723,29 +691,6 @@ VideoProcessor* video_processor_create_from_camera(const char* device_path, int 
     free(vp);
     return NULL;
 #endif
-
-    return vp;
-}
-
-VideoProcessor* video_processor_create_from_arrow(void) {
-    VideoProcessor* vp = (VideoProcessor*)calloc(1, sizeof(VideoProcessor));
-    if (!vp) return NULL;
-
-    vp->target_width = 640;
-    vp->target_height = 480;
-    vp->normalize = false;
-    vp->is_opened = true;
-    vp->fps = 15.0f;
-    vp->buffer_size = (size_t)640 * 480 * 3;
-    vp->frame_buffer = (uint8_t*)malloc(vp->buffer_size);
-    if (!vp->frame_buffer) {
-        free(vp);
-        return NULL;
-    }
-    vp->source_type = VP_SOURCE_ARROW;
-    strncpy(vp->input_path, "arrow:uart", MAX_PATH_LEN - 1);
-
-    log_info("Arrow UART source created");
 
     return vp;
 }

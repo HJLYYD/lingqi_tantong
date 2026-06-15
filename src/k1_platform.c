@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -32,21 +31,13 @@ static void detect_k1_capabilities(K1Platform* plat) {
     plat->tcm_size = 0;
     plat->cpu_count = K1_CPU_CORES;
 
-#ifdef PLATFORM_MUSE_PI_PRO
     plat->is_k1 = true;
     plat->cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (plat->cpu_count <= 0) plat->cpu_count = K1_CPU_CORES;
     if (plat->cpu_count > K1_CPU_CORES) plat->cpu_count = K1_CPU_CORES;
 
     plat->capabilities |= K1_CAP_RVV_1_0;
-
-#ifdef HAS_SPACEMIT_EP
     plat->capabilities |= K1_CAP_SPACEMIT_EP;
-#endif
-
-#ifdef HAS_SPACENGINE_AI
-    plat->capabilities |= K1_CAP_SPACENGINE | K1_CAP_AI_IME;
-#endif
 
     int tcm_fd = open("/dev/tcm", O_RDWR);
     if (tcm_fd >= 0) {
@@ -76,14 +67,6 @@ static void detect_k1_capabilities(K1Platform* plat) {
     if (access("/dev/dri/renderD128", F_OK) == 0) {
         plat->capabilities |= K1_CAP_GPU;
     }
-
-#else
-    plat->is_k1 = false;
-    plat->capabilities = 0;
-    plat->tcm_size = 0;
-    plat->cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (plat->cpu_count <= 0) plat->cpu_count = 4;
-#endif
 }
 
 K1Platform* k1_platform_init(void) {

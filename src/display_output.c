@@ -13,6 +13,10 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/mman.h>
+
+#ifdef HAS_SDL2
+#include "display_sdl2.h"
+#endif
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 
@@ -384,12 +388,52 @@ static int ffmpeg_write(DisplayFFmpeg* ff, const uint8_t* data, size_t size) {
  *  Per-channel writer threads
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/* ── SDL2 desktop-window writer (replaces fbdev when desktop is active) ── */
+
+#ifdef HAS_SDL2
+static void* sdl2_writer_thread(void* arg) {
+    DisplayOutput* d = (DisplayOutput*)arg;
+    int last_frame = -1;
+    int frame_count = 0;
+
+    log_info("[Display] SDL2 window thread started");
+
+    while (d->running && sdl2_display_is_running()) {
+        uint8_t* data = NULL;
+        size_t   size = 0;
+
+        pthread_mutex_lock(&d->ring_mutex);
+        int rc = ring_consume_latest(d, &last_frame, &data, &size);
+        pthread_mutex_unlock(&d->ring_mutex);
+
+        if (rc == 0 && data) {
+            sdl2_display_frame(data, d->width, d->height);
+            frame_count++;
+            if (frame_count % 30 == 0) {
+                log_info("[Display] SDL2: rendered %d frames | %dx%d",
+                         frame_count, d->width, d->height);
+            }
+        } else {
+            SDL_Delay(10);  /* no new frame — keep event loop alive */
+        }
+    }
+
+    log_info("[Display] SDL2 window exiting (%d frames)", frame_count);
+    sdl2_display_close();
+    return NULL;
+}
+#endif /* HAS_SDL2 */
+
+/* ── Raw framebuffer (/dev/fb0) fallback writer ── */
+
 static void* fb_writer_thread(void* arg) {
     DisplayOutput* d = (DisplayOutput*)arg;
     int last_frame = -1;
     int frame_count = 0;
 
     log_info("[Display] Framebuffer writer thread started");
+    log_info("[Display] fb: output %dx%d → framebuffer %dx%d",
+             d->width, d->height, d->fb.fb_width, d->fb.fb_height);
 
     while (d->running) {
         uint8_t* data = NULL;
@@ -402,6 +446,13 @@ static void* fb_writer_thread(void* arg) {
         if (rc == 0 && data) {
             fb_blit(d, data);
             frame_count++;
+            if (frame_count % 30 == 0) {
+                int offset_x = (d->fb.fb_width  > d->width)  ? (d->fb.fb_width  - d->width)  / 2 : 0;
+                int offset_y = (d->fb.fb_height > d->height) ? (d->fb.fb_height - d->height) / 2 : 0;
+                log_info("[Display] fb: wrote %d frames | %dx%d→%dx%d offset=(%d,%d)",
+                         frame_count, d->width, d->height,
+                         d->fb.fb_width, d->fb.fb_height, offset_x, offset_y);
+            }
         } else {
             /* No new frame — short sleep to avoid busy-waiting */
             struct timespec ts = {0, 16666667L};  /* ~16ms (~60 Hz max) */
@@ -497,6 +548,7 @@ DisplayOutput* display_output_create(int width, int height, float fps,
     d->channel_mask = channels;
     d->running = true;
     d->shutdown = false;
+    d->fb.fd = -1;  /* avoid close(0) when SDL2 is active (fd=0 from calloc) */
 
     size_t frame_bytes = (size_t)width * height * 3;
     ring_init(d, frame_bytes);
@@ -504,13 +556,37 @@ DisplayOutput* display_output_create(int width, int height, float fps,
     pthread_mutex_init(&d->ring_mutex, NULL);
     pthread_cond_init(&d->data_cond, NULL);
 
-    /* ── Framebuffer channel ── */
+    /* ── Display channel: prefer SDL2 desktop window, fallback to fbdev ── */
     if (channels & DISPLAY_CHANNEL_FRAMEBUFFER) {
-        if (fb_open(d, fb_path)) {
+        bool display_ok = false;
+
+#ifdef HAS_SDL2
+        /* Try SDL2 first — creates a window on top of the desktop */
+        if (sdl2_display_init(width, height)) {
+            if (pthread_create(&d->fb_thread, NULL, sdl2_writer_thread, d) == 0) {
+                d->fb_thread_active = true;
+                display_ok = true;
+                log_info("[Display] Using SDL2 window (desktop visible)");
+            } else {
+                log_warning("[Display] SDL2 thread creation failed, falling back");
+                sdl2_display_close();
+            }
+        }
+#endif
+
+        if (!display_ok && fb_open(d, fb_path)) {
             pthread_create(&d->fb_thread, NULL, fb_writer_thread, d);
             d->fb_thread_active = true;
-        } else {
-            log_warning("[Display] Framebuffer unavailable — disabling");
+            display_ok = true;
+            if (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) {
+                log_warning("[Display] Desktop detected — fbdev writes may be "
+                            "hidden behind compositor. Install SDL2 for desktop window: "
+                            "sudo apt install libsdl2-dev && rebuild");
+            }
+        }
+
+        if (!display_ok) {
+            log_warning("[Display] No display backend available — disabling");
             d->channel_mask &= ~DISPLAY_CHANNEL_FRAMEBUFFER;
         }
     }

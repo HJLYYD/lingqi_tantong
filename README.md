@@ -1561,7 +1561,7 @@ lingqi_tantong_c/
 | `ENABLE_K1_TCM` | `ON` | Enable K1 TCM tightly-coupled memory (weight preloading) |
 | `ENABLE_K1_VPU` | `ON` | Enable K1 VPU hardware video acceleration |
 | `ENABLE_K1_JPU` | `ON` | Enable K1 JPU hardware JPEG decoding |
-| `MUSE_PI_ARCH` | `rv64gcv0p7` | RISC-V target architecture |
+| `MUSE_PI_ARCH` | `rv64gcv1p0` | RISC-V target architecture (GCC 14+ → `-mcpu=spacemit-x60`, legacy GCC 13 → `-march=rv64gcv`) |
 | `SPACENGINE_DIR` | — | Spacengine AI acceleration SDK path |
 | `K1_MPP_DIR` | — | K1 MPP media processing SDK path |
 | `K1_JPU_DIR` | — | K1 JPU hardware decoding library path |
