@@ -140,11 +140,17 @@ static int ring_consume_latest(DisplayOutput* d, int* last_seen_frame,
 static bool fb_open(DisplayOutput* d, const char* fb_path) {
     if (!fb_path || fb_path[0] == '\0') return false;
 
-    d->fb.fd = open(fb_path, O_RDWR);
+    /* O_NONBLOCK prevents hanging on DRM/KMS drivers that wait for
+     * a physical display to be connected before completing open(). */
+    d->fb.fd = open(fb_path, O_RDWR | O_NONBLOCK);
     if (d->fb.fd < 0) {
         log_warning("[Display] Cannot open framebuffer %s: %s", fb_path, strerror(errno));
         return false;
     }
+
+    /* Clear O_NONBLOCK for normal read/write operations */
+    int flags = fcntl(d->fb.fd, F_GETFL, 0);
+    fcntl(d->fb.fd, F_SETFL, flags & ~O_NONBLOCK);
 
     struct fb_var_screeninfo vinfo;
     struct fb_fix_screeninfo finfo;
@@ -560,33 +566,43 @@ DisplayOutput* display_output_create(int width, int height, float fps,
     if (channels & DISPLAY_CHANNEL_FRAMEBUFFER) {
         bool display_ok = false;
 
+        /* Detect headless session (SSH only, no desktop).
+         * In a headless session, framebuffer open() can hang the K1 DRM driver
+         * waiting for a display that isn't connected. Skip it proactively. */
+        bool headless = (getenv("DISPLAY") == NULL && getenv("WAYLAND_DISPLAY") == NULL);
+
 #ifdef HAS_SDL2
-        /* Try SDL2 first — creates a window on top of the desktop */
-        if (sdl2_display_init(width, height)) {
-            if (pthread_create(&d->fb_thread, NULL, sdl2_writer_thread, d) == 0) {
-                d->fb_thread_active = true;
-                display_ok = true;
-                log_info("[Display] Using SDL2 window (desktop visible)");
-            } else {
-                log_warning("[Display] SDL2 thread creation failed, falling back");
-                sdl2_display_close();
+        /* Try SDL2 first — needs a real desktop (X11/Wayland) */
+        if (!headless) {
+            log_info("[Display] Desktop detected, trying SDL2...");
+            if (sdl2_display_init(width, height)) {
+                if (pthread_create(&d->fb_thread, NULL, sdl2_writer_thread, d) == 0) {
+                    d->fb_thread_active = true;
+                    display_ok = true;
+                    log_info("[Display] Using SDL2 window (desktop visible)");
+                } else {
+                    log_warning("[Display] SDL2 thread creation failed, falling back");
+                    sdl2_display_close();
+                }
             }
         }
 #endif
 
+        /* fbdev fallback: use O_NONBLOCK to avoid hanging on DRM drivers
+         * that wait indefinitely for a physical display connection. */
         if (!display_ok && fb_open(d, fb_path)) {
             pthread_create(&d->fb_thread, NULL, fb_writer_thread, d);
             d->fb_thread_active = true;
             display_ok = true;
-            if (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY")) {
-                log_warning("[Display] Desktop detected — fbdev writes may be "
-                            "hidden behind compositor. Install SDL2 for desktop window: "
-                            "sudo apt install libsdl2-dev && rebuild");
-            }
         }
 
         if (!display_ok) {
-            log_warning("[Display] No display backend available — disabling");
+            if (headless) {
+                log_info("[Display] Headless SSH session — display output disabled "
+                         "(set DISPLAY=:0 or connect a monitor for fbdev)");
+            } else {
+                log_warning("[Display] No display backend available — disabling");
+            }
             d->channel_mask &= ~DISPLAY_CHANNEL_FRAMEBUFFER;
         }
     }

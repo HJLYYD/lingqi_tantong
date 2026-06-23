@@ -286,6 +286,21 @@ use_cpu:  /* fallthrough label for EP skip */
     st_opt = g_ort_api->SetInterOpNumThreads(session_opts, inter);
     if (st_opt) g_ort_api->ReleaseStatus(st_opt);
 
+    /* ── Embedded memory optimization ──
+     * Per ONNX Runtime embedded best-practices (GitHub #22763):
+     *   - Disable CPU memory arena: saves ~50% peak memory on embedded,
+     *     critical when K1 TCM is only 512KB total across all EP sessions.
+     *     MemoryPattern cache still works for fixed-shape inputs (this project).
+     *   - ORT_SEQUENTIAL: linear pipeline, no parallel-op branches to exploit.
+     *   - Disable thread spinning: saves power on battery-constrained embedded. */
+    st_opt = g_ort_api->DisableCpuMemArena(session_opts);
+    if (st_opt) g_ort_api->ReleaseStatus(st_opt);
+    st_opt = g_ort_api->SetSessionExecutionMode(session_opts, ORT_SEQUENTIAL);
+    if (st_opt) g_ort_api->ReleaseStatus(st_opt);
+    st_opt = g_ort_api->AddSessionConfigEntry(session_opts,
+        "session.intra_op.allow_spinning", "0");
+    if (st_opt) g_ort_api->ReleaseStatus(st_opt);
+
     bool ep_registered = false;
 #ifdef HAS_SPACEMIT_EP
     if (want_ep) {
@@ -352,6 +367,14 @@ use_cpu:  /* fallthrough label for EP skip */
             st_c = g_ort_api->SetIntraOpNumThreads(cpu_opts, cpu_intra);
             if (st_c) g_ort_api->ReleaseStatus(st_c);
             st_c = g_ort_api->SetInterOpNumThreads(cpu_opts, cpu_inter);
+            if (st_c) g_ort_api->ReleaseStatus(st_c);
+            /* Embedded memory config for CPU fallback too */
+            st_c = g_ort_api->DisableCpuMemArena(cpu_opts);
+            if (st_c) g_ort_api->ReleaseStatus(st_c);
+            st_c = g_ort_api->SetSessionExecutionMode(cpu_opts, ORT_SEQUENTIAL);
+            if (st_c) g_ort_api->ReleaseStatus(st_c);
+            st_c = g_ort_api->AddSessionConfigEntry(cpu_opts,
+                "session.intra_op.allow_spinning", "0");
             if (st_c) g_ort_api->ReleaseStatus(st_c);
 
             OrtStatus* st_cs = g_ort_api->CreateSession(g_ort_env, model_path, cpu_opts, &session);

@@ -26,11 +26,26 @@ typedef struct OrtInferenceContext {
     bool format_cached;
     int num_groups;
     int group_indices[3][3];
+
+    /* ── Preprocessing buffer pool ──
+     * Pre-allocated to avoid per-frame malloc/free in the hot path.
+     * padded_buf holds the letterbox-resized RGB image (HWC layout).
+     * crop_buf holds the cropped image when aspect ratio differs significantly. */
+    uint8_t* preproc_padded_buf;
+    size_t   preproc_padded_buf_size;
+    uint8_t* preproc_crop_buf;
+    size_t   preproc_crop_buf_size;
 } OrtInferenceContext;
 
 OrtInferenceContext* ort_ctx_create(OrtSession* session, int input_w, int input_h, int input_c);
 void ort_ctx_destroy(OrtInferenceContext* ctx);
 bool ort_ctx_prepare_input(OrtInferenceContext* ctx, const float* data, size_t bytes);
+/*
+ * Mark input tensor as ready — the caller has already written preprocessed
+ * data directly into ctx->input_tensor (e.g. via yolo_preprocess_pooled).
+ * Skips the memcpy that ort_ctx_prepare_input would do.
+ */
+bool ort_ctx_input_ready(OrtInferenceContext* ctx, size_t bytes);
 int ort_ctx_run(OrtInferenceContext* ctx, OrtValue** output_vals);
 void ort_ctx_release_outputs(OrtInferenceContext* ctx, OrtValue** output_vals, size_t count);
 int ort_ctx_get_output_shape(OrtInferenceContext* ctx, OrtValue* val, int64_t* dims, int max_dims);

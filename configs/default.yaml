@@ -38,38 +38,15 @@ video:
   output_path: "output/result.mp4"
   save_frame_interval: 1
 
-arrow:
-  uart_device_A: "/dev/ttyS0"
-  uart_device_C: "/dev/ttyS1"
-  baudrate: 3000000
-  data_bits: 8
-  stop_bits: 1
-  parity: none
-  enable_fec: false
-  dual_link: true
-  reconnect_max_delay_s: 16
-  reconnect_initial_delay_s: 1
-  frame_timeout_s: 10              # auto-exit after N seconds of no frames in realtime mode
-
-mjpeg:
-  # WiFi MJPEG HTTP receiver for ESP32 camera (test-ov-imu.ino).
-  # Enables receiving JPEG frames over WiFi HTTP instead of Arrow UART.
-  # Enable via --mjpeg CLI flag
-  enabled: false
-  # ESP32 WiFi AP IP
+coap:
+  # CoAP/UDP receiver for ESP32 camera (ov-imu-pwm.ino + coap_server.h).
+  # Protocol: CoAP/UDP port 5683, Block2 streaming JPEG, separate /imu polling @ 1Hz.
+  enabled: true
   esp_ip: "192.168.4.1"
-  # HTTP port
-  esp_port: 80
-  # ESP32 AP SSID (leave empty if pre-configured externally)
+  esp_port: 5683
   wifi_ssid: "ESP32-Camera-AP"
-  # ESP32 AP password
   wifi_password: "12345678"
-  # IMU data is embedded inline in MJPEG stream (Python test-ov-imu.py style)
-  # ESP32 sends {"ax":...,"ay":...,"az":...,"gx":...,"gy":...,"gz":...} before each JPEG
-  imu_enabled: true
-  # IMU data arrives with each MJPEG frame (no separate polling needed)
-  # Exponential backoff cap in seconds
-  reconnect_max_delay_s: 16
+  frame_timeout_s: 10              # auto-exit after N seconds of no frames in realtime mode
 
 detection:
   # SECONDARY person detector — DISABLED in unified mode.
@@ -195,7 +172,7 @@ spatial:
   depth_min_keypoint_conf: 0.25  # minimum per-keypoint confidence for depth sampling
 
 imu:
-  source: arrow_uart
+  source: coap_udp
   sensor: external
   gps_source: none
   mag_declination: -5.5

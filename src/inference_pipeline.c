@@ -231,7 +231,6 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         pipeline->fallback_area_ratio_min = config_get_float(config, "detection.fallback_area_ratio_min", FILTER_FALLBACK_AREA_RATIO_MIN);
         pipeline->cascade_secondary_interval = config_get_int(config, "detection.cascade_secondary_interval", 5);
         pipeline->action_inference_interval = config_get_int(config, "action.inference_interval", 10);
-        pipeline->action_inference_interval = config ? config_get_int(config, "action.inference_interval", 10) : 10;
 
         log_info("Cascade: enabled=%d validation_interval=%d secondary_interval=%d tracking_res=%dx%d",
                  pipeline->cascade_enabled, pipeline->cascade_validation_interval,
@@ -408,25 +407,15 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
         output[filtered++] = *det;
     }
 
-    if (filtered > 0) {
-        utils_sort_detections_by_confidence(output, filtered);
+    /*
+     * Detections from YOLOv8-Pose already passed OKS-NMS inside
+     * yolov8_pose_estimator_estimate().  We skip pipeline-level NMS
+     * here to avoid redundant O(k²) processing — sort by confidence
+     * and apply the output cap only.
+     */
 
-        bool* suppressed = (bool*)calloc(filtered, sizeof(bool));
-        if (suppressed) {
-            int keep = 0;
-            for (int i = 0; i < filtered; i++) {
-                if (suppressed[i]) continue;
-                output[keep++] = output[i];
-                for (int j = i + 1; j < filtered; j++) {
-                    if (suppressed[j]) continue;
-                    if (bbox_iou(&output[i].bbox, &output[j].bbox) > PERSON_NMS_IOU_THRESHOLD) {
-                        suppressed[j] = true;
-                    }
-                }
-            }
-            filtered = keep;
-            free(suppressed);
-        }
+    if (filtered > 1) {
+        utils_sort_detections_by_confidence(output, filtered);
     }
 
     if (filtered > MAX_FILTERED_DETECTIONS) {
@@ -599,12 +588,11 @@ static void cascade_update_state(AIInferencePipeline* pipeline, int confirmed_tr
     }
 }
 
-InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
-                                                  const uint8_t* frame_data, int width, int height) {
-    InferenceResult result;
-    inference_result_init(&result);
-
-    if (!pipeline || !frame_data) return result;
+int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
+                                     const uint8_t* frame_data, int width, int height,
+                                     InferenceResult* out_result) {
+    if (!pipeline || !frame_data || !out_result) return -1;
+    inference_result_init(out_result);
 
     int64_t start_time = utils_get_time_ms();
     pipeline->frame_counter++;
@@ -639,27 +627,27 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
          * resize happens during preprocessing anyway.  The key saving comes
          * from SKIPPING the YOLO11n secondary model entirely.
          */
-        result.num_poses = estimate_poses_fullframe(pipeline->pose_estimator,
+        out_result->num_poses = estimate_poses_fullframe(pipeline->pose_estimator,
                                                      frame_data, width, height,
-                                                     result.poses, MAX_POSES_PER_FRAME);
+                                                     out_result->poses, MAX_POSES_PER_FRAME);
         /* Convert pose bboxes to detections for tracking */
         Detection pose_dets[MAX_POSES_PER_FRAME];
-        int num_pose_dets = poses_to_detections(result.poses, result.num_poses,
+        int num_pose_dets = poses_to_detections(out_result->poses, out_result->num_poses,
                                                  pose_dets, MAX_POSES_PER_FRAME);
 
         /* Filter pose detections with keypoint validation */
         Detection filtered_pose[MAX_POSES_PER_FRAME];
         int num_pose_filt = filter_detections(pose_dets, num_pose_dets, width, height,
                                                filtered_pose, MAX_POSES_PER_FRAME,
-                                               result.poses, result.num_poses,
+                                               out_result->poses, out_result->num_poses,
                                                pipeline->keypoint_validator,
                                                pipeline->keypoint_filter_enabled,
                                                pipeline->fallback_conf_threshold,
                                                pipeline->fallback_area_ratio_min);
 
         /* Pose detections (keypoint-validated by filter above) → final detections */
-        result.num_detections = num_pose_filt;
-        memcpy(result.detections, filtered_pose, (size_t)result.num_detections * sizeof(Detection));
+        out_result->num_detections = num_pose_filt;
+        memcpy(out_result->detections, filtered_pose, (size_t)out_result->num_detections * sizeof(Detection));
     }
 
     /* ── Cascade state update (after detection, before face/action) ──
@@ -670,7 +658,7 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
         int ctc = pipeline->confirmed_track_count;
         int ttc = pipeline->total_track_count;
         cascade_update_state(pipeline, ctc,
-                            result.num_detections, (ttc > 0 ? ttc : result.num_detections));
+                            out_result->num_detections, (ttc > 0 ? ttc : out_result->num_detections));
     }
 
     /* ── Step 3: Face detection (SUPPLEMENT, reduced frequency) ──
@@ -679,44 +667,44 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_FACE) && pipeline->face_detector) {
         int face_interval;
         if (pipeline->cascade_state == PIPELINE_CASCADE_TRACKING) {
-            face_interval = (result.num_detections > 0) ? 30 : 120;
+            face_interval = (out_result->num_detections > 0) ? 30 : 120;
         } else {
-            face_interval = (result.num_detections > 0) ? 10 : 120;
+            face_interval = (out_result->num_detections > 0) ? 10 : 120;
         }
         if (pipeline->frame_counter % face_interval == 0) {
-            result.num_faces = detect_faces(pipeline->face_detector, pipeline->face_recognizer,
+            out_result->num_faces = detect_faces(pipeline->face_detector, pipeline->face_recognizer,
                                              frame_data, width, height,
-                                             result.detections, result.num_detections,
-                                             result.faces, MAX_FACES_PER_FRAME);
+                                             out_result->detections, out_result->num_detections,
+                                             out_result->faces, MAX_FACES_PER_FRAME);
         }
     }
 
     /* ── Step 4: Action recognition from pose keypoints ── */
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_ACTION) && pipeline->action_recognizer
-        && result.num_poses > 0) {
-        for (int p = 0; p < result.num_poses; p++) {
-            stgcn_action_recognizer_push_pose(pipeline->action_recognizer, &result.poses[p], width, height);
+        && out_result->num_poses > 0) {
+        for (int p = 0; p < out_result->num_poses; p++) {
+            stgcn_action_recognizer_push_pose(pipeline->action_recognizer, &out_result->poses[p], width, height);
         }
         if (pipeline->frame_counter % pipeline->action_inference_interval == 0) {
-            result.action = stgcn_action_recognizer_recognize(pipeline->action_recognizer);
-            result.has_action = (result.action.num_actions > 0);
+            out_result->action = stgcn_action_recognizer_recognize(pipeline->action_recognizer);
+            out_result->has_action = (out_result->action.num_actions > 0);
         }
     }
 
-    result.processing_time_ms = (float)(utils_get_time_ms() - start_time);
+    out_result->processing_time_ms = (float)(utils_get_time_ms() - start_time);
 
     /* Per-frame timing and periodic summary */
     {
         static int64_t cum_ms = 0;
         static int cum_frames = 0;
-        cum_ms += (int64_t)result.processing_time_ms;
+        cum_ms += (int64_t)out_result->processing_time_ms;
         cum_frames++;
 
         log_debug("Frame %d [%s]: %.0f ms | poses=%d dets=%d faces=%d",
                   pipeline->frame_counter,
                   run_full_res ? "FULL" : "TRACK",
-                  result.processing_time_ms,
-                  result.num_poses, result.num_detections, result.num_faces);
+                  out_result->processing_time_ms,
+                  out_result->num_poses, out_result->num_detections, out_result->num_faces);
 
         if (pipeline->frame_counter % 30 == 0 && cum_frames > 0) {
             float avg = (float)cum_ms / (float)cum_frames;
@@ -725,13 +713,13 @@ InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                      cum_frames,
                      pipeline->cascade_state == PIPELINE_CASCADE_TRACKING ? "TRACK" : "FULL",
                      avg, 1000.0f / (avg > 0 ? avg : 1.0f),
-                     result.num_poses, result.num_detections, result.num_faces);
+                     out_result->num_poses, out_result->num_detections, out_result->num_faces);
             cum_ms = 0;
             cum_frames = 0;
         }
     }
 
-    return result;
+    return 0;
 }
 
 void inference_pipeline_configure(AIInferencePipeline* pipeline, uint32_t stages) {

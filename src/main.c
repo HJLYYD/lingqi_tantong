@@ -48,9 +48,6 @@ static void print_usage(const char* program_name) {
     printf("  --save_frame_interval <N>   Save frame every N frames (default: 10)\n");
     printf("  --config <path>             Configuration YAML file\n");
     printf("  --realtime                  Real-time pipeline mode (Muse Pi Pro)\n");
-    printf("  --uart-A <path>             Arrow UART device A (default: /dev/ttyS0)\n");
-    printf("  --uart-C <path>             Arrow UART device C (default: /dev/ttyS1)\n");
-    printf("  --baudrate <rate>           UART baudrate (default: 3000000)\n");
     printf("  --camera <path>             Camera device (default: /dev/video0)\n");
     printf("  --display                   Enable framebuffer display (/dev/fb0)\n");
     printf("  --display-device <path>     Framebuffer device (default: /dev/fb0)\n");
@@ -59,19 +56,16 @@ static void print_usage(const char* program_name) {
     printf("  --rtmp <url>                RTMP streaming\n");
     printf("  --save-video                Save output to MP4 video file\n");
     printf("  --frame-timeout <S>         Auto-exit after S seconds of no frames (default: 10)\n");
-    printf("  --mjpeg                     Enable MJPEG HTTP receiver (ESP32 WiFi)\n");
-    printf("  --mjpeg-ip <ip>             ESP32 IP address (default: 192.168.4.1)\n");
-    printf("  --mjpeg-port <port>         ESP32 HTTP port (default: 80)\n");
+    printf("  --coap                      Enable CoAP/UDP receiver (ESP32 WiFi)\n");
+    printf("  --coap-ip <ip>              ESP32 IP address (default: 192.168.4.1)\n");
+    printf("  --coap-port <port>          CoAP/UDP port (default: 5683)\n");
     printf("  --wifi-ssid <ssid>          WiFi SSID to connect (default: ESP32-Camera-AP)\n");
     printf("  --wifi-password <pw>        WiFi password (default: 12345678)\n");
     printf("  --help                      Show this help\n");
     printf("\nExamples:\n");
-    printf("  # Arrow UART dual-link (primary path):\n");
-    printf("  %s --realtime\n", program_name);
-    printf("  %s --realtime --uart-A /dev/ttyS0 --uart-C /dev/ttyS1 --baudrate 3000000\n", program_name);
-    printf("  # MJPEG WiFi receiver (ESP32 camera):\n");
-    printf("  %s --realtime --mjpeg --display\n", program_name);
-    printf("  %s --realtime --mjpeg --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
+    printf("  # CoAP/UDP WiFi receiver (ESP32 camera):\n");
+    printf("  %s --realtime --coap --display\n", program_name);
+    printf("  %s --realtime --coap --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
     printf("  # Offline video processing:\n");
     printf("  %s --video_path test.mp4 --save_frame_interval 1\n", program_name);
     printf("  %s --video_path test.mp4 --max-frames 100\n", program_name);
@@ -81,11 +75,8 @@ int main(int argc, char* argv[]) {
     const char* video_path = "test.mp4";
     const char* output_path = "output/results";
     const char* config_path = "configs/default.yaml";
-    const char* uart_a = "/dev/ttyS0";
-    const char* uart_c = "/dev/ttyS1";
     const char* camera_dev = "/dev/video0";
     int save_frame_interval = 0;  /* 0 = use config value */
-    int baudrate = 3000000;
     bool realtime_mode = false;
 
     /* Display / streaming options (override config) */
@@ -97,10 +88,10 @@ int main(int argc, char* argv[]) {
     int cli_max_frames = 0;
     int cli_frame_timeout = 0;
 
-    /* MJPEG receiver CLI overrides */
-    bool cli_mjpeg_enabled = false;
-    const char* cli_mjpeg_ip = NULL;
-    int  cli_mjpeg_port = 0;
+    /* CoAP receiver CLI overrides */
+    bool cli_coap_enabled = false;
+    const char* cli_coap_ip = NULL;
+    int  cli_coap_port = 0;
     const char* cli_wifi_ssid = NULL;
     const char* cli_wifi_password = NULL;
 
@@ -120,12 +111,6 @@ int main(int argc, char* argv[]) {
             save_frame_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
-        } else if (strcmp(argv[i], "--uart-A") == 0 && i + 1 < argc) {
-            uart_a = argv[++i];
-        } else if (strcmp(argv[i], "--uart-C") == 0 && i + 1 < argc) {
-            uart_c = argv[++i];
-        } else if (strcmp(argv[i], "--baudrate") == 0 && i + 1 < argc) {
-            baudrate = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
             camera_dev = argv[++i];
         } else if (strcmp(argv[i], "--display") == 0) {
@@ -147,12 +132,12 @@ int main(int argc, char* argv[]) {
             cli_max_frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frame-timeout") == 0 && i + 1 < argc) {
             cli_frame_timeout = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--mjpeg") == 0) {
-            cli_mjpeg_enabled = true;
-        } else if (strcmp(argv[i], "--mjpeg-ip") == 0 && i + 1 < argc) {
-            cli_mjpeg_ip = argv[++i];
-        } else if (strcmp(argv[i], "--mjpeg-port") == 0 && i + 1 < argc) {
-            cli_mjpeg_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--coap") == 0) {
+            cli_coap_enabled = true;
+        } else if (strcmp(argv[i], "--coap-ip") == 0 && i + 1 < argc) {
+            cli_coap_ip = argv[++i];
+        } else if (strcmp(argv[i], "--coap-port") == 0 && i + 1 < argc) {
+            cli_coap_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--wifi-ssid") == 0 && i + 1 < argc) {
             cli_wifi_ssid = argv[++i];
         } else if (strcmp(argv[i], "--wifi-password") == 0 && i + 1 < argc) {
@@ -173,8 +158,6 @@ int main(int argc, char* argv[]) {
 
     if (realtime_mode) {
         log_info("Mode: REALTIME");
-        log_info("Arrow UART A: %s @ %d bps", uart_a, baudrate);
-        log_info("Arrow UART C: %s", uart_c);
         log_info("Camera: %s", camera_dev);
     } else {
         log_info("Mode: OFFLINE");
@@ -221,33 +204,32 @@ int main(int argc, char* argv[]) {
         sc->frame_timeout_s = cli_frame_timeout;
         log_info("CLI override: frame_timeout = %ds", cli_frame_timeout);
     }
-    if (cli_mjpeg_enabled) {
-        sc->mjpeg_enabled = true;
-        log_info("CLI override: MJPEG receiver enabled");
+    if (cli_coap_enabled) {
+        sc->coap_enabled = true;
+        log_info("CLI override: CoAP receiver enabled");
     }
-    if (cli_mjpeg_ip) {
-        strncpy(sc->mjpeg_esp_ip, cli_mjpeg_ip, sizeof(sc->mjpeg_esp_ip) - 1);
-        sc->mjpeg_enabled = true;
-        log_info("CLI override: MJPEG IP = %s", cli_mjpeg_ip);
+    if (cli_coap_ip) {
+        strncpy(sc->coap_esp_ip, cli_coap_ip, sizeof(sc->coap_esp_ip) - 1);
+        sc->coap_enabled = true;
+        log_info("CLI override: CoAP IP = %s", cli_coap_ip);
     }
-    if (cli_mjpeg_port > 0) {
-        sc->mjpeg_esp_port = cli_mjpeg_port;
-        log_info("CLI override: MJPEG port = %d", cli_mjpeg_port);
+    if (cli_coap_port > 0) {
+        sc->coap_esp_port = cli_coap_port;
+        log_info("CLI override: CoAP port = %d", cli_coap_port);
     }
     if (cli_wifi_ssid) {
-        strncpy(sc->mjpeg_wifi_ssid, cli_wifi_ssid, sizeof(sc->mjpeg_wifi_ssid) - 1);
+        strncpy(sc->coap_wifi_ssid, cli_wifi_ssid, sizeof(sc->coap_wifi_ssid) - 1);
         log_info("CLI override: WiFi SSID = %s", cli_wifi_ssid);
     }
     if (cli_wifi_password) {
-        strncpy(sc->mjpeg_wifi_password, cli_wifi_password, sizeof(sc->mjpeg_wifi_password) - 1);
+        strncpy(sc->coap_wifi_password, cli_wifi_password, sizeof(sc->coap_wifi_password) - 1);
         log_info("CLI override: WiFi password set");
     }
 
     if (realtime_mode) {
         sc->running = 1;
         log_info("K1 dual-cluster pipeline mode activated");
-        SystemStatus status = system_controller_process_realtime_k1(
-            sc, uart_a, uart_c, baudrate);
+        SystemStatus status = system_controller_process_realtime_k1(sc);
         log_info("============================================================");
         log_info("K1 Pipeline Session Complete");
         log_info("============================================================");

@@ -120,6 +120,117 @@ void yolo_preprocess(const uint8_t* image_data, int width, int height,
     free(padded);
 }
 
+/*
+ * Pooled preprocess — zero malloc/free in the hot path.
+ * Writes CHW float tensor directly into ctx->input_tensor, using
+ * ctx->preproc_padded_buf as the intermediate letterbox buffer.
+ *
+ * Falls back to heap allocation if ctx buffers are not pre-allocated
+ * (backward compatible with contexts created before this optimization).
+ */
+int yolo_preprocess_pooled(OrtInferenceContext* ctx,
+                           const uint8_t* image_data, int width, int height,
+                           int target_w, int target_h,
+                           float* out_scale, int* out_pad_x, int* out_pad_y,
+                           int* out_crop_x, int* out_crop_y) {
+    if (!ctx || !image_data || target_w <= 0 || target_h <= 0) return -1;
+
+    float src_ar = (float)width / (float)UTILS_MAX(height, 1);
+    float dst_ar = (float)target_w / (float)UTILS_MAX(target_h, 1);
+    float ar_ratio = src_ar / UTILS_MAX(dst_ar, 0.01f);
+    bool need_crop = (ar_ratio < 0.7f || ar_ratio > 1.4f);
+
+    const uint8_t* src_ptr = image_data;
+    int src_w = width, src_h = height;
+    int crop_x = 0, crop_y = 0;
+
+    uint8_t* padded = ctx->preproc_padded_buf;
+    size_t padded_needed = (size_t)target_w * target_h * 3;
+
+    /* Validate or fall back to heap */
+    if (!padded || ctx->preproc_padded_buf_size < padded_needed) {
+        /* Pool too small or not allocated — use heap */
+        padded = (uint8_t*)malloc(padded_needed);
+        if (!padded) return -1;
+    }
+
+    if (need_crop) {
+        int crop_w, crop_h;
+        if (src_ar < dst_ar) {
+            crop_w = width;
+            crop_h = (int)((float)width / dst_ar + 0.5f);
+            crop_x = 0;
+            crop_y = (height - crop_h) / 2;
+        } else {
+            crop_h = height;
+            crop_w = (int)((float)height * dst_ar + 0.5f);
+            crop_x = (width - crop_w) / 2;
+            crop_y = 0;
+        }
+        if (crop_y < 0) crop_y = 0;
+        if (crop_x < 0) crop_x = 0;
+        if (crop_x + crop_w > width)  crop_w = width - crop_x;
+        if (crop_y + crop_h > height) crop_h = height - crop_y;
+
+        /* Use preproc_crop_buf if available */
+        size_t crop_needed = (size_t)crop_w * crop_h * 3;
+        uint8_t* crop_buf = ctx->preproc_crop_buf;
+        bool crop_from_pool = (crop_buf && ctx->preproc_crop_buf_size >= crop_needed);
+
+        if (!crop_from_pool) {
+            crop_buf = (uint8_t*)malloc(crop_needed);
+        }
+        if (crop_buf) {
+            for (int y = 0; y < crop_h; y++) {
+                for (int x = 0; x < crop_w; x++) {
+                    int si = ((crop_y + y) * width + (crop_x + x)) * 3;
+                    int di = (y * crop_w + x) * 3;
+                    crop_buf[di + 0] = image_data[si + 0];
+                    crop_buf[di + 1] = image_data[si + 1];
+                    crop_buf[di + 2] = image_data[si + 2];
+                }
+            }
+            src_ptr = crop_buf;
+            src_w = crop_w;
+            src_h = crop_h;
+            if (!crop_from_pool) {
+                free(crop_buf);
+            }
+        }
+    }
+
+    if (out_crop_x) *out_crop_x = crop_x;
+    if (out_crop_y) *out_crop_y = crop_y;
+
+    /* Letterbox resize — reuse padded buffer */
+    utils_letterbox(src_ptr, src_w, src_h, padded, target_w, target_h, 3,
+                    out_scale, out_pad_x, out_pad_y);
+
+    /* CHW conversion: write directly into ctx->input_tensor */
+    float* out_tensor = ctx->input_tensor;
+    if (!out_tensor) {
+        if (padded != ctx->preproc_padded_buf) free(padded);
+        return -1;
+    }
+
+    int pixels = target_w * target_h;
+    for (int y = 0; y < target_h; y++) {
+        for (int x = 0; x < target_w; x++) {
+            int src_idx = (y * target_w + x) * 3;
+            int dst_r = 0 * pixels + y * target_w + x;
+            int dst_g = 1 * pixels + y * target_w + x;
+            int dst_b = 2 * pixels + y * target_w + x;
+
+            out_tensor[dst_r] = padded[src_idx + 0] / 255.0f;
+            out_tensor[dst_g] = padded[src_idx + 1] / 255.0f;
+            out_tensor[dst_b] = padded[src_idx + 2] / 255.0f;
+        }
+    }
+
+    if (padded != ctx->preproc_padded_buf) free(padded);
+    return 0;
+}
+
 void yolo_map_to_original(float mx, float my, float scale, int pad_x, int pad_y,
                           int crop_x, int crop_y, float* ox, float* oy) {
     *ox = (mx - (float)pad_x) / scale + (float)crop_x;
@@ -208,14 +319,17 @@ int yolo_detect_xquant_split(size_t num_outputs, OrtValue** output_vals,
 }
 #endif
 
-static void swap_bytes(void* a, void* b, uint8_t* buf, size_t size) {
-    memcpy(buf, a, size);
-    memcpy(a, b, size);
-    memcpy(b, buf, size);
-}
-
 static float default_bbox_sim(const void* a, const void* b) {
     return bbox_iou((const BoundingBox*)a, (const BoundingBox*)b);
+}
+
+/* ── qsort helper: sort (float, int) pairs by confidence descending ── */
+typedef struct { float conf; int idx; } NmsSortPair;
+
+static int nms_compare_desc(const void* a, const void* b) {
+    float fa = ((const NmsSortPair*)a)->conf;
+    float fb = ((const NmsSortPair*)b)->conf;
+    return (fa < fb) - (fa > fb);  /* descending */
 }
 
 int yolo_nms_suppress(void* items, int num_items, size_t item_size,
@@ -224,23 +338,53 @@ int yolo_nms_suppress(void* items, int num_items, size_t item_size,
     if (num_items <= 0 || !items || item_size == 0) return 0;
     if (max_output <= 0) return 0;
 
-    uint8_t* swap_buf = (uint8_t*)malloc(item_size);
-    if (!swap_buf) return 0;
-
     uint8_t* ptr = (uint8_t*)items;
 
-    for (int i = 0; i < num_items - 1; i++) {
-        for (int j = i + 1; j < num_items; j++) {
-            float ci = *(float*)(ptr + (size_t)i * item_size + (size_t)conf_offset);
-            float cj = *(float*)(ptr + (size_t)j * item_size + (size_t)conf_offset);
-            if (ci < cj) {
-                swap_bytes(ptr + (size_t)i * item_size,
-                           ptr + (size_t)j * item_size,
-                           swap_buf, item_size);
+    /*
+     * Sort by confidence descending using qsort over an index array,
+     * then reorder in-place.  O(n log n) vs the old O(n²) selection sort.
+     * For n=6000 proposals this is ~77K ops vs ~18M — a 230× reduction.
+     */
+    NmsSortPair* pairs = (NmsSortPair*)malloc((size_t)num_items * sizeof(NmsSortPair));
+    if (!pairs) return 0;
+
+    for (int i = 0; i < num_items; i++) {
+        pairs[i].conf = *(float*)(ptr + (size_t)i * item_size + (size_t)conf_offset);
+        pairs[i].idx  = i;
+    }
+    qsort(pairs, (size_t)num_items, sizeof(NmsSortPair), nms_compare_desc);
+
+    /* ── In-place reorder via permutation cycle ──
+     * Use a single item_size temp buffer instead of swapping every pair. */
+    uint8_t* tmp_item = (uint8_t*)malloc(item_size);
+    if (!tmp_item) { free(pairs); return 0; }
+
+    bool* visited = (bool*)calloc((size_t)num_items, sizeof(bool));
+    if (!visited) { free(tmp_item); free(pairs); return 0; }
+
+    for (int i = 0; i < num_items; i++) {
+        if (visited[i]) continue;
+        /* Follow the cycle starting at i */
+        int cur = i;
+        memcpy(tmp_item, ptr + (size_t)cur * item_size, item_size);
+        for (;;) {
+            int next = pairs[cur].idx;
+            visited[cur] = true;
+            if (next == i) {
+                memcpy(ptr + (size_t)cur * item_size, tmp_item, item_size);
+                break;
             }
+            memcpy(ptr + (size_t)cur * item_size,
+                   ptr + (size_t)next * item_size, item_size);
+            cur = next;
         }
     }
 
+    free(visited);
+    free(tmp_item);
+    free(pairs);
+
+    /* ── Confidence threshold filter (in-place compaction) ── */
     int filtered = 0;
     for (int i = 0; i < num_items; i++) {
         float conf = *(float*)(ptr + (size_t)i * item_size + (size_t)conf_offset);
@@ -258,7 +402,6 @@ int yolo_nms_suppress(void* items, int num_items, size_t item_size,
 
     bool* suppressed = (bool*)calloc((size_t)num_items, sizeof(bool));
     if (!suppressed) {
-        free(swap_buf);
         return num_items;
     }
 
@@ -283,6 +426,5 @@ int yolo_nms_suppress(void* items, int num_items, size_t item_size,
     }
 
     free(suppressed);
-    free(swap_buf);
     return keep;
 }

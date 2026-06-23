@@ -24,21 +24,13 @@ extern "C" {
 #define MAX_LOG_MSG_LEN         1024
 #define MAX_BUFFER_SIZE         4096
 #define MAX_SESSION_RESULTS     1000
-#define ARROW_RING_BUFFER_SIZE  16
-#define ARROW_MAX_FRAME_LEN     65536
+#define FRAME_MAX_JPEG_LEN      65536
 
 typedef enum {
     PIPELINE_MODE_OFFLINE = 0,
     PIPELINE_MODE_REALTIME = 1,
     PIPELINE_MODE_BENCHMARK = 2,
 } PipelineMode;
-
-typedef enum {
-    ARROW_STATE_IDLE = 0,
-    ARROW_STATE_SYNCING,
-    ARROW_STATE_LOCKED,
-    ARROW_STATE_ERROR,
-} ArrowReceiveState;
 
 typedef enum {
     DETECTION_CLASS_PERSON = 0,
@@ -269,15 +261,7 @@ typedef struct {
 } IMUExternalPose;
 
 typedef struct {
-    uint8_t* jpeg_buf;
-    size_t jpeg_len;
-    int frame_index;
-    IMUExternalPose pose;
-    bool has_pose;
-} ARFramePair;
-
-typedef struct {
-    uint8_t jpeg_data[ARROW_MAX_FRAME_LEN];
+    uint8_t jpeg_data[FRAME_MAX_JPEG_LEN];
     size_t jpeg_len;
     IMUExternalPose pose;
     bool has_pose;

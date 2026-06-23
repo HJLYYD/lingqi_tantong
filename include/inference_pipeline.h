@@ -78,8 +78,14 @@ AIInferencePipeline* inference_pipeline_create(void);
 void inference_pipeline_destroy(AIInferencePipeline* pipeline);
 
 int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* model_dir, const ConfigManager* config);
-InferenceResult inference_pipeline_process_frame(AIInferencePipeline* pipeline,
-                                                  const uint8_t* frame_data, int width, int height);
+/*
+ * Process a single frame through the inference pipeline.
+ * Writes results into the caller-provided out_result buffer (no large struct copy).
+ * Returns 0 on success, -1 on error.
+ */
+int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
+                                     const uint8_t* frame_data, int width, int height,
+                                     InferenceResult* out_result);
 
 void inference_pipeline_configure(AIInferencePipeline* pipeline, uint32_t stages);
 void inference_pipeline_reset(AIInferencePipeline* pipeline);

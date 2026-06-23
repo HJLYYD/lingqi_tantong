@@ -117,9 +117,10 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_string(cm, "video.camera_device", "/dev/video0");
     config_set_string(cm, "video.camera_format", "MJPEG");
 
-    config_set_string(cm, "arrow.uart_device_A", "/dev/ttyS0");
-    config_set_string(cm, "arrow.uart_device_C", "/dev/ttyS1");
-    config_set_int(cm, "arrow.baudrate", 3000000);
+    config_set_string(cm, "coap.esp_ip", "192.168.4.1");
+    config_set_int(cm, "coap.esp_port", 5683);
+    config_set_string(cm, "coap.wifi_ssid", "ESP32-Camera-AP");
+    config_set_string(cm, "coap.wifi_password", "12345678");
 
     config_set_int(cm, "performance.openmp_threads", 6);
     config_set_bool(cm, "performance.realtime_scheduling", true);

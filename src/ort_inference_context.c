@@ -51,6 +51,22 @@ OrtInferenceContext* ort_ctx_create(OrtSession* session, int input_w, int input_
         return NULL;
     }
 
+    /* ── Pre-allocate preprocessing buffers ──
+     * padded_buf: letterbox-resized RGB image at model input size
+     * crop_buf:   worst-case crop buffer (same size as padded) */
+    ctx->preproc_padded_buf_size = (size_t)input_w * input_h * input_c;  /* uint8_t RGB */
+    ctx->preproc_padded_buf = (uint8_t*)calloc(1, ctx->preproc_padded_buf_size);
+    ctx->preproc_crop_buf_size = ctx->preproc_padded_buf_size;
+    ctx->preproc_crop_buf = (uint8_t*)calloc(1, ctx->preproc_crop_buf_size);
+    if (!ctx->preproc_padded_buf || !ctx->preproc_crop_buf) {
+        log_warning("ort_ctx_create: preproc buffer alloc failed — falling back to heap path");
+        free(ctx->preproc_padded_buf);
+        free(ctx->preproc_crop_buf);
+        ctx->preproc_padded_buf = NULL;
+        ctx->preproc_crop_buf = NULL;
+        /* Non-fatal: yolo_preprocess_pooled will fall back to malloc. */
+    }
+
     return ctx;
 }
 
@@ -72,6 +88,8 @@ void ort_ctx_destroy(OrtInferenceContext* ctx) {
         }
     }
     free(ctx->input_tensor);
+    free(ctx->preproc_padded_buf);
+    free(ctx->preproc_crop_buf);
     free(ctx);
 }
 
@@ -89,6 +107,17 @@ bool ort_ctx_prepare_input(OrtInferenceContext* ctx, const float* data, size_t b
     }
 
     memcpy(ctx->input_tensor, data, bytes);
+    return true;
+}
+
+/*
+ * Zero-copy input ready — the caller has already written preprocessed data
+ * directly into ctx->input_tensor via the pooled preprocess path.
+ * Only validates that the size matches; skips the memcpy.
+ */
+bool ort_ctx_input_ready(OrtInferenceContext* ctx, size_t bytes) {
+    if (!ctx || bytes == 0 || bytes != ctx->input_tensor_bytes) return false;
+    /* input_tensor already contains valid data — no memcpy needed */
     return true;
 }
 

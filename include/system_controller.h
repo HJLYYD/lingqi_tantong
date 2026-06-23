@@ -14,8 +14,7 @@
 #include "ar_renderer.h"
 #include "result_manager.h"
 #include "video_writer.h"
-#include "arrow_receiver.h"
-#include "mjpeg_receiver.h"
+#include "coap_receiver.h"
 #include "display_output.h"
 
 #ifdef __cplusplus
@@ -36,8 +35,7 @@ typedef struct {
     Visualizer* visualizer;
     ARRenderer* ar_renderer;
     ResultManager* result_manager;
-    ArrowReceiver* arrow_receiver;
-    MjpegReceiver* mjpeg_receiver;
+    CoapReceiver* coap_receiver;
     DisplayOutput* display_output;
 
     PipelineMode mode;
@@ -54,12 +52,12 @@ typedef struct {
     bool save_video_enabled;      /* MP4 file output */
     char save_video_path[MAX_PATH_LEN];
 
-    /* ── MJPEG receiver config ── */
-    bool mjpeg_enabled;
-    char mjpeg_esp_ip[64];
-    int  mjpeg_esp_port;
-    char mjpeg_wifi_ssid[64];
-    char mjpeg_wifi_password[64];
+    /* ── CoAP receiver config (ESP32 CoAP/UDP protocol) ── */
+    bool coap_enabled;
+    char coap_esp_ip[64];
+    int  coap_esp_port;
+    char coap_wifi_ssid[64];
+    char coap_wifi_password[64];
 
     float fps_history[SC_MAX_FPS_HISTORY];
     int fps_history_count;
@@ -79,10 +77,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
                                               bool show_windows,
                                               int save_frame_interval);
 
-SystemStatus system_controller_process_realtime_k1(SystemController* sc,
-                                                    const char* uart_device_A,
-                                                    const char* uart_device_C,
-                                                    int baudrate);
+SystemStatus system_controller_process_realtime_k1(SystemController* sc);
 
 SystemStatus system_controller_get_status(const SystemController* sc);
 SystemStatus system_controller_get_final_status(const SystemController* sc);

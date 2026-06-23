@@ -283,15 +283,14 @@ static void* k1_capture_thread(void* arg) {
     bool use_v4l2 = (sc->video_processor != NULL &&
                     video_processor_get_source_type(sc->video_processor) == VP_SOURCE_CAMERA &&
                     video_processor_is_opened(sc->video_processor));
-    bool use_arrow = (sc->arrow_receiver != NULL && !sc->mjpeg_enabled);
-    bool use_mjpeg = (sc->mjpeg_receiver != NULL);
-    if (!use_v4l2 && !use_arrow && !use_mjpeg) {
-        log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera, Arrow UART, or MJPEG)");
+    bool use_coap = (sc->coap_receiver != NULL);
+    if (!use_v4l2 && !use_coap) {
+        log_error("[K1 Pipeline] Capture: no source available (no V4L2 camera or CoAP receiver)");
         return NULL;
     }
 
     double last_frame_time = k1_get_time_ms() / 1000.0;
-    int cap_attempts = 0, cap_mjpeg_ok = 0;
+    int cap_attempts = 0, cap_coap_ok = 0;
 
     while (pl->running) {
         pl->thread_heartbeats[0]++;
@@ -322,69 +321,49 @@ static void* k1_capture_thread(void* arg) {
             }
         }
 
-        if (!got_frame && use_arrow) {
-            arrow_receiver_update(sc->arrow_receiver);
-            ArrowSourceFrame arrow_frame;
-            if (arrow_receiver_get_latest_frame(sc->arrow_receiver, &arrow_frame)) {
-                if (soft_jpeg_decode_to_rgb(arrow_frame.jpeg_data, arrow_frame.jpeg_len,
-                                            s->rgb_data, cam_w, cam_h) == 0) {
-                    got_frame = true;
-                    s->timestamp_us = (int64_t)(arrow_frame.timestamp * 1000.0);
-                    s->frame_index = arrow_frame.frame_index;
-                }
-
-                if (arrow_frame.has_pose) {
-                    imu_handler_set_external_pose(sc->imu_handler,
-                        arrow_frame.pose.qw, arrow_frame.pose.qx,
-                        arrow_frame.pose.qy, arrow_frame.pose.qz,
-                        arrow_frame.pose.pitch, arrow_frame.pose.roll,
-                        arrow_frame.pose.yaw, arrow_frame.pose.altitude_m,
-                        arrow_frame.pose.temperature_c,
-                        arrow_frame.pose.timestamp_ms);
-                }
-            }
-        }
-
-        if (!got_frame && use_mjpeg) {
-            ArrowSourceFrame mjpeg_frame;
-            if (mjpeg_receiver_get_latest_frame(sc->mjpeg_receiver, &mjpeg_frame)) {
-                cap_mjpeg_ok++;
+        if (!got_frame && use_coap) {
+            ArrowSourceFrame coap_frame;
+            if (coap_receiver_get_latest_frame(sc->coap_receiver, &coap_frame)) {
+                cap_coap_ok++;
                 double decode_start = k1_get_time_ms();
-                if (soft_jpeg_decode_to_rgb(mjpeg_frame.jpeg_data, mjpeg_frame.jpeg_len,
+                if (soft_jpeg_decode_to_rgb(coap_frame.jpeg_data, coap_frame.jpeg_len,
                                             s->rgb_data, cam_w, cam_h) == 0) {
                     double decode_ms = k1_get_time_ms() - decode_start;
                     got_frame = true;
-                    s->timestamp_us = (int64_t)mjpeg_frame.timestamp;  /* already in µs */
-                    s->frame_index = mjpeg_frame.frame_index;
-                    // 每 30 帧打印一次捕获详情
-                    if (mjpeg_frame.frame_index <= 3 ||
-                        mjpeg_frame.frame_index % 30 == 0) {
-                        log_info("[Capture] MJPEG frame#%d | JPEG=%zuB decode=%.1fms "
+                    s->timestamp_us = (int64_t)coap_frame.timestamp;
+                    s->frame_index = coap_frame.frame_index;
+                    if (coap_frame.frame_index <= 3 ||
+                        coap_frame.frame_index % 30 == 0) {
+                        log_info("[Capture] CoAP frame#%d | JPEG=%zuB decode=%.1fms "
                                  "| ok=%d/%d attempts",
-                                 mjpeg_frame.frame_index, mjpeg_frame.jpeg_len,
-                                 decode_ms, cap_mjpeg_ok, cap_attempts);
+                                 coap_frame.frame_index, coap_frame.jpeg_len,
+                                 decode_ms, cap_coap_ok, cap_attempts);
                     }
                 } else {
-                    log_warning("[K1 Pipeline] MJPEG decode failed frame#%d: %zu bytes",
-                                mjpeg_frame.frame_index, mjpeg_frame.jpeg_len);
+                    log_warning("[K1 Pipeline] CoAP decode failed frame#%d: %zu bytes",
+                                coap_frame.frame_index, coap_frame.jpeg_len);
                 }
 
-                if (mjpeg_frame.has_pose) {
+                if (coap_frame.has_pose) {
                     imu_handler_set_external_pose(sc->imu_handler,
-                        mjpeg_frame.pose.qw, mjpeg_frame.pose.qx,
-                        mjpeg_frame.pose.qy, mjpeg_frame.pose.qz,
-                        mjpeg_frame.pose.pitch, mjpeg_frame.pose.roll,
-                        mjpeg_frame.pose.yaw, mjpeg_frame.pose.altitude_m,
-                        mjpeg_frame.pose.temperature_c,
-                        mjpeg_frame.pose.timestamp_ms);
+                        coap_frame.pose.qw, coap_frame.pose.qx,
+                        coap_frame.pose.qy, coap_frame.pose.qz,
+                        coap_frame.pose.pitch, coap_frame.pose.roll,
+                        coap_frame.pose.yaw, coap_frame.pose.altitude_m,
+                        coap_frame.pose.temperature_c,
+                        coap_frame.pose.timestamp_ms);
                 }
             }
         }
 
         if (!got_frame) {
-            if (cap_attempts <= 5 || cap_attempts % 100 == 0) {
-                log_debug("[K1 Pipeline] Capture attempt#%d: no frame (V4L2=%d arrow=%d mjpeg=%d, got=%d)",
-                          cap_attempts, use_v4l2, use_arrow, use_mjpeg, cap_mjpeg_ok);
+            if (cap_attempts == 1) {
+                log_info("[K1 Pipeline] Waiting for first frame (CoAP=%d V4L2=%d)...",
+                         use_coap, use_v4l2);
+            } else if (cap_attempts <= 5 || cap_attempts % 300 == 0) {
+                double idle_s = (k1_get_time_ms() / 1000.0) - last_frame_time;
+                log_info("[K1 Pipeline] No frame after %d attempts (%.0fs idle, V4L2=%d coap=%d, ok=%d)",
+                         cap_attempts, idle_s, use_v4l2, use_coap, cap_coap_ok);
             }
             /* ── Frame timeout check ── */
             double now_s = k1_get_time_ms() / 1000.0;
@@ -438,12 +417,8 @@ static void* k1_inference_thread(void* arg) {
         }
 
         K1PipelineSlot* s = &pl->slots[slot];
-        InferenceResult inference = inference_pipeline_process_frame(
-            sc->inference_pipeline, s->rgb_data, s->width, s->height);
-
-        pthread_mutex_lock(&s->mutex);
-        s->inference = inference;
-        pthread_mutex_unlock(&s->mutex);
+        inference_pipeline_process_frame(
+            sc->inference_pipeline, s->rgb_data, s->width, s->height, &s->inference);
 
         k1_pipeline_slot_infer_done(pl, slot);
     }
@@ -597,10 +572,7 @@ static void* k1_postprocess_thread(void* arg) {
     return NULL;
 }
 
-SystemStatus system_controller_process_realtime_k1(SystemController* sc,
-                                                    const char* uart_device_A,
-                                                    const char* uart_device_C,
-                                                    int baudrate) {
+SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
     SystemStatus status;
     memset(&status, 0, sizeof(SystemStatus));
 
@@ -634,30 +606,19 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
         if (sc->video_processor) {
             log_info("[K1 Pipeline] Camera device opened: %s (%dx%d @ %.1f FPS)", camera_dev, cam_w, cam_h, cam_fps);
         } else {
-            log_warning("[K1 Pipeline] V4L2 camera %s unavailable; will rely on Arrow UART", camera_dev);
+            log_warning("[K1 Pipeline] V4L2 camera %s unavailable; will rely on CoAP receiver", camera_dev);
         }
     }
 
-    if (uart_device_A) {
-        sc->arrow_receiver = arrow_receiver_create(uart_device_A, baudrate);
-        if (sc->arrow_receiver) {
-            log_info("[K1 Pipeline] Arrow UART: %s @ %d bps", uart_device_A, baudrate);
-            if (uart_device_C) {
-                arrow_receiver_add_secondary_link(sc->arrow_receiver, uart_device_C, baudrate);
-                log_info("[K1 Pipeline] Dual-link: secondary UART %s", uart_device_C);
-            }
-        }
-    }
-
-    /* ── MJPEG HTTP receiver (WiFi from ESP32) ── */
-    if (sc->mjpeg_enabled && sc->mjpeg_esp_ip[0] != '\0') {
-        sc->mjpeg_receiver = mjpeg_receiver_create(
-            sc->mjpeg_esp_ip, sc->mjpeg_esp_port,
-            sc->mjpeg_wifi_ssid[0] != '\0' ? sc->mjpeg_wifi_ssid : NULL,
-            sc->mjpeg_wifi_password[0] != '\0' ? sc->mjpeg_wifi_password : NULL);
-        if (sc->mjpeg_receiver) {
-            log_info("[K1 Pipeline] MJPEG receiver: %s:%d",
-                     sc->mjpeg_esp_ip, sc->mjpeg_esp_port);
+    /* ── CoAP/UDP receiver (WiFi from ESP32) ── */
+    if (sc->coap_enabled && sc->coap_esp_ip[0] != '\0') {
+        sc->coap_receiver = coap_receiver_create(
+            sc->coap_esp_ip, sc->coap_esp_port,
+            sc->coap_wifi_ssid[0] != '\0' ? sc->coap_wifi_ssid : NULL,
+            sc->coap_wifi_password[0] != '\0' ? sc->coap_wifi_password : NULL);
+        if (sc->coap_receiver) {
+            log_info("[K1 Pipeline] CoAP receiver: %s:%d (CoAP/UDP)",
+                     sc->coap_esp_ip, sc->coap_esp_port);
         }
     }
 
@@ -679,8 +640,12 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
                 sc->stream_url,
                 sc->save_video_path);
             if (sc->display_output) {
-                log_info("[K1 Pipeline] Display output active");
+                log_info("[K1 Pipeline] Display output active (channels=0x%x)", disp_channels);
+            } else {
+                log_warning("[K1 Pipeline] Display output creation failed, continuing without display");
             }
+        } else {
+            log_info("[K1 Pipeline] No display/output channels enabled (headless mode)");
         }
     }
 
@@ -718,6 +683,15 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc,
 
     sc->running = 1;
     sc->start_time = k1_get_time_ms() / 1000.0;
+
+    log_info("[K1 Pipeline] === Pipeline alive ===");
+    log_info("[K1 Pipeline] Source: %s | Display: %s | Video: %s",
+             sc->coap_receiver ? "CoAP/UDP" :
+                (sc->video_processor ? "V4L2 Camera" : "None"),
+             sc->display_output ? "active" : "none",
+             sc->save_video_enabled ? sc->save_video_path : "disabled");
+    log_info("[K1 Pipeline] Waiting for frames. Idle timeout: %ds. Press Ctrl+C to stop.",
+             sc->frame_timeout_s);
 
     /* ── Main thread: startup wait + heartbeat monitor ── */
     {
@@ -783,13 +757,9 @@ k1_cleanup:
     result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
     result_manager_end_session(sc->result_manager);
 
-    if (sc->arrow_receiver) {
-        arrow_receiver_destroy(sc->arrow_receiver);
-        sc->arrow_receiver = NULL;
-    }
-    if (sc->mjpeg_receiver) {
-        mjpeg_receiver_destroy(sc->mjpeg_receiver);
-        sc->mjpeg_receiver = NULL;
+    if (sc->coap_receiver) {
+        coap_receiver_destroy(sc->coap_receiver);
+        sc->coap_receiver = NULL;
     }
     if (sc->display_output) {
         display_output_destroy(sc->display_output);
@@ -913,13 +883,13 @@ SystemController* system_controller_create(const char* config_path) {
     sc->ar_renderer = ar_renderer_create(render_w, render_h, true);
     sc->result_manager = result_manager_create("output");
 
-    sc->arrow_receiver = NULL;
+    sc->coap_receiver = NULL;
     sc->display_output = NULL;
     sc->mode = PIPELINE_MODE_OFFLINE;
 
     sc->frame_count = 0;
     sc->max_frames = config_get_int(sc->config, "system.max_frames", 0);
-    sc->frame_timeout_s = config_get_int(sc->config, "arrow.frame_timeout_s", 10);
+    sc->frame_timeout_s = config_get_int(sc->config, "coap.frame_timeout_s", 10);
     sc->start_time = (double)utils_get_time_ms() / 1000.0;
     sc->fps_history_count = 0;
     sc->proc_times_count = 0;
@@ -955,21 +925,21 @@ SystemController* system_controller_create(const char* config_path) {
         }
     }
 
-    /* MJPEG receiver config */
-    sc->mjpeg_receiver = NULL;
-    sc->mjpeg_enabled = config_get_bool(sc->config, "mjpeg.enabled", false);
+    /* CoAP receiver config (ESP32 CoAP/UDP) */
+    sc->coap_receiver = NULL;
+    sc->coap_enabled = config_get_bool(sc->config, "coap.enabled", true);
     {
-        const char* ip = config_get_string(sc->config, "mjpeg.esp_ip", "192.168.4.1");
-        strncpy(sc->mjpeg_esp_ip, ip ? ip : "192.168.4.1", sizeof(sc->mjpeg_esp_ip) - 1);
+        const char* ip = config_get_string(sc->config, "coap.esp_ip", "192.168.4.1");
+        strncpy(sc->coap_esp_ip, ip ? ip : "192.168.4.1", sizeof(sc->coap_esp_ip) - 1);
     }
-    sc->mjpeg_esp_port = config_get_int(sc->config, "mjpeg.esp_port", 80);
+    sc->coap_esp_port = config_get_int(sc->config, "coap.esp_port", 5683);
     {
-        const char* ssid = config_get_string(sc->config, "mjpeg.wifi_ssid", "");
-        strncpy(sc->mjpeg_wifi_ssid, ssid ? ssid : "", sizeof(sc->mjpeg_wifi_ssid) - 1);
+        const char* ssid = config_get_string(sc->config, "coap.wifi_ssid", "ESP32-Camera-AP");
+        strncpy(sc->coap_wifi_ssid, ssid ? ssid : "", sizeof(sc->coap_wifi_ssid) - 1);
     }
     {
-        const char* pw = config_get_string(sc->config, "mjpeg.wifi_password", "");
-        strncpy(sc->mjpeg_wifi_password, pw ? pw : "", sizeof(sc->mjpeg_wifi_password) - 1);
+        const char* pw = config_get_string(sc->config, "coap.wifi_password", "12345678");
+        strncpy(sc->coap_wifi_password, pw ? pw : "", sizeof(sc->coap_wifi_password) - 1);
     }
 
     log_info("System Controller initialized");
@@ -989,8 +959,7 @@ void system_controller_destroy(SystemController* sc) {
     if (sc->visualizer) visualizer_destroy(sc->visualizer);
     if (sc->ar_renderer) ar_renderer_destroy(sc->ar_renderer);
     if (sc->result_manager) result_manager_destroy(sc->result_manager);
-    if (sc->arrow_receiver) arrow_receiver_destroy(sc->arrow_receiver);
-    if (sc->mjpeg_receiver) mjpeg_receiver_destroy(sc->mjpeg_receiver);
+    if (sc->coap_receiver) coap_receiver_destroy(sc->coap_receiver);
     if (sc->display_output) display_output_destroy(sc->display_output);
 
     free(sc);
@@ -1143,8 +1112,9 @@ SystemStatus system_controller_process_video(SystemController* sc,
             break;
         }
 
-        InferenceResult inference = inference_pipeline_process_frame(
-            sc->inference_pipeline, frame->data, frame->width, frame->height);
+        InferenceResult inference;
+        inference_pipeline_process_frame(
+            sc->inference_pipeline, frame->data, frame->width, frame->height, &inference);
 
         if (sc->frame_count == 1 && inference.num_detections > 0) {
             spatial_engine_initialize_coordinate_system(
@@ -1299,7 +1269,7 @@ SystemStatus system_controller_get_final_status(const SystemController* sc) {
         return status;
     }
 
-    double total_time = (double)utils_get_time_ms() / 1000.0 - sc->start_time;
+    double total_time = k1_get_time_ms() / 1000.0 - sc->start_time;
 
     float avg_fps = 0.0f;
     if (sc->fps_history_count > 0) {

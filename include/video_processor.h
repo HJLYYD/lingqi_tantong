@@ -13,7 +13,6 @@ extern "C" {
 
 #define VP_SOURCE_FILE      0
 #define VP_SOURCE_CAMERA    1
-#define VP_SOURCE_ARROW     2
 
 typedef struct VideoProcessor VideoProcessor;
 

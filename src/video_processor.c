@@ -698,10 +698,8 @@ VideoProcessor* video_processor_create_from_camera(const char* device_path, int 
 int video_processor_get_source_type(const VideoProcessor* vp) {
     if (!vp) return VP_SOURCE_FILE;
     if (vp->source_type == VP_SOURCE_CAMERA) return VP_SOURCE_CAMERA;
-    if (vp->source_type == VP_SOURCE_ARROW) return VP_SOURCE_ARROW;
     if (vp->input_path[0]) {
         if (strncmp(vp->input_path, "/dev/video", 10) == 0) return VP_SOURCE_CAMERA;
-        if (strncmp(vp->input_path, "arrow:", 6) == 0) return VP_SOURCE_ARROW;
     }
     return VP_SOURCE_FILE;
 }

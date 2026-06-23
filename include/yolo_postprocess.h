@@ -17,6 +17,20 @@ void yolo_preprocess(const uint8_t* image_data, int width, int height,
                      float* out_scale, int* out_pad_x, int* out_pad_y,
                      int* out_crop_x, int* out_crop_y);
 
+/*
+ * Pooled preprocess — writes directly into ctx->input_tensor (float* CHW),
+ * using ctx->preproc_padded_buf as the intermediate letterbox buffer.
+ * Zero malloc/free in the hot path.  Falls back to heap if ctx buffers
+ * are NULL (backward compatible with bare OrtInferenceContext).
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int yolo_preprocess_pooled(OrtInferenceContext* ctx,
+                           const uint8_t* image_data, int width, int height,
+                           int target_w, int target_h,
+                           float* out_scale, int* out_pad_x, int* out_pad_y,
+                           int* out_crop_x, int* out_crop_y);
+
 void yolo_map_to_original(float mx, float my, float scale, int pad_x, int pad_y,
                           int crop_x, int crop_y, float* ox, float* oy);
 
