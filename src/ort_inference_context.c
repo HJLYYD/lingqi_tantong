@@ -67,6 +67,9 @@ OrtInferenceContext* ort_ctx_create(OrtSession* session, int input_w, int input_
         /* Non-fatal: yolo_preprocess_pooled will fall back to malloc. */
     }
 
+    /* Output pool: allocated lazily on first ort_ctx_get_output_pool() call,
+     * after num_outputs is known from the first Run(). */
+
     return ctx;
 }
 
@@ -90,6 +93,7 @@ void ort_ctx_destroy(OrtInferenceContext* ctx) {
     free(ctx->input_tensor);
     free(ctx->preproc_padded_buf);
     free(ctx->preproc_crop_buf);
+    free(ctx->output_val_pool);
     free(ctx);
 }
 
@@ -255,6 +259,42 @@ float* ort_ctx_get_output_data(OrtInferenceContext* ctx, OrtValue* val) {
         return NULL;
     }
     return data;
+}
+
+/*
+ * ── Output value pool ──
+ *
+ * Pre-allocates an OrtValue* array sized to num_outputs once (on first call
+ * after the first Run() has cached output names).  Callers pass this to
+ * ort_ctx_run() instead of calloc-per-frame.
+ *
+ * After processing outputs:
+ *   1. ort_ctx_release_outputs(ctx, pool, num_outputs);  // release OrtValues
+ *   2. ort_ctx_reset_outputs(ctx);                       // zero the pool
+ *
+ * The pool is NOT zeroed automatically — callers must use the pair above.
+ */
+OrtValue** ort_ctx_get_output_pool(OrtInferenceContext* ctx) {
+    if (!ctx) return NULL;
+
+    /* First call after names are cached: allocate the pool */
+    if (!ctx->output_val_pool && ctx->num_outputs > 0) {
+        ctx->output_val_pool_size = ctx->num_outputs;
+        ctx->output_val_pool = (OrtValue**)calloc(ctx->num_outputs, sizeof(OrtValue*));
+        if (!ctx->output_val_pool) {
+            log_error("ort_ctx_get_output_pool: allocation failed (%zu entries)",
+                      ctx->num_outputs);
+            return NULL;
+        }
+    }
+
+    return ctx->output_val_pool;
+}
+
+void ort_ctx_reset_outputs(OrtInferenceContext* ctx) {
+    if (!ctx || !ctx->output_val_pool) return;
+    memset(ctx->output_val_pool, 0,
+           ctx->output_val_pool_size * sizeof(OrtValue*));
 }
 
 #endif

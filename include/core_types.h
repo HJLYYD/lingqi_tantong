@@ -260,6 +260,35 @@ typedef struct {
     bool is_valid;
 } IMUExternalPose;
 
+/* ── Phase 1-2: Madgwick 滤波器 + 双 IMU 融合 ── */
+
+typedef struct {
+    float qw, qx, qy, qz;        /* 估计姿态四元数 (Hamilton w-first) */
+    float beta;                   /* 滤波器增益 [Madgwick 2011] */
+    float sample_freq;            /* 标称采样率 Hz */
+    float integral_fb[3];         /* 陀螺仪偏置在线估计积分项 */
+    bool  initialized;
+    double last_timestamp;        /* 上次更新时间 (秒), 用于计算真实 dt */
+} MadgwickFilter;
+
+typedef struct {
+    float k1_qw, k1_qx, k1_qy, k1_qz;      /* K1 本地 IMU → Madgwick */
+    float cam_qw, cam_qx, cam_qy, cam_qz;   /* ESP32 远端 IMU → Madgwick */
+    float align_qw, align_qx, align_qy, align_qz; /* K1→相机 对齐旋转 */
+    float rel_pitch, rel_roll, rel_yaw;     /* 相对姿态 (相机在 K1 帧中) */
+    bool  k1_valid, cam_valid, align_valid;
+    uint32_t timestamp_ms;
+} DualImuPose;
+
+typedef struct {
+    int    window_size;
+    int    samples_collected;
+    int    cam_idx;                /* 相机加速度样本的独立索引 */
+    float  k1_accels[3][256];     /* K1 静止加速度样本 */
+    float  cam_accels[3][256];    /* ESP32 静止加速度样本 */
+    bool   done;
+} FrameAlignmentCtx;
+
 typedef struct {
     uint8_t jpeg_data[FRAME_MAX_JPEG_LEN];
     size_t jpeg_len;

@@ -17,8 +17,18 @@ system:
   #   intra=3: ~510KB TCM — 1 EP session only
   #   intra=4: may trigger "tcm buffer alloc failed" — do not use
   # K1 Cluster0: 512KB shared TCM across 4 AI cores.
-  # intra=1 maximizes EP coverage: YOLO11 + YOLOv8-Pose + Face (3 EP sessions).
-  spacemit_ep_intra_threads: 1  # intra=1 only - Bianbu 2.3.3 K1 crashes at intra>=2 (tcm buffer alloc failed core 2)
+  # intra=1 maximizes EP coverage: YOLOv8-Pose + Face (3 EP sessions).
+  #
+  # Current EP session allocation (3 models on SpacemiT EP):
+  #   1. yolov8n-pose.q.onnx  (~170KB TCM) — person detection + 17-keypoint pose
+  #   2. yolov5n-face_320_cut.q.onnx (~170KB TCM) — face detection
+  #   3. arcface_mobilefacenet_cut.q.onnx (~170KB TCM) — face recognition
+  #   Total: ~510KB / 512KB TCM — fully utilized, no headroom for more EP models.
+  #
+  # stgcn.fp32.onnx uses CPU EP (not quantized) — runs on general-purpose core.
+  # To add ST-GCN to EP: quantize stgcn → .q.onnx, then reduce face_interval
+  # so face models don't compete for TCM with ST-GCN's session.
+  spacemit_ep_intra_threads: 1  # intra=1 only — max EP models on K1's 512KB TCM
   log_level: INFO
   startup_mode: realtime
   max_frames: 0
@@ -28,7 +38,7 @@ system:
 
 video:
   source: camera
-  camera_device: "/dev/video0"
+  camera_device: "/dev/video1"   # K1: /dev/video0=VPU, /dev/video1=CCIC1 MIPI CSI camera
   camera_width: 640
   camera_height: 480
   camera_fps: 15.0
@@ -39,18 +49,29 @@ video:
   save_frame_interval: 1
 
 coap:
-  # CoAP/UDP receiver for ESP32 camera (ov-imu-pwm.ino + coap_server.h).
-  # Protocol: CoAP/UDP port 5683, Block2 streaming JPEG, separate /imu polling @ 1Hz.
   enabled: true
   esp_ip: "192.168.4.1"
   esp_port: 5683
   wifi_ssid: "ESP32-Camera-AP"
   wifi_password: "12345678"
-  frame_timeout_s: 10              # auto-exit after N seconds of no frames in realtime mode
+  frame_timeout_s: 10
+
+k1_imu:
+  i2c_bus: 4
+  sample_rate_hz: 100
+  calibration_samples: 200
+
+madgwick:
+  beta: 0.08
+  sample_freq_hz: 100.0
+
+dual_imu:
+  alignment_window: 200
+  alignment_timeout_s: 10.0
 
 detection:
   # SECONDARY person detector — DISABLED in unified mode.
-  # yolo11n-pose (pose section below) does BOTH person detection AND 17-keypoint
+  # yolov8n-pose (pose section below) does BOTH person detection AND 17-keypoint
   # pose estimation in a single forward pass — no separate detector needed.
   # This saves ~150ms/frame (one full EP inference) and one TCM slot.
   # Set model_path to a valid .q.onnx file to re-enable the secondary detector.
@@ -60,9 +81,9 @@ detection:
   iou_threshold: 0.40
   input_size: [640, 640]
   classes: 80
-  keypoint_min_count: 4           # lowered from 6: accept partial-body detections
-  keypoint_min_confidence: 0.15    # lowered from 0.30: INT8 model keypoint conf is lower
-  keypoint_validity_threshold: 0.30 # lowered from 0.50: less strict overall validity
+  keypoint_min_count: 3           # lowered from 6: 320x320 model produces weak keypoints
+  keypoint_min_confidence: 0.08   # lowered from 0.30: INT8-quantized keypoints rarely exceed 0.15
+  keypoint_validity_threshold: 0.25 # lowered from 0.50: compensate for low-conf keypoints
   # ── Cascade optimization (single-model mode) ──
   # With only one model, the cascade simply throttles face detection
   # when tracks are stable. No secondary detector to schedule.
@@ -74,15 +95,13 @@ detection:
   fallback_area_ratio_min: 0.008
 
 pose:
-  # UNIFIED person detector + pose estimator (YOLO11n-pose, xquant-split INT8).
-  # Replaces both YOLOv8n-pose + YOLO11n with a SINGLE model.
-  # YOLO11n-pose: 2.9M params, 7.4 GFLOPs, AP 50.0 on COCO-Pose.
-  # vs YOLOv8n-pose: 3.3M params, 9.2 GFLOPs, AP 48.0.
+  # PERSON detector + pose estimator (YOLOv8n-pose from official BRDK CV demo, xquant-split INT8).
+  # YOLOv8n-pose: 3.3M params, 9.2 GFLOPs, AP 48.0 on COCO-Pose.
   # Output format: {reg(64ch), cls(1ch), kpt(51ch)} × 3 FPN strides.
   # DFL peakiness used as confidence (cls head broken by INT8 quantization).
   # 480×480: 44% fewer pixels than 640, ~40% faster inference.
   backend: ai_accel
-  model_path: "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx"
+  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
   confidence_threshold: 0.06   # lowered: catch more detections
   iou_threshold: 0.40
   input_size: [480, 480]       # model's actual input is 640x640 (overridden at load)
@@ -96,7 +115,7 @@ face:
   # person detection + pose estimation + action recognition.
   detection_backend: ai_accel
   recognition_backend: ai_accel
-  detection_model_path: "models/Face Recognition/yolov5n-face_cut.q.onnx"
+  detection_model_path: "models/Face Recognition/yolov5n-face_320_cut.q.onnx"
   recognition_model_path: "models/Face Recognition/arcface_mobilefacenet_cut.q.onnx"
   face_min_size: 24
   confidence_threshold: 0.50
@@ -114,7 +133,12 @@ action:
   num_persons: 1
   num_classes: 7    # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
   confidence_threshold: 0.50
-  inference_interval: 25   # was 10: run ST-GCN less often for higher overall FPS
+  # ST-GCN runs on CPU EP (FP32) — ~400ms per forward pass on K1.
+  # inference_interval=50 means ST-GCN runs every 50th pose-estimation frame.
+  # At ~4 FPS: 50 frames ≈ 12.5s between action predictions. This is acceptable
+  # for most real-world scenarios (actions unfold over seconds, not milliseconds).
+  # Tradeoff: higher interval = lower CPU load, lower interval = faster reaction.
+  inference_interval: 50   # further reduced CPU contention; was 25, was 10 before that
 
 tracking:
   max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
@@ -255,7 +279,18 @@ ai_acceleration:
 performance:
   rvv_enabled: true
   rvv_vlen: 256
-  openmp_threads: 6
+  # ── Thread parallelism strategy for K1 8-core ──
+  # Cluster0 (AI cores 0-3): 512KB shared TCM → AI inference
+  #   Core 0: PostProcess (tracking + spatial engine, stripped from rendering)
+  #   Core 1: Inference main (YOLO pose + face detect + ArcFace)
+  #   Core 2: ST-GCN action recognition (CPU EP, FP32)
+  #   Core 3: OpenMP worker
+  # Cluster1 (I/O cores 4-7): Data movement + visualization
+  #   Core 4: Capture (CoAP receive + JPEG decode via JPU)
+  #   Core 5: OpenMP worker
+  #   Core 6: Viz thread (visualizer rendering + fb/SDL2/RSTP output)
+  #   Core 7: OpenMP worker / OS background
+  openmp_threads: 6       # 4 cores Cluster0 + 2 cores Cluster1 for parallel loops
   pipeline_pin_to_core: true
   imu_core: 0
   inference_core: 1
@@ -291,6 +326,17 @@ k1_hardware:
     opengl_visualization: false
   pipeline:
     ring_buffer_size: 4
+    # ── K1 ∞-core pipeline mapping (optimized for multi-model parallelism) ──
+    # Cluster0 (AI, cores 0-3, 512KB shared TCM):
+    #   CPU 0: PostProcess (visualizer + tracker + spatial engine + output)
+    #   CPU 1: Inference (YOLO pose + face detect/recog + ST-GCN dispatch)
+    #   CPU 2: Reserved for future ST-GCN EP or parallel model inference
+    #   CPU 3: OpenMP worker / spare
+    # Cluster1 (I/O, cores 4-7):
+    #   CPU 4: Capture (CoAP receive + JPEG decode)
+    #   CPU 5: VPU/JPU offload / spare
+    #   CPU 6: OpenMP worker
+    #   CPU 7: OpenMP worker / OS background
     capture_thread_cpu: 4
     infer_thread_cpu: 1
     postprocess_thread_cpu: 0

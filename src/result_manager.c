@@ -1,10 +1,12 @@
 #include "result_manager.h"
+#include "spatial_engine.h"
 #include "logger.h"
 #include "utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -131,13 +133,75 @@ void result_manager_add_error(ResultManager* rm, const char* type, const char* m
     get_iso_time(err->timestamp, sizeof(err->timestamp));
 }
 
-const char* result_manager_end_session(ResultManager* rm) {
+const char* result_manager_end_session(ResultManager* rm, SpatialLocalizationEngine* spatial) {
     if (!rm || !rm->current_session) {
         log_warning("No active session to end");
         return "";
     }
 
     SessionResult* session = rm->current_session;
+
+    /* ── Export spatial trajectories before ending the session ── */
+    if (spatial) {
+        int track_ids[SPATIAL_MAX_PERSONS];
+        int num_active = spatial_engine_get_active_tracks(spatial, track_ids, SPATIAL_MAX_PERSONS);
+
+        /* Per-track CSV: output/trajectories/{session_id}_track_{id}.csv */
+        char traj_dir[MAX_PATH_LEN * 2];
+        snprintf(traj_dir, sizeof(traj_dir), "%s/trajectories", rm->base_output_dir);
+        mkdir(traj_dir, 0755);
+
+        for (int i = 0; i < num_active; i++) {
+            int tid = track_ids[i];
+            int traj_count = 0;
+            const SpatialPosition* traj = spatial_engine_get_trajectory(spatial, tid, &traj_count);
+            if (!traj || traj_count < 2) continue;
+
+            char traj_path[MAX_PATH_LEN * 3];
+            snprintf(traj_path, sizeof(traj_path), "%s/%s_track_%d.csv",
+                     traj_dir, session->session_id, tid);
+            FILE* f = fopen(traj_path, "w");
+            if (!f) continue;
+            fprintf(f, "index,x,y,z,confidence\n");
+            float total_dist = 0.0f;
+            for (int j = 0; j < traj_count; j++) {
+                fprintf(f, "%d,%.4f,%.4f,%.4f,%.4f\n",
+                        j, traj[j].x, traj[j].y, traj[j].z, traj[j].confidence);
+                if (j > 0) {
+                    float dx = traj[j].x - traj[j-1].x;
+                    float dy = traj[j].y - traj[j-1].y;
+                    float dz = traj[j].z - traj[j-1].z;
+                    total_dist += sqrtf(dx*dx + dy*dy + dz*dz);
+                }
+            }
+            fclose(f);
+
+            /* Store trajectory summary in session record */
+            if (session->num_tracked_objects < RM_MAX_TRACKED_OBJS) {
+                TrackedObjectSummary* obj = &session->tracked_objects[session->num_tracked_objects];
+                /* Update existing entry or create new one */
+                bool found = false;
+                for (int k = 0; k < session->num_tracked_objects; k++) {
+                    if (session->tracked_objects[k].track_id == tid) {
+                        obj = &session->tracked_objects[k];
+                        found = true;
+                        break;
+                    }
+                }
+                obj->track_id = tid;
+                obj->position_count = traj_count;
+                obj->start_x = traj[0].x;
+                obj->start_y = traj[0].y;
+                obj->start_z = traj[0].z;
+                obj->end_x = traj[traj_count - 1].x;
+                obj->end_y = traj[traj_count - 1].y;
+                obj->end_z = traj[traj_count - 1].z;
+                obj->total_distance_m = total_dist;
+                if (!found) session->num_tracked_objects++;
+            }
+        }
+    }
+
     get_iso_time(session->end_time, sizeof(session->end_time));
     session->active = false;
 
@@ -190,7 +254,12 @@ int result_manager_save_json_report(const ResultManager* rm, const char* session
         fprintf(f, "      \"track_id\": %d,\n", obj->track_id);
         fprintf(f, "      \"height_meters\": %.2f,\n", obj->height_meters);
         fprintf(f, "      \"position_count\": %d,\n", obj->position_count);
-        fprintf(f, "      \"pose_count\": %d\n", obj->pose_count);
+        fprintf(f, "      \"pose_count\": %d,\n", obj->pose_count);
+        fprintf(f, "      \"start_position\": [%.4f, %.4f, %.4f],\n",
+                obj->start_x, obj->start_y, obj->start_z);
+        fprintf(f, "      \"end_position\": [%.4f, %.4f, %.4f],\n",
+                obj->end_x, obj->end_y, obj->end_z);
+        fprintf(f, "      \"total_distance_m\": %.4f\n", obj->total_distance_m);
         fprintf(f, "    }%s\n", (i < session->num_tracked_objects - 1) ? "," : "");
     }
 
@@ -261,4 +330,28 @@ int result_manager_save_frame(const ResultManager* rm, const char* session_id, c
     }
 
     return ret;
+}
+
+int result_manager_save_frame_metadata(const ResultManager* rm, const char* session_id,
+                                        int frame_num, int num_detections, int num_poses,
+                                        int num_faces, int num_tracked, int has_action) {
+    if (!rm || !session_id) return -1;
+
+    char meta_path[MAX_PATH_LEN * 3];
+    snprintf(meta_path, sizeof(meta_path), "%s/reports/%s_frames.jsonl",
+             rm->base_output_dir, session_id);
+
+    FILE* f = fopen(meta_path, "a");
+    if (!f) return -1;
+
+    char timestamp[32];
+    get_iso_time(timestamp, sizeof(timestamp));
+
+    fprintf(f, "{\"frame\":%d,\"time\":\"%s\",\"detections\":%d,\"poses\":%d,"
+               "\"faces\":%d,\"tracked\":%d,\"action\":%d}\n",
+            frame_num, timestamp, num_detections, num_poses,
+            num_faces, num_tracked, has_action);
+
+    fclose(f);
+    return 0;
 }

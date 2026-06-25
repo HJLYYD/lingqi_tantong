@@ -13,7 +13,7 @@ extern "C" {
 const OrtApi* ort_get_api(void);
 OrtEnv* ort_get_env(void);
 bool ort_global_init(void);
-void ort_global_shutdown(void);
+void ort_global_shutdown(void);     /* Release global ORT environment (called once at process exit) */
 bool ort_spacemit_ep_active(void);
 
 /*

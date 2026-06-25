@@ -66,10 +66,10 @@ python -m xquant -c config.json -i model.onnx -o model.q.onnx
 
 | Model | Filename | Purpose |
 |-------|----------|---------|
-| YOLO11n | yolo11n.q.onnx | Pedestrian detection |
-| YOLOv8n-Pose | yolov8n-pose.q.onnx | Skeleton pose estimation |
+| YOLOv8n-Pose | yolov8n-pose.q.onnx | Person detection + 17-keypoint pose estimation |
+| YOLOv11n | yolov11n_320x320.q.onnx | Secondary object detection (available, disabled by default) |
 | ST-GCN | stgcn.fp32.onnx | Skeleton-based action recognition (FP32, CPU EP) |
-| YOLOv5n-Face | yolov5n-face_cut.q.onnx | Face detection |
+| YOLOv5n-Face | yolov5n-face_320_cut.q.onnx | Face detection |
 | ArcFace MobileFaceNet | arcface_mobilefacenet_cut.q.onnx | Face recognition feature extraction |
 
 ## 4. Bianbu OS

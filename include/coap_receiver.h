@@ -49,6 +49,9 @@ extern "C" {
 
 typedef struct CoapReceiver CoapReceiver;
 
+/* 原始 IMU 数据回调: 当收到 /imu 的原始 accel/gyro JSON 时调用 */
+typedef void (*CoapImuRawCallback)(void* user, const float accel[3], const float gyro[3]);
+
 CoapReceiver* coap_receiver_create(const char* esp_ip, int esp_port,
                                    const char* wifi_ssid,
                                    const char* wifi_password);
@@ -57,6 +60,8 @@ void coap_receiver_update(CoapReceiver* receiver);
 bool coap_receiver_get_latest_frame(CoapReceiver* receiver,
                                     ArrowSourceFrame* out_frame);
 bool coap_receiver_is_connected(CoapReceiver* receiver);
+void coap_receiver_set_imu_raw_callback(CoapReceiver* receiver,
+                                         CoapImuRawCallback cb, void* user);
 
 #ifdef __cplusplus
 }

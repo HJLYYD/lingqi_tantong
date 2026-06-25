@@ -31,17 +31,20 @@ static inline float utils_fast_sqrt(float x) {
     return v.f * x;
 }
 
-void utils_rgb_to_bgr(const uint8_t* rgb, uint8_t* bgr, int width, int height);
-void utils_bgr_to_rgb(const uint8_t* bgr, uint8_t* rgb, int width, int height);
-void utils_resize_image(const uint8_t* src, int src_w, int src_h,
-                        uint8_t* dst, int dst_w, int dst_h,
+void utils_rgb_to_bgr(const uint8_t* restrict rgb, uint8_t* restrict bgr, int width, int height);
+void utils_bgr_to_rgb(const uint8_t* restrict bgr, uint8_t* restrict rgb, int width, int height);
+void utils_resize_image(const uint8_t* restrict src, int src_w, int src_h,
+                        uint8_t* restrict dst, int dst_w, int dst_h,
                         int channels);
-void utils_letterbox(const uint8_t* src, int src_w, int src_h,
-                     uint8_t* dst, int dst_w, int dst_h,
+void utils_crop_image(const uint8_t* restrict src, int full_w, int full_h,
+                      int roi_x, int roi_y, int roi_w, int roi_h,
+                      uint8_t* restrict dst);
+void utils_letterbox(const uint8_t* restrict src, int src_w, int src_h,
+                     uint8_t* restrict dst, int dst_w, int dst_h,
                      int channels, float* out_scale, int* out_pad_x, int* out_pad_y);
 
-void utils_normalize_chw(const uint8_t* src, int width, int height,
-                         float* dst, float scale, float mean, float std);
+void utils_normalize_chw(const uint8_t* restrict src, int width, int height,
+                         float* restrict dst, float scale, float mean, float std);
 
 float utils_median_float(float* arr, int len);
 void utils_sort_float_desc(float* arr, int* indices, int len);

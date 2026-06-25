@@ -39,7 +39,7 @@ typedef struct {
     DisplayOutput* display_output;
 
     PipelineMode mode;
-    int frame_count;
+    volatile int frame_count;     /* shared: postproc writes, stgcn/viz read; volatile prevents compiler hoisting */
     int max_frames;               /* 0 = unlimited */
     int frame_timeout_s;          /* auto-exit after N seconds of no frames */
     double start_time;
@@ -60,10 +60,10 @@ typedef struct {
     char coap_wifi_password[64];
 
     float fps_history[SC_MAX_FPS_HISTORY];
-    int fps_history_count;
+    volatile int fps_history_count;   /* shared: postproc writes, viz reads via get_current_fps */
     float processing_times[SC_MAX_PROC_TIMES];
-    int proc_times_count;
-    int detection_count;
+    volatile int proc_times_count;    /* shared: postproc writes, viz reads */
+    volatile int detection_count;     /* shared: postproc writes, viz reads */
     volatile sig_atomic_t running;   /* sig_atomic_t: safe for signal handler + cross-thread with -O3 */
 } SystemController;
 

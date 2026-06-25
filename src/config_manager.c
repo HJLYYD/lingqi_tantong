@@ -38,7 +38,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_string(cm, "system.log_level", "INFO");
 
     config_set_string(cm, "detection.backend", "ai_accel");
-    config_set_string(cm, "detection.model_path", "");  /* empty = disabled (unified mode: yolo11n-pose handles both) */
+    config_set_string(cm, "detection.model_path", "");  /* empty = disabled (unified mode: yolov8n-pose handles both) */
     config_set_float(cm, "detection.confidence_threshold", 0.12f);  /* DFL peakiness for quantized models */
     config_set_float(cm, "detection.iou_threshold", 0.40f);         /* NMS for secondary detector */
     config_set_int(cm, "detection.input_size", 640);
@@ -60,7 +60,7 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_float(cm, "detection.fallback_area_ratio_min", 0.008f);
 
     config_set_string(cm, "pose.backend", "ai_accel");
-    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx");
+    config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
     config_set_float(cm, "pose.confidence_threshold", 0.10f);  /* DFL peakiness for quantized pose model */
     config_set_float(cm, "pose.iou_threshold", 0.40f);
     config_set_int(cm, "pose.input_size.0", 640);
@@ -69,7 +69,7 @@ static void config_set_defaults(ConfigManager* cm) {
 
     config_set_string(cm, "face.detection_backend", "ai_accel");
     config_set_string(cm, "face.recognition_backend", "ai_accel");
-    config_set_string(cm, "face.detection_model_path", "models/Face Recognition/yolov5n-face_cut.q.onnx");
+    config_set_string(cm, "face.detection_model_path", "models/Face Recognition/yolov5n-face_320_cut.q.onnx");
     config_set_string(cm, "face.recognition_model_path", "models/Face Recognition/arcface_mobilefacenet_cut.q.onnx");
     config_set_int(cm, "face.face_min_size", 24);
     config_set_float(cm, "face.confidence_threshold", 0.5f);

@@ -21,7 +21,7 @@ You are a technical assistant that prioritizes tools & latest knowledge. For any
 
 ### Model Management
 - Quantized models use `.q.onnx` suffix (xquant INT8). SpacemiT EP auto-detects and registers.
-- Pedestrian detection uses YOLO11n (yolov8_detector module, YOLO11 model). Face detection uses YOLOv5-Face (yolov5_face_detector).
+- Pedestrian detection uses YOLOv8n-Pose (yolov8_pose_estimator module, from official BRDK CV demo). Face detection uses YOLOv5-Face (yolov5_face_detector).
 - Action recognition uses ST-GCN (stgcn_action_recognizer), FP32 model on CPU EP. Takes pose keypoints as input.
 - SCRFD code is retained but excluded from build. Depth estimation (MiDaS) has been removed.
 - Model registry is in model_store.c MODEL_REGISTRY. Config defaults are in config_manager.c config_set_defaults.

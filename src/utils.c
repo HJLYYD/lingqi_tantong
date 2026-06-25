@@ -19,12 +19,35 @@
 #include <turbojpeg.h>
 #endif
 
-#ifdef HAS_OPENMP
-#include <omp.h>
+#ifdef HAS_K1_JPU_LIB
+#include "k1_jpu.h"
 #endif
 
-void utils_rgb_to_bgr(const uint8_t* rgb, uint8_t* bgr, int width, int height) {
+#ifdef HAS_RVV_OPT
+#if defined(__GNUC__) && !defined(__clang__)
+#include <riscv_vector.h>
+#endif
+#endif
+
+#ifdef HAS_OPENMP
+#ifdef __clang__
+/* Clang + riscv64: libomp not packaged on Bianbu, we link libgomp via
+ * -fopenmp=libgomp.  GCC's omp.h uses __attribute__((__malloc__(omp_free)))
+ * which Clang rejects.  Declare only the functions we actually use. */
+void omp_set_num_threads(int n);
+int  omp_get_num_threads(void);
+int  omp_get_thread_num(void);
+int  omp_get_max_threads(void);
+#else
+#include <omp.h>
+#endif
+#endif
+
+void utils_rgb_to_bgr(const uint8_t* restrict rgb, uint8_t* restrict bgr, int width, int height) {
     int pixels = width * height;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int i = 0; i < pixels; i++) {
         bgr[i * 3 + 0] = rgb[i * 3 + 2];
         bgr[i * 3 + 1] = rgb[i * 3 + 1];
@@ -32,8 +55,11 @@ void utils_rgb_to_bgr(const uint8_t* rgb, uint8_t* bgr, int width, int height) {
     }
 }
 
-void utils_bgr_to_rgb(const uint8_t* bgr, uint8_t* rgb, int width, int height) {
+void utils_bgr_to_rgb(const uint8_t* restrict bgr, uint8_t* restrict rgb, int width, int height) {
     int pixels = width * height;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int i = 0; i < pixels; i++) {
         rgb[i * 3 + 0] = bgr[i * 3 + 2];
         rgb[i * 3 + 1] = bgr[i * 3 + 1];
@@ -41,12 +67,107 @@ void utils_bgr_to_rgb(const uint8_t* bgr, uint8_t* rgb, int width, int height) {
     }
 }
 
-void utils_resize_image(const uint8_t* src, int src_w, int src_h,
-                        uint8_t* dst, int dst_w, int dst_h,
+/*
+ * Crop a rectangular region from a full-frame image (with stride=full_w*3).
+ * Copies roi_w × roi_h pixels from (roi_x, roi_y) in the source frame to a
+ * contiguous output buffer (stride=roi_w*3).  Channels is always 3 (RGB).
+ */
+void utils_crop_image(const uint8_t* restrict src, int full_w, int full_h,
+                      int roi_x, int roi_y, int roi_w, int roi_h,
+                      uint8_t* restrict dst) {
+    if (!src || !dst || roi_w <= 0 || roi_h <= 0) return;
+    for (int y = 0; y < roi_h; y++) {
+        int src_y = roi_y + y;
+        if (src_y < 0 || src_y >= full_h) {
+            memset(dst + (size_t)y * roi_w * 3, 0, (size_t)roi_w * 3);
+            continue;
+        }
+        int src_start_x = roi_x;
+        int copy_w = roi_w;
+        int dst_offset = 0;
+        if (src_start_x < 0) {
+            dst_offset = -src_start_x * 3;
+            copy_w += src_start_x;
+            src_start_x = 0;
+        }
+        if (src_start_x + copy_w > full_w) {
+            copy_w = full_w - src_start_x;
+        }
+        if (copy_w > 0) {
+            memcpy(dst + (size_t)y * roi_w * 3 + dst_offset,
+                   src + ((size_t)src_y * full_w + src_start_x) * 3,
+                   (size_t)copy_w * 3);
+        }
+        /* Zero any remaining right-side padding */
+        if ((size_t)(dst_offset + copy_w * 3) < (size_t)roi_w * 3) {
+            memset(dst + (size_t)y * roi_w * 3 + dst_offset + copy_w * 3, 0,
+                   (size_t)roi_w * 3 - dst_offset - (size_t)copy_w * 3);
+        }
+    }
+}
+
+void utils_resize_image(const uint8_t* restrict src, int src_w, int src_h,
+                        uint8_t* restrict dst, int dst_w, int dst_h,
                         int channels) {
     float x_ratio = (float)src_w / dst_w;
     float y_ratio = (float)src_h / dst_h;
 
+#if defined(HAS_RVV_OPT) && defined(__GNUC__) && !defined(__clang__)
+    /*
+     * RVV-accelerated nearest-neighbor resize for the 3-channel hot path.
+     * Processes 8 pixels at a time using LMUL=8 (vlen=256 → 32 bytes).
+     * Falls back to scalar for edge cases (non-3-channel, small images).
+     */
+    if (channels == 3 && dst_w >= 8) {
+        /* Pre-compute source x indices for each destination column */
+        int* src_x_tab = (int*)malloc((size_t)dst_w * sizeof(int));
+        if (src_x_tab) {
+            for (int x = 0; x < dst_w; x++) {
+                int sx = (int)(x * x_ratio);
+                src_x_tab[x] = UTILS_MIN(sx, src_w - 1);
+            }
+
+#ifdef HAS_OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for (int y = 0; y < dst_h; y++) {
+                int src_y = (int)(y * y_ratio);
+                src_y = UTILS_MIN(src_y, src_h - 1);
+                uint8_t* dst_row = dst + (size_t)y * dst_w * 3;
+
+                size_t vl;
+                int x = 0;
+                /* Process 8 pixels per RVV iteration (24 bytes per pixel-group × 8 = 192 bytes with LMUL=8) */
+                for (; x + 7 < dst_w; x += 8) {
+                    vl = __riscv_vsetvl_e8m4(24); /* 8 pixels × 3 channels */
+                    /* Gather source pixels */
+                    uint8_t gathered[24];
+                    for (int k = 0; k < 8; k++) {
+                        int sx = src_x_tab[x + k];
+                        int si = (src_y * src_w + sx) * 3;
+                        gathered[k * 3 + 0] = src[si + 0];
+                        gathered[k * 3 + 1] = src[si + 1];
+                        gathered[k * 3 + 2] = src[si + 2];
+                    }
+                    vint8m4_t vec = __riscv_vle8_v_i8m4((int8_t*)gathered, vl);
+                    __riscv_vse8_v_i8m4((int8_t*)(dst_row + x * 3), vec, vl);
+                }
+                /* Tail: scalar fallback */
+                for (; x < dst_w; x++) {
+                    int sx = src_x_tab[x];
+                    int si = (src_y * src_w + sx) * 3;
+                    int di = x * 3;
+                    dst_row[di + 0] = src[si + 0];
+                    dst_row[di + 1] = src[si + 1];
+                    dst_row[di + 2] = src[si + 2];
+                }
+            }
+            free(src_x_tab);
+            return;
+        }
+    }
+#endif
+    /* Fallback scalar path */
 #ifdef HAS_OPENMP
     #pragma omp parallel for collapse(2) schedule(static)
 #endif
@@ -67,8 +188,8 @@ void utils_resize_image(const uint8_t* src, int src_w, int src_h,
     }
 }
 
-void utils_letterbox(const uint8_t* src, int src_w, int src_h,
-                     uint8_t* dst, int dst_w, int dst_h,
+void utils_letterbox(const uint8_t* restrict src, int src_w, int src_h,
+                     uint8_t* restrict dst, int dst_w, int dst_h,
                      int channels, float* out_scale, int* out_pad_x, int* out_pad_y) {
     float scale = UTILS_MIN((float)dst_w / src_w, (float)dst_h / src_h);
     int new_w = (int)(src_w * scale);
@@ -102,14 +223,17 @@ void utils_letterbox(const uint8_t* src, int src_w, int src_h,
     if (out_pad_y) *out_pad_y = pad_y;
 }
 
-void utils_normalize_chw(const uint8_t* src, int width, int height,
-                         float* dst, float scale, float mean, float std) {
+void utils_normalize_chw(const uint8_t* restrict src, int width, int height,
+                         float* restrict dst, float scale, float mean, float std) {
     int pixels = width * height;
 #ifdef HAS_OPENMP
     #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int c = 0; c < 3; c++) {
         for (int y = 0; y < height; y++) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
             for (int x = 0; x < width; x++) {
                 int src_idx = (y * width + x) * 3 + c;
                 int dst_idx = c * pixels + y * width + x;
@@ -261,6 +385,24 @@ int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
         return -2;
     }
 
+    /*
+     * K1 JPU hardware decode (优先): 释放 CPU 给推理任务。
+     * 需要 k1x-jpu SDK (cmake -DK1_JPU_DIR=/path/to/k1x-jpu)。
+     * 失败时静默回退到 libjpeg-turbo 软解码。
+     */
+#ifdef HAS_K1_JPU_LIB
+    if (k1_jpu_is_available()) {
+        int jpu_ret = k1_jpu_decode_to_rgb(jpeg_data, jpeg_len, rgb_out, out_w, out_h);
+        if (jpu_ret == 0) return 0;  /* JPU 硬解码成功 */
+        /* JPU 失败 → 回退到 libjpeg-turbo 软解码 */
+        static int jpu_fallback_count = 0;
+        if (++jpu_fallback_count <= 3 || jpu_fallback_count % 50 == 0) {
+            log_warning("JPU decode failed (ret=%d), falling back to software (%d fallbacks)",
+                      jpu_ret, jpu_fallback_count);
+        }
+    }
+#endif
+
 #ifdef HAS_LIBJPEG_TURBO
     tjhandle handle = tjInitDecompress();
     if (!handle) {
@@ -280,11 +422,12 @@ int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
         int ret = tjDecompress2(handle, jpeg_data, (unsigned long)jpeg_len,
                                 rgb_out, out_w, 0 /* pitch=0 → tight */,
                                 out_h, TJPF_RGB, TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
-        tjDestroy(handle);
         if (ret != 0) {
             log_error("tjDecompress2 failed: %s", tjGetErrorStr2(handle));
+            tjDestroy(handle);
             return -5;
         }
+        tjDestroy(handle);
         return 0;
     }
 

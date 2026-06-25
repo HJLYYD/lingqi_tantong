@@ -5,9 +5,11 @@
 #include "logger.h"
 #include "utils.h"
 #include "k1_platform.h"
+#include "k1_imu.h"
 #include "video_processor.h"
 #include "ort_common.h"
 #include "spacemit_ort_bridge.h"
+#include "stgcn_action_recognizer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,7 +28,8 @@ static float get_current_fps(const SystemController* sc);
 #include <unistd.h>
 
 #define K1_RING_SIZE        4
-#define K1_MAX_PIPELINE_THREADS 6
+#define K1_MAX_PIPELINE_THREADS 8
+#define K1_PIPELINE_NUM_HEARTS   6   /* capture, inference, stgcn, postprocess, viz, output */
 
 typedef struct {
     uint8_t* rgb_data;
@@ -61,6 +64,7 @@ typedef struct {
     pthread_mutex_t ring_mutex;
     pthread_cond_t capture_done_cond;
     pthread_cond_t infer_done_cond;
+    pthread_cond_t track_done_cond;
     pthread_cond_t post_done_cond;
 
     pthread_t threads[K1_MAX_PIPELINE_THREADS];
@@ -72,8 +76,8 @@ typedef struct {
      * Each worker thread bumps its heartbeat every loop iteration.
      * Main thread checks hearts are still beating; if a thread dies,
      * it shuts down the pipeline to prevent deadlocks. */
-    volatile int thread_heartbeats[3];  /* [0]=capture, [1]=inference, [2]=postprocess */
-    volatile bool thread_alive[3];
+    volatile int thread_heartbeats[K1_PIPELINE_NUM_HEARTS];  /* [0]=capture, [1]=inference, [2]=stgcn, [3]=postprocess, [4]=viz */
+    volatile bool thread_alive[K1_PIPELINE_NUM_HEARTS];
 
     SystemController* controller;
 } K1Pipeline;
@@ -131,16 +135,20 @@ static void k1_pipeline_init(K1Pipeline* pl, SystemController* sc) {
     pthread_mutex_init(&pl->ring_mutex, NULL);
     pthread_cond_init(&pl->capture_done_cond, NULL);
     pthread_cond_init(&pl->infer_done_cond, NULL);
+    pthread_cond_init(&pl->track_done_cond, NULL);
     pthread_cond_init(&pl->post_done_cond, NULL);
 }
 
 static void k1_pipeline_destroy(K1Pipeline* pl) {
+    /* Set shutdown UNDER the mutex so waiting threads atomically see the new
+     * predicate.  Broadcast after unlock is safe; the mutex provides the
+     * memory barrier for the flag write. */
+    pthread_mutex_lock(&pl->ring_mutex);
     pl->running = false;
     pl->shutdown = true;
-
-    pthread_mutex_lock(&pl->ring_mutex);
     pthread_cond_broadcast(&pl->capture_done_cond);
     pthread_cond_broadcast(&pl->infer_done_cond);
+    pthread_cond_broadcast(&pl->track_done_cond);
     pthread_cond_broadcast(&pl->post_done_cond);
     pthread_mutex_unlock(&pl->ring_mutex);
 
@@ -152,6 +160,7 @@ static void k1_pipeline_destroy(K1Pipeline* pl) {
     pthread_mutex_destroy(&pl->ring_mutex);
     pthread_cond_destroy(&pl->capture_done_cond);
     pthread_cond_destroy(&pl->infer_done_cond);
+    pthread_cond_destroy(&pl->track_done_cond);
     pthread_cond_destroy(&pl->post_done_cond);
 }
 
@@ -178,6 +187,10 @@ static void k1_pipeline_slot_capture_done(K1Pipeline* pl, int slot) {
     pthread_cond_signal(&s->avail_cond);
     pthread_mutex_unlock(&s->mutex);
 
+    /* Full memory barrier: ensures has_frame is visible to threads
+     * scanning under ring_mutex on RISC-V (weak memory ordering). */
+    __sync_synchronize();
+
     pthread_mutex_lock(&pl->ring_mutex);
     pthread_cond_signal(&pl->capture_done_cond);
     pthread_mutex_unlock(&pl->ring_mutex);
@@ -192,6 +205,8 @@ static int k1_pipeline_slot_wait_captured(K1Pipeline* pl) {
         pthread_mutex_unlock(&pl->ring_mutex);
         return -1;
     }
+
+    __sync_synchronize();  /* RISC-V: see has_frame stores from capture_done */
 
     for (int i = 0; i < K1_RING_SIZE; i++) {
         int idx = (pl->infer_idx + i) % K1_RING_SIZE;
@@ -213,6 +228,8 @@ static void k1_pipeline_slot_infer_done(K1Pipeline* pl, int slot) {
     pthread_cond_signal(&s->avail_cond);
     pthread_mutex_unlock(&s->mutex);
 
+    __sync_synchronize();  /* RISC-V weak-memory barrier */
+
     pthread_mutex_lock(&pl->ring_mutex);
     pthread_cond_signal(&pl->infer_done_cond);
     pthread_mutex_unlock(&pl->ring_mutex);
@@ -220,6 +237,7 @@ static void k1_pipeline_slot_infer_done(K1Pipeline* pl, int slot) {
 
 static int k1_pipeline_slot_wait_inferred(K1Pipeline* pl) {
     pthread_mutex_lock(&pl->ring_mutex);
+    __sync_synchronize();  /* RISC-V: see has_inference stores from infer_done */
     while (!pl->shutdown) {
         for (int i = 0; i < K1_RING_SIZE; i++) {
             int idx = (pl->post_idx + i) % K1_RING_SIZE;
@@ -231,6 +249,39 @@ static int k1_pipeline_slot_wait_inferred(K1Pipeline* pl) {
             }
         }
         pthread_cond_wait(&pl->infer_done_cond, &pl->ring_mutex);
+    }
+    pthread_mutex_unlock(&pl->ring_mutex);
+    return -1;
+}
+
+static void k1_pipeline_slot_tracking_done(K1Pipeline* pl, int slot) {
+    K1PipelineSlot* s = &pl->slots[slot];
+    pthread_mutex_lock(&s->mutex);
+    s->has_tracking = true;
+    pthread_cond_signal(&s->avail_cond);
+    pthread_mutex_unlock(&s->mutex);
+
+    __sync_synchronize();  /* RISC-V weak-memory barrier */
+
+    pthread_mutex_lock(&pl->ring_mutex);
+    pthread_cond_signal(&pl->track_done_cond);
+    pthread_mutex_unlock(&pl->ring_mutex);
+}
+
+static int k1_pipeline_slot_wait_tracked(K1Pipeline* pl) {
+    pthread_mutex_lock(&pl->ring_mutex);
+    __sync_synchronize();  /* RISC-V: see has_tracking stores from tracking_done */
+    while (!pl->shutdown) {
+        for (int i = 0; i < K1_RING_SIZE; i++) {
+            int idx = (pl->post_idx + i) % K1_RING_SIZE;
+            K1PipelineSlot* s = &pl->slots[idx];
+            if (s->has_tracking) {
+                pl->post_idx = idx;
+                pthread_mutex_unlock(&pl->ring_mutex);
+                return idx;
+            }
+        }
+        pthread_cond_wait(&pl->track_done_cond, &pl->ring_mutex);
     }
     pthread_mutex_unlock(&pl->ring_mutex);
     return -1;
@@ -291,9 +342,16 @@ static void* k1_capture_thread(void* arg) {
 
     double last_frame_time = k1_get_time_ms() / 1000.0;
     int cap_attempts = 0, cap_coap_ok = 0;
+    int consecutive_decode_fails = 0;
+    int consecutive_frame_misses = 0;
+    (void)cap_coap_ok; (void)consecutive_frame_misses;
 
     while (pl->running) {
         pl->thread_heartbeats[0]++;
+
+        /* ── Check shutdown BEFORE any blocking call ── */
+        if (pl->shutdown) break;
+
         int slot = k1_pipeline_slot_acquire(pl);
         if (slot < 0) break;
 
@@ -321,27 +379,36 @@ static void* k1_capture_thread(void* arg) {
             }
         }
 
+        /* ── K1 本地 IMU: 读取并馈送到 Madgwick 滤波器 ── */
+        {
+            IMUHandler* imuh = sc->imu_handler;
+            if (imuh && imuh->k1_imu) {
+                K1Imu* ki = (K1Imu*)imuh->k1_imu;
+                IMUData k1_raw;
+                if (k1_imu_read_sample(ki, &k1_raw)) {
+                    imu_handler_feed_k1_imu(imuh, &k1_raw);
+                }
+            }
+        }
+
         if (!got_frame && use_coap) {
             ArrowSourceFrame coap_frame;
             if (coap_receiver_get_latest_frame(sc->coap_receiver, &coap_frame)) {
                 cap_coap_ok++;
-                double decode_start = k1_get_time_ms();
                 if (soft_jpeg_decode_to_rgb(coap_frame.jpeg_data, coap_frame.jpeg_len,
                                             s->rgb_data, cam_w, cam_h) == 0) {
-                    double decode_ms = k1_get_time_ms() - decode_start;
                     got_frame = true;
                     s->timestamp_us = (int64_t)coap_frame.timestamp;
                     s->frame_index = coap_frame.frame_index;
-                    if (coap_frame.frame_index <= 3 ||
-                        coap_frame.frame_index % 30 == 0) {
-                        log_info("[Capture] CoAP frame#%d | JPEG=%zuB decode=%.1fms "
-                                 "| ok=%d/%d attempts",
-                                 coap_frame.frame_index, coap_frame.jpeg_len,
-                                 decode_ms, cap_coap_ok, cap_attempts);
-                    }
+                    consecutive_decode_fails = 0;
                 } else {
-                    log_warning("[K1 Pipeline] CoAP decode failed frame#%d: %zu bytes",
-                                coap_frame.frame_index, coap_frame.jpeg_len);
+                    consecutive_decode_fails++;
+                    if (consecutive_decode_fails <= 3 || consecutive_decode_fails % 10 == 0) {
+                        log_warning("[K1 Pipeline] CoAP decode failed frame#%d: %zu bytes "
+                                    "(%d consecutive fails — check WiFi signal / ESP32 stability)",
+                                    coap_frame.frame_index, coap_frame.jpeg_len,
+                                    consecutive_decode_fails);
+                    }
                 }
 
                 if (coap_frame.has_pose) {
@@ -357,13 +424,14 @@ static void* k1_capture_thread(void* arg) {
         }
 
         if (!got_frame) {
+            consecutive_frame_misses++;
             if (cap_attempts == 1) {
-                log_info("[K1 Pipeline] Waiting for first frame (CoAP=%d V4L2=%d)...",
+                log_info("[Pipeline] Waiting for first frame (CoAP=%d V4L2=%d)...",
                          use_coap, use_v4l2);
-            } else if (cap_attempts <= 5 || cap_attempts % 300 == 0) {
+            } else if (cap_attempts <= 3 || cap_attempts % 500 == 0) {
                 double idle_s = (k1_get_time_ms() / 1000.0) - last_frame_time;
-                log_info("[K1 Pipeline] No frame after %d attempts (%.0fs idle, V4L2=%d coap=%d, ok=%d)",
-                         cap_attempts, idle_s, use_v4l2, use_coap, cap_coap_ok);
+                log_info("[Pipeline] No frame: %d attempts, %.0fs idle",
+                         cap_attempts, idle_s);
             }
             /* ── Frame timeout check ── */
             double now_s = k1_get_time_ms() / 1000.0;
@@ -372,8 +440,13 @@ static void* k1_capture_thread(void* arg) {
                 log_info("[K1 Pipeline] No frames received for %.0fs (timeout=%ds), shutting down",
                          idle_s, sc->frame_timeout_s);
                 sc->running = 0;
-                pl->running = false;
                 pthread_mutex_lock(&pl->ring_mutex);
+                pl->running = false;
+                pl->shutdown = true;
+                pthread_cond_broadcast(&pl->capture_done_cond);
+                pthread_cond_broadcast(&pl->infer_done_cond);
+                pthread_cond_broadcast(&pl->track_done_cond);
+                pthread_cond_broadcast(&pl->post_done_cond);
                 pl->active_slots--;
                 pl->capture_idx = (pl->capture_idx - 1 + K1_RING_SIZE) % K1_RING_SIZE;
                 pthread_cond_signal(&pl->post_done_cond);
@@ -391,6 +464,7 @@ static void* k1_capture_thread(void* arg) {
         }
 
         last_frame_time = k1_get_time_ms() / 1000.0;
+        consecutive_frame_misses = 0;
         k1_pipeline_slot_capture_done(pl, slot);
     }
 
@@ -426,6 +500,59 @@ static void* k1_inference_thread(void* arg) {
     return NULL;
 }
 
+/*
+ * ── K1 ST-GCN async thread (CPU 2, Cluster0) ──
+ *
+ * ST-GCN 使用 CPU EP (FP32 模型, 未量化), 不占用 TCM。
+ * 在独立核心上异步运行, 与 YOLO/Face 推理 (CPU 1) 并行:
+ *   CPU 1: pose + face detect + face recog (SpacemiT EP, ~200ms)
+ *   CPU 2: ST-GCN action recognition (CPU EP, FP32, ~400ms every 50 frames)
+ *
+ * 唤醒间隔 = action_inference_interval 帧 (config: 50 frames ≈ 12s at 4 FPS)
+ * 单次推理 ~400ms, 在间隔内安全完成。
+ */
+static void* k1_stgcn_thread(void* arg) {
+    K1ThreadArg* ta = (K1ThreadArg*)arg;
+    K1Pipeline* pl = ta->pipeline;
+    SystemController* sc = pl->controller;
+
+    k1_pin_current_to_cpu(ta->cpu_core);
+    k1_apply_rt_priority("ST-GCN");
+    pl->thread_alive[2] = true;
+    log_info("[K1 Pipeline] ST-GCN thread on CPU %d (Cluster0)", ta->cpu_core);
+
+    int interval = 10; /* default, updated below */
+    {
+        AIInferencePipeline* ip = sc->inference_pipeline;
+        if (ip && ip->action_recognizer) {
+            interval = ip->action_inference_interval;
+        }
+    }
+    log_info("[K1 Pipeline] ST-GCN async interval: %d frames", interval);
+
+    int last_run_frame = 0;
+    while (pl->running) {
+        pl->thread_heartbeats[2]++;
+
+        /* Check if it's time to run (based on frame count) */
+        int current_frame = sc->frame_count;
+        if (current_frame > 0 &&
+            current_frame - last_run_frame >= interval &&
+            sc->inference_pipeline &&
+            sc->inference_pipeline->action_recognizer) {
+            last_run_frame = current_frame;
+            stgcn_action_recognizer_run_async(
+                sc->inference_pipeline->action_recognizer);
+        }
+
+        /* Sleep 5ms between checks — ST-GCN runs infrequently,
+         * no need to spin tight. */
+        usleep(5000);
+    }
+
+    return NULL;
+}
+
 static void* k1_postprocess_thread(void* arg) {
     K1ThreadArg* ta = (K1ThreadArg*)arg;
     K1Pipeline* pl = ta->pipeline;
@@ -433,18 +560,15 @@ static void* k1_postprocess_thread(void* arg) {
 
     k1_pin_current_to_cpu(ta->cpu_core);
     k1_apply_rt_priority("PostProcess");
-    pl->thread_alive[2] = true;
+    pl->thread_alive[3] = true;
     log_info("[K1 Pipeline] Post-process thread on CPU %d (Cluster0)", ta->cpu_core);
 
     int cam_w = pl->slots[0].width;
     int cam_h = pl->slots[0].height;
     float cam_fps = 15.0f;
 
-    uint8_t* vis_buffer = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
-    if (!vis_buffer) return NULL;
-
     while (pl->running) {
-        pl->thread_heartbeats[2]++;
+        pl->thread_heartbeats[3]++;
         int slot = k1_pipeline_slot_wait_inferred(pl);
         if (slot < 0) break;
 
@@ -501,9 +625,27 @@ static void* k1_postprocess_thread(void* arg) {
             obj->has_height = true;
         }
 
+        /* ── Save tracked objects to result manager ── */
+        for (int i = 0; i < tracking.num_tracked; i++) {
+            TrackedObject* obj = &tracking.tracked_objects[i];
+            if (obj->frames_seen >= 3) {
+                result_manager_add_tracked_object(sc->result_manager,
+                    obj->track_id, obj->height_meters,
+                    obj->frames_seen, obj->has_pose ? 1 : 0);
+            }
+        }
+
         IMUExternalPose imu_pose;
         if (imu_handler_get_latest_pose(sc->imu_handler, &imu_pose)) {
             spatial_engine_set_camera_pose(sc->spatial_engine, imu_pose.pitch, imu_pose.roll, imu_pose.yaw);
+        }
+
+        /* ── 双 IMU 状态 (每 30 帧) ── */
+        if (sc->frame_count % 30 == 0 && sc->imu_handler) {
+            if (!imu_handler_is_alignment_done(sc->imu_handler)) {
+                log_info("[IMU] Aligning frames... (%d/200 samples)",
+                         sc->imu_handler->align_ctx.samples_collected);
+            }
         }
 
         sc->detection_count += tracking.num_tracked;
@@ -515,7 +657,7 @@ static void* k1_postprocess_thread(void* arg) {
             sc->processing_times[sc->proc_times_count++] = (float)(frame_time / 1000.0);
         }
 
-        /* ── Real FPS from elapsed wall-clock time (was hardcoded 1.0) ── */
+        /* ── Real FPS from elapsed wall-clock time ── */
         static double last_fps_time_ms = 0;
         double now_ms = k1_get_time_ms();
         float current_fps = 1.0f;
@@ -528,41 +670,85 @@ static void* k1_postprocess_thread(void* arg) {
             sc->fps_history[sc->fps_history_count++] = current_fps;
         }
 
-        float avg_fps = get_current_fps(sc);
+        /* Store tracking result in slot for viz thread */
+        s->tracking = tracking;
 
-        /* ── Phase timing breakdown ── */
-        double t0 = k1_get_time_ms();
-
-        visualizer_render_detection_view(sc->visualizer,
-                                          s->rgb_data, cam_w, cam_h,
-                                          tracking.tracked_objects, tracking.num_tracked,
-                                          sc->frame_count, avg_fps,
-                                          vis_buffer);
-        double t_vis = k1_get_time_ms();
-
-        /* ── Output to display / stream / video file ── */
-        if (sc->display_output) {
-            display_output_write_frame(sc->display_output, vis_buffer);
-        }
-        double t_display = k1_get_time_ms();
-
-        // 每 30 帧打印一次详细管道耗时分解
-        if (sc->frame_count % 30 == 0) {
-            double t_total = t_display - proc_start_ms;
-            double t_track_spatial = t0 - proc_start_ms;
-            double t_vis_ms = t_vis - t0;
-            double t_disp_ms = t_display - t_vis;
-            log_info("[K1 Pipeline] Frame %d: %d objs, %.1f FPS | "
-                     "track+spatial=%.0fms vis=%.0fms display=%.0fms total=%.0fms",
-                     sc->frame_count, tracking.num_tracked, avg_fps,
-                     t_track_spatial, t_vis_ms, t_disp_ms, t_total);
-        }
-
-        /* ── Max frames check (signal shutdown via controller) ── */
+        /* Max frames check */
         if (sc->max_frames > 0 && sc->frame_count >= sc->max_frames) {
             log_info("[K1 Pipeline] Reached max_frames=%d, shutting down", sc->max_frames);
             sc->running = 0;
+            pthread_mutex_lock(&pl->ring_mutex);
             pl->running = false;
+            pl->shutdown = true;
+            pthread_cond_broadcast(&pl->capture_done_cond);
+            pthread_cond_broadcast(&pl->infer_done_cond);
+            pthread_cond_broadcast(&pl->track_done_cond);
+            pthread_cond_broadcast(&pl->post_done_cond);
+            pthread_mutex_unlock(&pl->ring_mutex);
+        }
+
+        k1_pipeline_slot_tracking_done(pl, slot);
+    }
+
+    return NULL;
+}
+
+/*
+ * ── K1 Viz/Render thread (CPU 6, Cluster1) ──
+ *
+ * Offloads visualization rendering and display output from Cluster0
+ * to Cluster1.  Renders bounding-box overlay + skeleton onto vis_buffer
+ * and pushes to display_output (framebuffer / RTSP / file).
+ */
+static void* k1_viz_thread(void* arg) {
+    K1ThreadArg* ta = (K1ThreadArg*)arg;
+    K1Pipeline* pl = ta->pipeline;
+    SystemController* sc = pl->controller;
+
+    k1_pin_current_to_cpu(ta->cpu_core);
+    pl->thread_alive[4] = true;
+    log_info("[K1 Pipeline] Viz thread on CPU %d (Cluster1)", ta->cpu_core);
+
+    int cam_w = pl->slots[0].width;
+    int cam_h = pl->slots[0].height;
+    uint8_t* vis_buffer = (uint8_t*)malloc((size_t)cam_w * cam_h * 3);
+    if (!vis_buffer) return NULL;
+
+    while (pl->running) {
+        pl->thread_heartbeats[4]++;
+        int slot = k1_pipeline_slot_wait_tracked(pl);
+        if (slot < 0) break;
+
+        K1PipelineSlot* s = &pl->slots[slot];
+        TrackingResult* tracking = &s->tracking;
+        float avg_fps = get_current_fps(sc);
+
+        /* Render detection view */
+        visualizer_render_detection_view(sc->visualizer,
+                                          s->rgb_data, cam_w, cam_h,
+                                          tracking->tracked_objects, tracking->num_tracked,
+                                          sc->frame_count, avg_fps,
+                                          vis_buffer);
+
+        /* Push to display / stream / video file (non-blocking, async internal threads) */
+        if (sc->display_output) {
+            display_output_write_frame(sc->display_output, vis_buffer);
+        }
+
+        /* Periodic status log */
+        if (sc->frame_count % 30 == 0) {
+            log_info("[STATUS] frame=%d | objs=%d | %.1f FPS",
+                     sc->frame_count, tracking->num_tracked, avg_fps);
+        }
+
+        /* ── Save per-frame metadata (JSON lines) ── */
+        {
+            const InferenceResult* ir = &s->inference;
+            int has_action = (ir->has_action && ir->action.num_actions > 0) ? 1 : 0;
+            result_manager_save_frame_metadata(sc->result_manager,
+                "realtime", sc->frame_count,
+                ir->num_detections, ir->num_poses,
+                ir->num_faces, tracking->num_tracked, has_action);
         }
 
         k1_pipeline_slot_release(pl, slot);
@@ -619,7 +805,21 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
         if (sc->coap_receiver) {
             log_info("[K1 Pipeline] CoAP receiver: %s:%d (CoAP/UDP)",
                      sc->coap_esp_ip, sc->coap_esp_port);
+            /* 注册原始 IMU 数据回调 → Madgwick 相机滤波器 */
+            coap_receiver_set_imu_raw_callback(sc->coap_receiver,
+                (CoapImuRawCallback)imu_handler_feed_external_raw, sc->imu_handler);
         }
+    }
+
+    /* ── K1 本地 I2C IMU (GY85) ── */
+    int k1_imu_bus = config_get_int(sc->config, "k1_imu.i2c_bus", 4);
+    float k1_imu_rate = (float)config_get_float(sc->config, "k1_imu.sample_rate_hz", 100.0);
+    K1Imu* k1_imu = k1_imu_create(k1_imu_bus, k1_imu_rate);
+    if (k1_imu && k1_imu_get_state(k1_imu) != K1_IMU_STATE_ERROR) {
+        imu_handler_set_k1_imu(sc->imu_handler, k1_imu);
+        log_info("[K1 Pipeline] K1 local IMU: /dev/i2c-%d @ %.0fHz", k1_imu_bus, k1_imu_rate);
+    } else {
+        log_warning("[K1 Pipeline] K1 local IMU unavailable — using ESP32 IMU only");
     }
 
     /* ── Create display output ── */
@@ -660,6 +860,11 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
     const char* session_id = result_manager_start_session(sc->result_manager, "realtime_k1");
     (void)session_id;
 
+    /* Start IMU recording (K1 local GY85 + ESP32 remote via CoAP) */
+    if (sc->imu_handler) {
+        imu_handler_start_recording(sc->imu_handler, "output", session_id);
+    }
+
     K1ThreadArg thread_args[K1_MAX_PIPELINE_THREADS];
     int t = 0;
 
@@ -671,15 +876,24 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
     pthread_create(&pl.threads[t], NULL, k1_inference_thread, &thread_args[t]);
     t++;
 
+    thread_args[t] = (K1ThreadArg){&pl, t, K1_CPU_CLUSTER0_DETECT, "ST-GCN"};
+    pthread_create(&pl.threads[t], NULL, k1_stgcn_thread, &thread_args[t]);
+    t++;
+
     thread_args[t] = (K1ThreadArg){&pl, t, K1_CPU_CLUSTER0_AI, "PostProcess"};
     pthread_create(&pl.threads[t], NULL, k1_postprocess_thread, &thread_args[t]);
     t++;
 
+    thread_args[t] = (K1ThreadArg){&pl, t, K1_CPU_CLUSTER1_VIZ, "Viz"};
+    pthread_create(&pl.threads[t], NULL, k1_viz_thread, &thread_args[t]);
+    t++;
+
     pl.num_threads = t;
 
-    log_info("[K1 Pipeline] %d threads running: Capture(CPU%d) → Inference(CPU%d) → PostProcess(CPU%d)",
+    log_info("[K1 Pipeline] %d threads: Capture(CPU%d)→Inference(CPU%d)→ST-GCN(CPU%d)→Post(CPU%d)→Viz(CPU%d)",
              pl.num_threads,
-             K1_CPU_CLUSTER1_CAPTURE, K1_CPU_CLUSTER0_INFERENCE, K1_CPU_CLUSTER0_AI);
+             K1_CPU_CLUSTER1_CAPTURE, K1_CPU_CLUSTER0_INFERENCE,
+             K1_CPU_CLUSTER0_DETECT, K1_CPU_CLUSTER0_AI, K1_CPU_CLUSTER1_VIZ);
 
     sc->running = 1;
     sc->start_time = k1_get_time_ms() / 1000.0;
@@ -693,17 +907,30 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
     log_info("[K1 Pipeline] Waiting for frames. Idle timeout: %ds. Press Ctrl+C to stop.",
              sc->frame_timeout_s);
 
-    /* ── Main thread: startup wait + heartbeat monitor ── */
+    /* ── Main thread: startup wait + heartbeat monitor ──
+     * Elevate to SCHED_FIFO prio 51 (1 tick above pipeline threads at 50)
+     * so shutdown broadcasts + pthread_join can preempt worker threads. */
     {
-        int prev_hearts[3] = {0, 0, 0};
+        struct sched_param sp;
+        memset(&sp, 0, sizeof(sp));
+        sp.sched_priority = 51;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+            log_info("[K1 Pipeline] Monitor thread elevated to SCHED_FIFO prio 51");
+        }
+
+        int prev_hearts[K1_PIPELINE_NUM_HEARTS] = {0};  /* all 6 hearts zero-initialized */
         int stuck_count = 0;
         int startup_ticks = 0;
         while (sc->running) {
-            usleep(500000);  /* 500ms poll interval */
+            /* 500ms poll interval, split into 10ms slices for responsive shutdown */
+            for (int p = 0; p < 50 && sc->running; p++) {
+                usleep(10000);
+            }
+            if (!sc->running) break;
 
             /* ── Startup grace: wait up to 30s for all threads to come alive ── */
             int all_alive = 1;
-            for (int i = 0; i < pl.num_threads; i++) {
+            for (int i = 0; i < pl.num_threads && i < K1_PIPELINE_NUM_HEARTS; i++) {
                 if (!pl.thread_alive[i]) { all_alive = 0; break; }
             }
             if (!all_alive) {
@@ -711,7 +938,13 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
                 if (startup_ticks > 60) {  /* 30s timeout */
                     log_error("[K1 Pipeline] Worker threads failed to start within 30s");
                     sc->running = 0;
+                    pthread_mutex_lock(&pl.ring_mutex);
                     pl.running = false; pl.shutdown = true;
+                    pthread_cond_broadcast(&pl.capture_done_cond);
+                    pthread_cond_broadcast(&pl.infer_done_cond);
+                    pthread_cond_broadcast(&pl.track_done_cond);
+                    pthread_cond_broadcast(&pl.post_done_cond);
+                    pthread_mutex_unlock(&pl.ring_mutex);
                 }
                 continue;
             }
@@ -729,10 +962,13 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
                 log_error("[K1 Pipeline] Capture thread stuck (%d checks), shutting down",
                           stuck_count);
                 sc->running = 0;
+                pthread_mutex_lock(&pl.ring_mutex);
                 pl.running = false; pl.shutdown = true;
                 pthread_cond_broadcast(&pl.capture_done_cond);
                 pthread_cond_broadcast(&pl.infer_done_cond);
+                pthread_cond_broadcast(&pl.track_done_cond);
                 pthread_cond_broadcast(&pl.post_done_cond);
+                pthread_mutex_unlock(&pl.ring_mutex);
             }
         }
     }
@@ -740,6 +976,7 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
     k1_pipeline_destroy(&pl);
 
 k1_cleanup:
+    ;
     float avg_fps = 0.0f;
     if (sc->fps_history_count > 0) {
         float sum = 0.0f;
@@ -755,7 +992,7 @@ k1_cleanup:
     }
 
     result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
-    result_manager_end_session(sc->result_manager);
+    result_manager_end_session(sc->result_manager, sc->spatial_engine);
 
     if (sc->coap_receiver) {
         coap_receiver_destroy(sc->coap_receiver);
@@ -962,6 +1199,13 @@ void system_controller_destroy(SystemController* sc) {
     if (sc->coap_receiver) coap_receiver_destroy(sc->coap_receiver);
     if (sc->display_output) display_output_destroy(sc->display_output);
 
+    /* ── Global resource cleanup (once at process exit) ── */
+    {
+        K1Platform* plat = k1_platform_init();   /* obtain singleton for destroy */
+        if (plat) k1_platform_destroy(plat);
+    }
+    ort_global_shutdown();       /* ONNX Runtime global environment */
+
     free(sc);
 }
 
@@ -1065,12 +1309,17 @@ SystemStatus system_controller_process_video(SystemController* sc,
     const char* session_id = result_manager_start_session(sc->result_manager, video_path);
     (void)session_id;
 
+    /* Start IMU recording if handler is available (offline mode may not have IMU) */
+    if (sc->imu_handler) {
+        imu_handler_start_recording(sc->imu_handler, "output", session_id);
+    }
+
     VideoProcessor* processor = video_processor_create(video_path, 0, 0, false);
     if (!processor || video_processor_open(processor, video_path) != VP_OK) {
         strncpy(status.message, "Failed to open video", sizeof(status.message) - 1);
         status.message[sizeof(status.message) - 1] = '\0';
         result_manager_add_error(sc->result_manager, "VideoOpenError", "Failed to open video");
-        result_manager_end_session(sc->result_manager);
+        result_manager_end_session(sc->result_manager, sc->spatial_engine);
         if (processor) video_processor_destroy(processor);
         return status;
     }
@@ -1165,6 +1414,16 @@ SystemStatus system_controller_process_video(SystemController* sc,
             obj->has_height = true;
         }
 
+        /* ── Save tracked objects to result manager ── */
+        for (int i = 0; i < tracking.num_tracked; i++) {
+            TrackedObject* obj = &tracking.tracked_objects[i];
+            if (obj->frames_seen >= 3) {
+                result_manager_add_tracked_object(sc->result_manager,
+                    obj->track_id, obj->height_meters,
+                    obj->frames_seen, obj->has_pose ? 1 : 0);
+            }
+        }
+
         IMUExternalPose imu_pose;
         if (imu_handler_get_latest_pose(sc->imu_handler, &imu_pose)) {
             spatial_engine_set_camera_pose(sc->spatial_engine, imu_pose.pitch, imu_pose.roll, imu_pose.yaw);
@@ -1230,7 +1489,7 @@ SystemStatus system_controller_process_video(SystemController* sc,
     }
 
     result_manager_update_session_stats(sc->result_manager, sc->frame_count, sc->detection_count, avg_fps, avg_time_ms);
-    result_manager_end_session(sc->result_manager);
+    result_manager_end_session(sc->result_manager, sc->spatial_engine);
 
     sc->running = 0;
     return system_controller_get_final_status(sc);

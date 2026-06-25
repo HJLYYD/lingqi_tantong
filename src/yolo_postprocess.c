@@ -9,7 +9,20 @@
 #include "ort_common.h"
 #endif
 
-void yolo_softmax_stable(float* x, int n) {
+/*
+ * GCC -O3 -mcpu=spacemit-x60 auto-vectorizes simple loops via RVV.
+ * DFL softmax/decode operates on 16-element bins — too small for
+ * hand-written intrinsics to beat the compiler's auto-vectorizer.
+ * Keep scalar C and let the compiler do the work.
+ */
+
+void yolo_softmax_stable(float* restrict x, int n) {
+    /* Scalar: GCC -O3 -mcpu=spacemit-x60 auto-vectorizes simple loops.
+     * DFL softmax is called on 16-element bins — the overhead of hand-
+     * written RVV intrinsics (vsetvl + multi-LMUL reduction) outweighs
+     * any benefit for such small vectors.  Keep it simple and correct.
+     * NOTE: no ivdep on reduction loops (max/sum) — those have genuine
+     * loop-carried dependencies that ivdep would incorrectly suppress. */
     float max_val = x[0];
     for (int i = 1; i < n; i++) {
         if (x[i] > max_val) max_val = x[i];
@@ -20,14 +33,20 @@ void yolo_softmax_stable(float* x, int n) {
         sum += x[i];
     }
     float inv = (sum > 1e-12f) ? (1.0f / sum) : 1.0f;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
-float yolo_dfl_decode_position(const float* reg_data, int pix, int hw, float dists_out[4]) {
+float yolo_dfl_decode_position(const float* restrict reg_data, int pix, int hw, float dists_out[4]) {
     float peaks[4];
     for (int coord = 0; coord < 4; coord++) {
         float bins[16];
         int base = coord * 16;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
         for (int b = 0; b < 16; b++) {
             bins[b] = reg_data[(base + b) * hw + pix];
         }
@@ -79,6 +98,9 @@ void yolo_preprocess(const uint8_t* image_data, int width, int height,
 
         crop_buf = (uint8_t*)malloc((size_t)crop_w * crop_h * 3);
         if (crop_buf) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
             for (int y = 0; y < crop_h; y++) {
                 for (int x = 0; x < crop_w; x++) {
                     int si = ((crop_y + y) * width + (crop_x + x)) * 3;
@@ -104,6 +126,9 @@ void yolo_preprocess(const uint8_t* image_data, int width, int height,
     free(crop_buf);
 
     int pixels = target_w * target_h;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int y = 0; y < target_h; y++) {
         for (int x = 0; x < target_w; x++) {
             int src_idx = (y * target_w + x) * 3;
@@ -143,6 +168,8 @@ int yolo_preprocess_pooled(OrtInferenceContext* ctx,
     const uint8_t* src_ptr = image_data;
     int src_w = width, src_h = height;
     int crop_x = 0, crop_y = 0;
+    uint8_t* crop_buf = NULL;
+    bool     crop_from_pool = false;
 
     uint8_t* padded = ctx->preproc_padded_buf;
     size_t padded_needed = (size_t)target_w * target_h * 3;
@@ -174,13 +201,16 @@ int yolo_preprocess_pooled(OrtInferenceContext* ctx,
 
         /* Use preproc_crop_buf if available */
         size_t crop_needed = (size_t)crop_w * crop_h * 3;
-        uint8_t* crop_buf = ctx->preproc_crop_buf;
-        bool crop_from_pool = (crop_buf && ctx->preproc_crop_buf_size >= crop_needed);
+        crop_buf = ctx->preproc_crop_buf;
+        crop_from_pool = (crop_buf && ctx->preproc_crop_buf_size >= crop_needed);
 
         if (!crop_from_pool) {
             crop_buf = (uint8_t*)malloc(crop_needed);
         }
         if (crop_buf) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
             for (int y = 0; y < crop_h; y++) {
                 for (int x = 0; x < crop_w; x++) {
                     int si = ((crop_y + y) * width + (crop_x + x)) * 3;
@@ -193,9 +223,6 @@ int yolo_preprocess_pooled(OrtInferenceContext* ctx,
             src_ptr = crop_buf;
             src_w = crop_w;
             src_h = crop_h;
-            if (!crop_from_pool) {
-                free(crop_buf);
-            }
         }
     }
 
@@ -206,6 +233,11 @@ int yolo_preprocess_pooled(OrtInferenceContext* ctx,
     utils_letterbox(src_ptr, src_w, src_h, padded, target_w, target_h, 3,
                     out_scale, out_pad_x, out_pad_y);
 
+    /* crop_buf is no longer needed after letterbox */
+    if (need_crop && !crop_from_pool && crop_buf) {
+        free(crop_buf);
+    }
+
     /* CHW conversion: write directly into ctx->input_tensor */
     float* out_tensor = ctx->input_tensor;
     if (!out_tensor) {
@@ -214,6 +246,9 @@ int yolo_preprocess_pooled(OrtInferenceContext* ctx,
     }
 
     int pixels = target_w * target_h;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int y = 0; y < target_h; y++) {
         for (int x = 0; x < target_w; x++) {
             int src_idx = (y * target_w + x) * 3;

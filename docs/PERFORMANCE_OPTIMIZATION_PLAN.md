@@ -29,7 +29,7 @@
 | **YOLOv8n** | **320×320** | **INT8** | **26 FPS** | 同上 |
 | ArcFace | 320×320 | INT8 | 23 FPS | 同上 |
 
-**关键发现**: 640×640 → 320×320 分辨率降低带来 **4.3× 帧率提升**（6 → 26 FPS）。本项目的 yolo11n-pose（2.9M 参数, 7.4 GFLOPs）比 YOLOv5n（1.9M, 4.5 GFLOPs）重 ~60%，当前 2.3 FPS 与官方基准趋势一致。
+**关键发现**: 640×640 → 320×320 分辨率降低带来 **4.3× 帧率提升**（6 → 26 FPS）。本项目的 yolov8n-pose（2.9M 参数, 7.4 GFLOPs）比 YOLOv5n（1.9M, 4.5 GFLOPs）重 ~60%，当前 2.3 FPS 与官方基准趋势一致。
 
 ### 1.2 学术界最新进展
 
@@ -79,7 +79,7 @@ IME 指令约束:
 ┌─────────────────────────────────────────────────────────┐
 │               每帧管道耗时 (~430ms → 2.3 FPS)            │
 ├─────────────────────────────────────────────────────────┤
-│ ORT 推理 (yolo11n-pose):     ~200ms  ████████████████░░ │ 46% │
+│ ORT 推理 (yolov8n-pose):     ~200ms  ████████████████░░ │ 46% │
 │ 预处理 (letterbox+CHW):       ~70ms  █████░░░░░░░░░░░░ │ 16% │
 │ DFL 解码 (10800 cells):       ~50ms  ███░░░░░░░░░░░░░░ │ 12% │
 │ OKS-NMS (全对比较):           ~30ms  ██░░░░░░░░░░░░░░░ │  7% │
@@ -145,7 +145,7 @@ IME 指令约束:
 ```yaml
 # configs/default.yaml
 pose:
-  model_path: "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx"
+  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
   input_size: [480, 480]     # 当前配置值
   # 新增: 级联动态分辨率
   cascade_input_size: [320, 320]   # TRACKING 模式使用

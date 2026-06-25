@@ -98,6 +98,10 @@ struct CoapReceiver {
     uint16_t stream_msg_id;
     double   last_stream_sub_ms;
 
+    /* ── 原始 IMU 数据回调 ── */
+    CoapImuRawCallback imu_raw_cb;
+    void*              imu_raw_user;
+
     /* ── 线程 ── */
     pthread_t       reader_thread;
     volatile bool   running;
@@ -115,16 +119,46 @@ static bool wifi_connect(const char* ssid, const char* password) {
         return true;
     }
 
-    /* Check if already connected to target SSID */
+    /* ── Check if already connected to target SSID ──
+     * Try multiple methods, from fastest to slowest:
+     *   1. iwgetid -r  (returns raw SSID of current connection, sub-ms)
+     *   2. nmcli dev wifi list (available networks + active status)
+     *   3. nmcli connection show --active (active connection profiles) */
+    bool already_connected = false;
+
+    /* Method 1: iwgetid — direct kernel query, no nmcli overhead */
     {
         char check[256];
         snprintf(check, sizeof(check),
-            "nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep -q '^yes:%s$'", ssid);
-        int already = system(check);
-        if (already == 0) {
-            log_info("[CoapRX] Already connected to WiFi: %s", ssid);
-            return true;
+            "iwgetid -r 2>/dev/null | grep -qxF '%s'", ssid);
+        if (system(check) == 0) {
+            already_connected = true;
         }
+    }
+
+    /* Method 2: nmcli WiFi scan (cached, fast) */
+    if (!already_connected) {
+        char check[256];
+        snprintf(check, sizeof(check),
+            "nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep -q '^yes:%s$'", ssid);
+        if (system(check) == 0) {
+            already_connected = true;
+        }
+    }
+
+    /* Method 3: nmcli active connections */
+    if (!already_connected) {
+        char check[256];
+        snprintf(check, sizeof(check),
+            "nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF '%s'", ssid);
+        if (system(check) == 0) {
+            already_connected = true;
+        }
+    }
+
+    if (already_connected) {
+        log_info("[CoapRX] Already connected to WiFi: %s (skipping reconnect)", ssid);
+        return true;
     }
 
     log_info("[CoapRX] Connecting to WiFi: %s ...", ssid);
@@ -138,9 +172,23 @@ static bool wifi_connect(const char* ssid, const char* password) {
     }
     int rc = system(cmd);
     if (rc != 0) {
-        log_warning("[CoapRX] nmcli wifi connect returned %d (SSID=%s) — "
-                    "UDP packets may not reach ESP32", rc, ssid);
-        /* Continue anyway — maybe WiFi is already connected via other means */
+        /* nmcli may need root; try with sudo as fallback */
+        if (password && password[0] != '\0') {
+            snprintf(cmd, sizeof(cmd),
+                "sudo nmcli dev wifi connect \"%s\" password \"%s\" 2>&1", ssid, password);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                "sudo nmcli dev wifi connect \"%s\" 2>&1", ssid);
+        }
+        int rc2 = system(cmd);
+        if (rc2 != 0) {
+            log_warning("[CoapRX] nmcli wifi connect failed (rc=%d, sudo rc=%d, SSID=%s) — "
+                        "UDP packets may not reach ESP32. "
+                        "Tip: pre-connect with 'sudo nmcli dev wifi connect \"%s\"' before running.",
+                        rc, rc2, ssid, ssid);
+        } else {
+            log_info("[CoapRX] WiFi connected to %s (via sudo)", ssid);
+        }
     } else {
         log_info("[CoapRX] WiFi connected to %s", ssid);
     }
@@ -674,6 +722,13 @@ static void process_coap_packet(CoapReceiver* r, const uint8_t* data, int len,
         if (parse_imu_json(resp.payload, resp.payload_len,
                            &ax, &ay, &az, &gx, &gy, &gz)) {
 
+            /* 原始数据回调: 馈送到 Madgwick 相机滤波器 */
+            if (r->imu_raw_cb) {
+                float accel[3] = {ax, ay, az};
+                float gyro[3]  = {gx, gy, gz};
+                r->imu_raw_cb(r->imu_raw_user, accel, gyro);
+            }
+
             /* 计算 tilt (roll/pitch from accelerometer) */
             float roll_rad  = atan2f(ay, az);
             float pitch_rad = atan2f(-ax, sqrtf(ay*ay + az*az));
@@ -970,4 +1025,12 @@ bool coap_receiver_get_latest_frame(CoapReceiver* r, ArrowSourceFrame* out) {
 
 bool coap_receiver_is_connected(CoapReceiver* r) {
     return r ? r->connected : false;
+}
+
+void coap_receiver_set_imu_raw_callback(CoapReceiver* r,
+                                         CoapImuRawCallback cb, void* user) {
+    if (r) {
+        r->imu_raw_cb = cb;
+        r->imu_raw_user = user;
+    }
 }

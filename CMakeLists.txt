@@ -1,13 +1,31 @@
 cmake_minimum_required(VERSION 3.16)
+
+# On K1 (riscv64), prefer Clang — better X60 support, no misaligned-vector bug.
+# Must be BEFORE project() so compiler is locked in before all flag checks.
+if(NOT CMAKE_C_COMPILER AND NOT CMAKE_CXX_COMPILER)
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE _HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_HOST_ARCH MATCHES "riscv64")
+        find_program(_CLANG NAMES clang-20 clang-19 clang-18 clang)
+        find_program(_CLANGXX NAMES clang++-20 clang++-19 clang++-18 clang++)
+        if(_CLANG AND _CLANGXX)
+            set(CMAKE_C_COMPILER "${_CLANG}" CACHE FILEPATH "C compiler")
+            set(CMAKE_CXX_COMPILER "${_CLANGXX}" CACHE FILEPATH "C++ compiler")
+            set(_K1_USE_CLANG TRUE)
+        endif()
+    endif()
+endif()
+
 project(LingQiTanTong C)
+
+if(_K1_USE_CLANG)
+    message(STATUS "K1: using Clang (better X60 support, no SIGBUS risk)")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(USE_ONNX_RUNTIME "Enable ONNX Runtime for real model inference" ON)
-option(USE_SPACENGINE_AI "Enable SpacemiT RISC-V AI instruction acceleration" OFF)
 option(USE_OPENMP "Enable OpenMP parallel processing" ON)
-option(ENABLE_RVV_OPT "Enable RISC-V Vector (RVV 1.0) optimizations" OFF)
 option(ENABLE_K1_PIPELINE "Enable K1 dual-cluster pipeline parallelism" ON)
 option(ENABLE_K1_TCM "Enable K1 TCM (Tightly Coupled Memory) for AI weights" ON)
 option(ENABLE_K1_VPU "Enable K1 VPU hardware video/JPEG acceleration" ON)
@@ -17,7 +35,6 @@ option(ENABLE_SDL2_DISPLAY "Enable SDL2 desktop window display (auto if availabl
 set(MUSE_PI_ARCH "rv64gcv0p7" CACHE STRING "Target RISC-V arch: rv64gcv0p7 (K1) or rv64gcv1p0")
 set(BIANBU_SYSROOT "" CACHE PATH "Bianbu OS sysroot path (for cross-compilation)")
 set(ONNX_RUNTIME_DIR "" CACHE PATH "Path to ONNX Runtime installation directory")
-set(SPACENGINE_DIR "" CACHE PATH "Path to SpacemiT Spacengine SDK")
 set(K1_MPP_DIR "" CACHE PATH "Path to K1 MPP (Media Process Platform) SDK")
 set(K1_JPU_DIR "" CACHE PATH "Path to K1 JPU hardware JPEG decode library")
 
@@ -25,6 +42,14 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64" OR CMAKE_C_COMPILER MATCHES "riscv6
     set(BUILDING_FOR_RISCV64 TRUE)
 else()
     set(BUILDING_FOR_RISCV64 FALSE)
+endif()
+
+# RVV optimizations: auto-enabled on RISC-V targets.
+# Must be after BUILDING_FOR_RISCV64 is determined.
+if(BUILDING_FOR_RISCV64)
+    set(ENABLE_RVV_OPT ON CACHE BOOL "Enable RISC-V Vector (RVV 1.0) optimizations" FORCE)
+else()
+    set(ENABLE_RVV_OPT OFF CACHE BOOL "Enable RISC-V Vector (RVV 1.0) optimizations" FORCE)
 endif()
 
 if(BUILDING_FOR_RISCV64)
@@ -72,7 +97,38 @@ if(BUILDING_FOR_RISCV64)
     endif()
 
     set(RISCV_COMMON_FLAGS "-Wall -Wextra -fomit-frame-pointer")
-    set(RISCV_RELEASE_FLAGS "-O3 -ffast-math -flto")
+    set(RISCV_RELEASE_FLAGS "-O3 -ffast-math")
+    option(ENABLE_LTO "Enable Link-Time Optimization" ON)
+
+    # Clang: always use version-matched lld linker (GNU ld is too strict for K1 .so deps)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        find_program(LLD_EXECUTABLE NAMES ld.lld-20 ld.lld-19 ld.lld-18 ld.lld-17 ld.lld)
+        if(LLD_EXECUTABLE)
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${LLD_EXECUTABLE} -Wl,--allow-shlib-undefined -Wl,--export-dynamic")
+            message(STATUS "K1 linker: ${LLD_EXECUTABLE}")
+        else()
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -Wl,--allow-shlib-undefined -Wl,--export-dynamic")
+        endif()
+    endif()
+
+    if(ENABLE_LTO)
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            set(RISCV_RELEASE_FLAGS "${RISCV_RELEASE_FLAGS} -flto -fopt-info-vec-optimized")
+        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+            find_program(LLVM_AR NAMES llvm-ar-20 llvm-ar-19 llvm-ar-18 llvm-ar-17 llvm-ar)
+            find_program(LLVM_RANLIB NAMES llvm-ranlib-20 llvm-ranlib-19 llvm-ranlib-18 llvm-ranlib-17 llvm-ranlib)
+            if(LLVM_AR AND LLVM_RANLIB)
+                set(CMAKE_AR "${LLVM_AR}" CACHE FILEPATH "AR" FORCE)
+                set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "RANLIB" FORCE)
+                set(RISCV_RELEASE_FLAGS "${RISCV_RELEASE_FLAGS} -flto=thin")
+                message(STATUS "K1 Clang LTO (thin) enabled with llvm-ar + lld")
+            else()
+                message(STATUS "K1 Clang LTO disabled (llvm-ar not found — install llvm)")
+            endif()
+        endif()
+    else()
+        message(STATUS "LTO disabled (ENABLE_LTO=OFF)")
+    endif()
 
     # Debug builds: no optimization, no LTO, no fast-math
     # (GCC 13.2 on RISC-V can emit illegal instructions with -ffast-math -flto)
@@ -117,6 +173,19 @@ if(BUILDING_FOR_RISCV64)
         endif()
         set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -funroll-loops")
 
+        # ── GCC auto-vectorization safety on X60 ────────────────────
+        # X60 lacks Zicclsm (misaligned vector load/store hardware).
+        # GCC 14 may emit misaligned vector instructions → SIGBUS.
+        # GCC 15+ is safe.  Alternatives:
+        #   - Upgrade OpenSBI to ≥v1.6 (software emulation)
+        #   - Use Clang:   cmake -DCMAKE_C_COMPILER=clang
+        #   - Disable vec:  add -fno-tree-vectorize to CFLAGS
+        # Ref: community.milkv.io/t/spacemit-k1-m1-is-not-quite-rva22-compliant/2870
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS "15.0")
+            message(STATUS "GCC ${CMAKE_C_COMPILER_VERSION} < 15 on K1 — auto-disabling tree-vectorize to avoid SIGBUS (X60 has no Zicclsm)")
+            set(RISCV_COMMON_FLAGS "${RISCV_COMMON_FLAGS} -fno-tree-vectorize")
+        endif()
+
         if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0")
             set(K1_EXTRA_FLAGS "-mrvv-vector-bits=zvl")
         else()
@@ -160,22 +229,50 @@ if(BUILDING_FOR_RISCV64)
     if(USE_OPENMP)
         # find_package(OpenMP) fails on some RISC-V sysroots even when
         # -fopenmp works; probe directly with the compiler.
+        # Clang on riscv64 needs special handling: libomp is not packaged
+        # for riscv64 on Ubuntu/Bianbu, and omp.h lives in GCC's private
+        # include dir.  Use libgomp + GCC's omp.h.
+        if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+            set(_OPENMP_FLAG "-fopenmp=libgomp")
+            # Find GCC's omp.h (Clang doesn't search GCC private include dirs)
+            execute_process(
+                COMMAND ${CMAKE_C_COMPILER} -print-runtime-dir
+                OUTPUT_VARIABLE _CLANG_RT_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+            # Probe typical GCC include paths for omp.h
+            set(_GCC_OMP_INCLUDE "")
+            foreach(_GCC_VER 14 13 15)
+                set(_TRY_PATH "/usr/lib/gcc/riscv64-linux-gnu/${_GCC_VER}/include")
+                if(EXISTS "${_TRY_PATH}/omp.h")
+                    set(_GCC_OMP_INCLUDE "${_TRY_PATH}")
+                    break()
+                endif()
+            endforeach()
+            if(_GCC_OMP_INCLUDE)
+                set(_OPENMP_INCLUDE_FLAG "-isystem${_GCC_OMP_INCLUDE}")
+            endif()
+        else()
+            set(_OPENMP_FLAG "-fopenmp")
+            set(_OPENMP_INCLUDE_FLAG "")
+        endif()
         execute_process(
-            COMMAND ${CMAKE_C_COMPILER} -fopenmp -x c ${DEV_NULL} -c -o ${DEV_NULL}
+            COMMAND ${CMAKE_C_COMPILER} ${_OPENMP_FLAG} ${_OPENMP_INCLUDE_FLAG} -x c ${DEV_NULL} -c -o ${DEV_NULL}
             RESULT_VARIABLE TEST_OPENMP_RESULT
             ERROR_QUIET OUTPUT_QUIET
         )
         if(TEST_OPENMP_RESULT EQUAL 0)
-            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fopenmp")
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fopenmp")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${_OPENMP_FLAG} ${_OPENMP_INCLUDE_FLAG}")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${_OPENMP_FLAG}")
             add_compile_definitions(HAS_OPENMP)
-            message(STATUS "OpenMP enabled for RISC-V multi-core (-fopenmp)")
+            message(STATUS "OpenMP enabled (${_OPENMP_FLAG}${_OPENMP_INCLUDE_FLAG})")
         else()
             message(WARNING "OpenMP not found, using single-core mode")
         endif()
     endif()
 
     if(ENABLE_RVV_OPT)
+        add_compile_definitions(HAS_RVV_OPT)
         message(STATUS "RVV ${RVV_VERSION} vector optimization enabled")
     endif()
 else()
@@ -200,6 +297,8 @@ set(CORE_SOURCES
     src/ort_inference_context.c
     src/core_types.c
     src/k1_platform.c
+    src/k1_imu.c
+    src/k1_jpu.c
     src/yolo_postprocess.c
     src/keypoint_validator.c
 )
@@ -273,49 +372,96 @@ if(BUILDING_FOR_RISCV64)
 endif()
 
 if(USE_ONNX_RUNTIME)
+    # ── Auto-detect ONNX Runtime installation ──
+    # Priority: 1) user-specified ONNX_RUNTIME_DIR  2) SpacemiT ORT in /opt
+    #            3) system-installed in /usr         4) /usr/local
     if(NOT ONNX_RUNTIME_DIR)
-        if(EXISTS "/usr/local/include/onnxruntime_c_api.h" OR EXISTS "/usr/include/onnxruntime_c_api.h")
-            message(STATUS "ONNX_RUNTIME_DIR not set; falling back to system-installed ONNX Runtime")
+        # Probe /opt for SpacemiT ONNX Runtime (spacemit-ort.riscv64.*)
+        file(GLOB ORT_CANDIDATES
+            "/opt/spacemit-ort.riscv64.*"
+            "/opt/spacemit-ort*")
+        foreach(ORT_CAND IN LISTS ORT_CANDIDATES)
+            if(IS_DIRECTORY "${ORT_CAND}" AND EXISTS "${ORT_CAND}/include/onnxruntime_c_api.h")
+                set(ONNX_RUNTIME_DIR "${ORT_CAND}")
+                message(STATUS "Auto-detected SpacemiT ORT at: ${ONNX_RUNTIME_DIR}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(NOT ONNX_RUNTIME_DIR)
+        # Fall back to system-installed ONNX Runtime
+        if(EXISTS "/usr/include/onnxruntime/onnxruntime_c_api.h")
             set(ONNX_RUNTIME_SYSTEM_INSTALL TRUE)
+            message(STATUS "ONNX Runtime: using system install (/usr)")
+        elseif(EXISTS "/usr/local/include/onnxruntime_c_api.h")
+            set(ONNX_RUNTIME_SYSTEM_INSTALL TRUE)
+            message(STATUS "ONNX Runtime: using system install (/usr/local)")
         else()
-            message(FATAL_ERROR
-                "ONNX_RUNTIME_DIR is required when USE_ONNX_RUNTIME=ON.\n"
-                "  Download SpacemiT ONNX Runtime 2.0.2 from:\n"
-                "    https://archive.spacemit.com/spacemit-ai/onnxruntime/spacemit-ort.riscv64.2.0.2.tar.gz\n"
-                "  Then re-configure with:\n"
-                "    -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.2.0.2")
+            # Final fallback: check if header is directly in /usr/include
+            if(EXISTS "/usr/include/onnxruntime_c_api.h")
+                set(ONNX_RUNTIME_SYSTEM_INSTALL TRUE)
+                message(STATUS "ONNX Runtime: using system install (/usr/include)")
+            endif()
         endif()
+    endif()
+
+    # Header check
+    if(NOT ONNX_RUNTIME_DIR AND NOT ONNX_RUNTIME_SYSTEM_INSTALL)
+        message(FATAL_ERROR
+            "USE_ONNX_RUNTIME=ON but ONNX Runtime not found.\n"
+            "  Auto-probed /opt/spacemit-ort*/ /usr/include /usr/local/include — all empty.\n"
+            "  Install SpacemiT ONNX Runtime 2.0.2:\n"
+            "    https://archive.spacemit.com/spacemit-ai/onnxruntime/spacemit-ort.riscv64.2.0.2.tar.gz\n"
+            "  Or set manually: cmake -DONNX_RUNTIME_DIR=/path/to/ort")
     endif()
 
     if(ONNX_RUNTIME_DIR)
         target_include_directories(lingqi_tantong_core PRIVATE "${ONNX_RUNTIME_DIR}/include")
     endif()
 
+    # Library detection
+    set(ORT_LIB_FOUND FALSE)
     if(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
         target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
+        set(ORT_LIB_FOUND TRUE)
+        message(STATUS "ONNX Runtime lib: ${ONNX_RUNTIME_DIR}/lib/libonnxruntime.so")
     elseif(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
         target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a")
-    elseif(EXISTS "/usr/lib/libonnxruntime.so" OR EXISTS "/usr/lib/riscv64-linux-gnu/libonnxruntime.so")
-        target_link_libraries(lingqi_tantong_core PUBLIC onnxruntime)
+        set(ORT_LIB_FOUND TRUE)
+        message(STATUS "ONNX Runtime lib: ${ONNX_RUNTIME_DIR}/lib/libonnxruntime.a (static)")
     else()
-        message(FATAL_ERROR
-            "ONNX Runtime library not found.\n"
-            "  Looked for libonnxruntime.so in:\n"
-            "    ${ONNX_RUNTIME_DIR}/lib/\n"
-            "    /usr/lib/\n"
-            "    /usr/lib/riscv64-linux-gnu/\n"
-            "  Install SpacemiT ONNX Runtime first.")
+        find_library(ORT_LIB NAMES onnxruntime
+            PATHS /usr/lib /usr/lib/riscv64-linux-gnu /usr/local/lib
+            NO_DEFAULT_PATH)
+        if(ORT_LIB)
+            target_link_libraries(lingqi_tantong_core PUBLIC ${ORT_LIB})
+            set(ORT_LIB_FOUND TRUE)
+            message(STATUS "ONNX Runtime lib: ${ORT_LIB}")
+        endif()
     endif()
 
+    if(NOT ORT_LIB_FOUND)
+        message(FATAL_ERROR
+            "USE_ONNX_RUNTIME=ON but libonnxruntime.so not found.\n"
+            "  Searched: ${ONNX_RUNTIME_DIR}/lib/, /usr/lib/, /usr/lib/riscv64-linux-gnu/\n"
+            "  Install spacemit-onnxruntime: sudo apt install spacemit-onnxruntime\n"
+            "  Or set: -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.x.x.x")
+    endif()
+
+    # SpacemiT MLAS (RISC-V optimized math)
     if(ONNX_RUNTIME_DIR AND EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
         target_link_libraries(lingqi_tantong_core PUBLIC "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
-        message(STATUS "SpacemiT RISC-V MLAS (optimized math) enabled")
+        message(STATUS "RISC-V MLAS: ${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
     elseif(EXISTS "/usr/lib/libonnxruntime_mlas.so")
         target_link_libraries(lingqi_tantong_core PUBLIC onnxruntime_mlas)
-        message(STATUS "SpacemiT RISC-V MLAS (optimized math) enabled")
+        message(STATUS "RISC-V MLAS: system lib")
+    else()
+        message(STATUS "RISC-V MLAS: not found (OK — using generic ORT math)")
     endif()
 
-    # SpacemiT EP shared libs (libspacemit_ep.so etc.)
+    # SpacemiT EP shared lib (libspacemit_ep.so)
+    set(SPACEMIT_EP_FOUND FALSE)
     if(ONNX_RUNTIME_DIR)
         find_library(SPACEMIT_EP_LIB
             NAMES spacemit_ep
@@ -323,52 +469,59 @@ if(USE_ONNX_RUNTIME)
             NO_DEFAULT_PATH)
         if(SPACEMIT_EP_LIB)
             target_link_libraries(lingqi_tantong_core PUBLIC "${SPACEMIT_EP_LIB}")
-            message(STATUS "SpacemiT EP lib linked: ${SPACEMIT_EP_LIB}")
+            set(SPACEMIT_EP_FOUND TRUE)
+            message(STATUS "SpacemiT EP lib: ${SPACEMIT_EP_LIB}")
         else()
             file(GLOB SPACEMIT_EP_LIBS_FALLBACK
                 "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_providers_spacemit*.so"
                 "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_spacemit*.so")
             foreach(SPM_LIB IN LISTS SPACEMIT_EP_LIBS_FALLBACK)
                 target_link_libraries(lingqi_tantong_core PUBLIC "${SPM_LIB}")
-                message(STATUS "SpacemiT EP lib linked (fallback): ${SPM_LIB}")
+                set(SPACEMIT_EP_FOUND TRUE)
+                message(STATUS "SpacemiT EP lib (fallback): ${SPM_LIB}")
             endforeach()
-            if(NOT SPACEMIT_EP_LIBS_FALLBACK)
-                message(WARNING
-                    "libspacemit_ep.so NOT found under ${ONNX_RUNTIME_DIR}/lib/.\n"
-                    "  SpacemiT EP symbol resolution will fail at link time.")
-            endif()
         endif()
-    else()
-        # System-installed ONNX Runtime — search system paths for EP lib
+    endif()
+    if(NOT SPACEMIT_EP_FOUND)
         find_library(SPACEMIT_EP_LIB
             NAMES spacemit_ep
             PATHS /usr/lib /usr/lib/riscv64-linux-gnu /usr/local/lib
             NO_DEFAULT_PATH)
         if(SPACEMIT_EP_LIB)
             target_link_libraries(lingqi_tantong_core PUBLIC "${SPACEMIT_EP_LIB}")
-            message(STATUS "SpacemiT EP lib linked (system): ${SPACEMIT_EP_LIB}")
-        else()
+            set(SPACEMIT_EP_FOUND TRUE)
+            message(STATUS "SpacemiT EP lib (system): ${SPACEMIT_EP_LIB}")
+        endif()
+    endif()
+
+    if(NOT SPACEMIT_EP_FOUND)
+        if(BUILDING_FOR_RISCV64)
             message(WARNING
-                "libspacemit_ep.so NOT found in system library paths.\n"
-                "  SpacemiT EP symbol resolution will fail at link time.\n"
-                "  Install libspacemit_ep.so or set ONNX_RUNTIME_DIR to the\n"
-                "  SpacemiT ONNX Runtime installation directory.")
+                "libspacemit_ep.so not found — SpacemiT EP unavailable.\n"
+                "  K1 AI acceleration (RVV 1.0 + IME) will NOT work.\n"
+                "  Install: sudo apt install spacemit-onnxruntime\n"
+                "  Or set: -DONNX_RUNTIME_DIR=/path/to/spacemit-ort.riscv64.x.x.x")
+        else()
+            message(STATUS "SpacemiT EP lib: not found (host build — OK)")
         endif()
     endif()
 
     add_compile_definitions(HAS_ONNX_RUNTIME)
     if(ONNX_RUNTIME_DIR)
-        message(STATUS "ONNX Runtime enabled: ${ONNX_RUNTIME_DIR}")
+        message(STATUS "ONNX Runtime: ${ONNX_RUNTIME_DIR}")
     else()
-        message(STATUS "ONNX Runtime enabled: system install")
+        message(STATUS "ONNX Runtime: system install")
     endif()
 
+    # SpacemiT EP header (spacemit_ort_env.h) — C++ bridge
     find_file(SPACEMIT_ORT_ENV_H
         NAMES spacemit_ort_env.h
         PATHS "${ONNX_RUNTIME_DIR}/include"
               "${ONNX_RUNTIME_DIR}/include/onnxruntime"
               "/usr/local/include/onnxruntime"
               "/usr/local/include"
+              "/usr/include/onnxruntime"
+              "/usr/include"
         NO_DEFAULT_PATH
     )
 
@@ -378,15 +531,15 @@ if(USE_ONNX_RUNTIME)
         target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SPACEMIT_EP)
         target_link_libraries(lingqi_tantong_core PRIVATE stdc++)
         list(APPEND ALL_LIB_CXX_SOURCES src/spacemit_ort_bridge.cpp)
-        message(STATUS "SpacemiT Execution Provider enabled: ${SPACEMIT_ORT_ENV_H}")
+        message(STATUS "SpacemiT EP: YES (${SPACEMIT_ORT_ENV_H})")
     else()
         if(BUILDING_FOR_RISCV64)
             message(WARNING
-                "spacemit_ort_env.h NOT found - SpacemiT EP disabled.\n"
-                "  K1 hardware AI acceleration (RVV + IME) will NOT be used.\n"
-                "  Install header in ${ONNX_RUNTIME_DIR}/include/onnxruntime/ or /usr/local/include/onnxruntime/")
+                "spacemit_ort_env.h not found — SpacemiT EP C++ bridge disabled.\n"
+                "  K1 AI acceleration (RVV 1.0 + IME) will NOT work.\n"
+                "  Searched: ${ONNX_RUNTIME_DIR}/include/, /usr/local/include/onnxruntime/")
         else()
-            message(STATUS "spacemit_ort_env.h not found (host build - acceptable)")
+            message(STATUS "SpacemiT EP header: not found (host build — OK)")
         endif()
     endif()
 endif()
@@ -406,60 +559,82 @@ else()
         "  Install on RHEL/Fedora:   sudo dnf install turbojpeg-devel")
 endif()
 
-    # check_include_file fails on some RISC-V sysroots; probe with shell echo.
-    execute_process(
-        COMMAND sh -c "echo '#include <linux/videodev2.h>' | ${CMAKE_C_COMPILER} -E -x c - > /dev/null 2>&1"
-        RESULT_VARIABLE TEST_V4L2_RESULT
-    )
-    if(TEST_V4L2_RESULT EQUAL 0)
-        set(HAVE_V4L2 TRUE)
-        add_compile_definitions(HAS_V4L2)
-        message(STATUS "V4L2 enabled (Linux video capture)")
-    else()
-        set(HAVE_V4L2 FALSE)
-        if(BUILDING_FOR_RISCV64)
-            message(WARNING
-                "V4L2 header <linux/videodev2.h> NOT found - local camera capture disabled.\n"
-                "  Arrow UART JPEG path still works, but /dev/video0 will not be used.\n"
-                "  To enable: sudo apt install linux-libc-dev\n"
-                "  Then re-run cmake.")
-        endif()
+# check_include_file fails on some RISC-V sysroots; probe with shell echo.
+execute_process(
+    COMMAND sh -c "echo '#include <linux/videodev2.h>' | ${CMAKE_C_COMPILER} -E -x c - > /dev/null 2>&1"
+    RESULT_VARIABLE TEST_V4L2_RESULT
+)
+if(TEST_V4L2_RESULT EQUAL 0)
+    set(HAVE_V4L2 TRUE)
+    add_compile_definitions(HAS_V4L2)
+    message(STATUS "V4L2 enabled (Linux video capture)")
+else()
+    set(HAVE_V4L2 FALSE)
+    if(BUILDING_FOR_RISCV64)
+        message(WARNING
+            "V4L2 header <linux/videodev2.h> NOT found - local camera capture disabled.\n"
+            "  Arrow UART JPEG path still works, but /dev/video0 will not be used.\n"
+            "  To enable: sudo apt install linux-libc-dev\n"
+            "  Then re-run cmake.")
     endif()
-
-if(USE_SPACENGINE_AI AND BUILDING_FOR_RISCV64)
-    if(SPACENGINE_DIR)
-        target_include_directories(lingqi_tantong_core PRIVATE "${SPACENGINE_DIR}/include")
-        target_link_directories(lingqi_tantong PRIVATE "${SPACENGINE_DIR}/lib")
-        target_link_libraries(lingqi_tantong PRIVATE spacengine_rt)
-
-        target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SPACENGINE_AI)
-        message(STATUS "SpacemiT RISC-V AI acceleration enabled: ${SPACENGINE_DIR}")
-    else()
-        message(FATAL_ERROR "SPACENGINE_DIR must be set when USE_SPACENGINE_AI=ON")
-    endif()
-elseif(USE_SPACENGINE_AI)
-    message(WARNING "Spacengine AI acceleration only available on RISC-V Muse Pi Pro")
 endif()
 
 if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
-    if(ENABLE_K1_VPU AND K1_MPP_DIR)
-        target_include_directories(lingqi_tantong_core PRIVATE "${K1_MPP_DIR}/include")
-        target_link_directories(lingqi_tantong PRIVATE "${K1_MPP_DIR}/lib")
-        target_link_libraries(lingqi_tantong PRIVATE mpp)
-        message(STATUS "K1 MPP hardware video pipeline: ${K1_MPP_DIR}")
-    elseif(ENABLE_K1_VPU)
-        message(STATUS "K1 VPU: MPP SDK not set, video acceleration disabled")
-        message(STATUS "  Set -DK1_MPP_DIR=/path/to/k1x-mpp for hardware video")
+    # ── VPU / MPP auto-detection ──
+    if(ENABLE_K1_VPU)
+        if(K1_MPP_DIR)
+            # User-specified path
+            target_include_directories(lingqi_tantong_core PRIVATE "${K1_MPP_DIR}/include")
+            target_link_directories(lingqi_tantong PRIVATE "${K1_MPP_DIR}/lib")
+            target_link_libraries(lingqi_tantong PRIVATE mpp)
+            target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_VPU)
+            message(STATUS "K1 VPU/MPP: ${K1_MPP_DIR}")
+        else()
+            # Auto-detect system-installed libmpp.so
+            find_library(K1_MPP_LIB NAMES mpp spacemit_mpp
+                PATHS /usr/lib /usr/lib/riscv64-linux-gnu NO_DEFAULT_PATH)
+            if(K1_MPP_LIB)
+                target_link_libraries(lingqi_tantong PRIVATE "${K1_MPP_LIB}" dl)
+                target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_VPU)
+                message(STATUS "K1 VPU/MPP: auto-detected (${K1_MPP_LIB})")
+            else()
+                message(FATAL_ERROR
+                    "ENABLE_K1_VPU=ON but libmpp.so not found.\n"
+                    "  Auto-probed: /usr/lib/, /usr/lib/riscv64-linux-gnu/ — not found.\n"
+                    "  Install: sudo apt install k1x-mpp\n"
+                    "  Or set: -DK1_MPP_DIR=/path/to/k1x-mpp\n"
+                    "  Or disable VPU: -DENABLE_K1_VPU=OFF")
+            endif()
+        endif()
     endif()
 
-    if(ENABLE_K1_JPU AND K1_JPU_DIR)
-        target_include_directories(lingqi_tantong_core PRIVATE "${K1_JPU_DIR}/include")
-        target_link_directories(lingqi_tantong PRIVATE "${K1_JPU_DIR}/lib")
-        target_link_libraries(lingqi_tantong PRIVATE jpu)
-        message(STATUS "K1 JPU hardware JPEG decode: ${K1_JPU_DIR}")
-    elseif(ENABLE_K1_JPU)
-        message(STATUS "K1 JPU: SDK not set, JPEG hardware decode disabled")
-        message(STATUS "  Set -DK1_JPU_DIR=/path/to/k1x-jpu for HW JPEG decode")
+    # ── JPU auto-detection ──
+    if(ENABLE_K1_JPU)
+        if(K1_JPU_DIR)
+            # NOTE: Do NOT link libjpu.so directly — it has an unresolved
+            # "LogMsg" symbol.  k1_jpu.c loads it at runtime via dlopen/dlsym.
+            target_include_directories(lingqi_tantong_core PRIVATE "${K1_JPU_DIR}/include")
+            target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_JPU_LIB)
+            message(STATUS "K1 JPU: ${K1_JPU_DIR}")
+        else()
+            find_library(K1_JPU_LIB NAMES jpu PATHS /usr/lib /usr/lib/riscv64-linux-gnu NO_DEFAULT_PATH)
+            if(K1_JPU_LIB)
+                # Do NOT direct-link libjpu.so — libspacemit_mpp.so also exports
+                # AsrJpuDecOpen, and the global linker resolves it to the wrong
+                # implementation (→ segfault).  k1_jpu.c dlopens libjpu.so with
+                # RTLD_LOCAL and binds the correct symbols via dlsym.
+                # LogMsg is satisfied by our stub + --export-dynamic.
+                target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_JPU_LIB)
+                message(STATUS "K1 JPU: auto-detected (${K1_JPU_LIB})")
+            else()
+                message(FATAL_ERROR
+                    "ENABLE_K1_JPU=ON but libjpu.so not found.\n"
+                    "  Auto-probed: /usr/lib/, /usr/lib/riscv64-linux-gnu/ — not found.\n"
+                    "  Install: sudo apt install k1x-jpu\n"
+                    "  Or set: -DK1_JPU_DIR=/path/to/k1x-jpu\n"
+                    "  Or disable JPU: -DENABLE_K1_JPU=OFF")
+            endif()
+        endif()
     endif()
 endif()
 
@@ -519,13 +694,12 @@ if(HAVE_V4L2)
     message(STATUS "V4L2:              YES (Linux video capture)")
 endif()
 if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "riscv")
-    if(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so")
+    if(EXISTS "${ONNX_RUNTIME_DIR}/lib/libonnxruntime_mlas.so" OR EXISTS "/usr/lib/libonnxruntime_mlas.so")
         message(STATUS "RISC-V MLAS:       YES")
     else()
         message(STATUS "RISC-V MLAS:       NO (lib not found)")
     endif()
 endif()
-message(STATUS "Spacengine AI accel: ${USE_SPACENGINE_AI}")
 message(STATUS "OpenMP:            ${USE_OPENMP}")
 message(STATUS "RVV Optimize:      ${ENABLE_RVV_OPT}")
 message(STATUS "K1 Pipeline:       ${ENABLE_K1_PIPELINE}")

@@ -32,7 +32,9 @@ static void signal_handler(int sig) {
         const char msg[] = "\nShutting down... (Ctrl+C again to force quit)\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         g_running_flag = 0;
-        if (g_sc) g_sc->running = 0;
+        if (g_sc) {
+            g_sc->running = 0;
+        }
     } else {
         _exit(1);
     }

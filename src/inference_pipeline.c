@@ -16,8 +16,8 @@
  * peakiness as the confidence signal: uniform≈0.0625, weak≈0.10,
  * clear≈0.25+.
  *
- * STRATEGY: YOLOv8-pose is the PRIMARY person detector (trained specifically
- * for person detection + keypoints). YOLO11n is the SECONDARY fallback.
+ * STRATEGY: YOLOv8n-pose (official BRDK CV demo) is the PRIMARY person detector
+ * (person detection + 17 COCO keypoints). YOLOv11n is the SECONDARY fallback.
  * Face detection runs at reduced frequency as optional supplement.
  * ByteTrack does two-stage matching for final filtering. */
 #define PERSON_CLASS_ID             0
@@ -56,8 +56,8 @@ AIInferencePipeline* inference_pipeline_create(void) {
     AIInferencePipeline* pipeline = (AIInferencePipeline*)calloc(1, sizeof(AIInferencePipeline));
     if (!pipeline) return NULL;
 
-    /* PRIMARY: YOLOv8-pose for person detection + keypoints.
-     * SECONDARY: YOLO11n for supplementary person detection.
+    /* PRIMARY: YOLOv8n-pose (official BRDK CV demo) for person detection + keypoints.
+     * SECONDARY: YOLOv11n for supplementary person detection.
      * SUPPLEMENT: Face detection/recognition (reduced frequency).
      * Action recognition runs from pose keypoints. */
     pipeline->enabled_stages = PIPELINE_ENABLE_POSE | PIPELINE_ENABLE_FACE | PIPELINE_ENABLE_ACTION;
@@ -119,14 +119,14 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
 
     /*
      * K1 EP slot allocation (SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD=1):
-     *   1. YOLO11n-pose — person detector + keypoints in one pass (every frame)
+     *   1. YOLOv8n-pose — person detector + keypoints in one pass (every frame)
      *   2. (reserved for future use — secondary detector disabled in unified mode)
      *   3. Face det      — face detection (every 10-120 frames)
      *   4. ArcFace       — face recognition (per-face)
      *   5. ST-GCN        — CPU EP only (FP32)
      */
 
-    /* ── Step 1: YOLO11n-pose (PRIMARY, REQUIRED) ── */
+    /* ── Step 1: YOLOv8n-pose (PRIMARY, REQUIRED) ── */
     {
         const char* m = config_get_string(config, "pose.model_path", NULL);
         if (!m || m[0] == '\0') {
@@ -256,7 +256,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
  * are rejected — this is our primary defense against non-human false positives
  * from the broken INT8 classifier head.
  *
- * When no pose data is available (YOLO11-only detections), stricter geometry
+ * When no pose data is available (detector-only, no keypoints), stricter geometry
  * thresholds are applied as a fallback.
  */
 static int filter_detections(const Detection* input, int num_input, int img_w, int img_h,
@@ -316,6 +316,10 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
          * Partial-body detections are MARKED but NOT rejected — they are
          * passed through with is_partial_body=true for the tracker to handle
          * with occlusion-aware matching thresholds. */
+        bool is_partial = false;
+        int nvis = 0;
+        bool apply_boost = false;
+
         if (kpt_filter_enabled && kv && num_poses > 0 && poses) {
             /* Find best-matching pose for this detection */
             float best_pose_iou = 0.35f;
@@ -384,27 +388,35 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
                             continue;
                         }
                         /* Side-body passed — mark as partial */
-                        output[filtered].is_partial_body = true;
-                        output[filtered].num_visible_keypoints =
-                            (n_left >= n_right && n_left >= 3) ? n_left : n_right;
-                        output[filtered].confidence += TRACKING_PARTIAL_BODY_CONF_BOOST;
+                        is_partial = true;
+                        nvis = (n_left >= n_right && n_left >= 3) ? n_left : n_right;
+                        apply_boost = true;
                     } else {
                         /* Upper-body passed — mark as partial */
-                        output[filtered].is_partial_body = true;
-                        output[filtered].num_visible_keypoints = n_upper;
-                        output[filtered].confidence += TRACKING_PARTIAL_BODY_CONF_BOOST;
+                        is_partial = true;
+                        nvis = n_upper;
+                        apply_boost = true;
                     }
                 } else {
                     /* Full-body passed */
-                    output[filtered].is_partial_body = false;
-                    output[filtered].num_visible_keypoints = 17;
+                    is_partial = false;
+                    nvis = 17;
+                    apply_boost = false;
                 }
             }
             /* If no matching pose found, still accept detection
              * because it might be a person the pose model missed. */
         }
 
-        output[filtered++] = *det;
+        /* Copy detection first, then re-apply metadata AFTER the copy
+         * so partial-body / keypoint fields are not overwritten. */
+        output[filtered] = *det;
+        output[filtered].is_partial_body = is_partial;
+        output[filtered].num_visible_keypoints = nvis;
+        if (apply_boost) {
+            output[filtered].confidence += TRACKING_PARTIAL_BODY_CONF_BOOST;
+        }
+        filtered++;
     }
 
     /*
@@ -454,6 +466,18 @@ static int poses_to_detections(const PoseEstimation* poses, int num_poses,
     return out_count;
 }
 
+/*
+ * ── Face detection with ROI acceleration ──
+ *
+ * When person detections are available, faces are detected in each person's
+ * head region (ROI cropping → resize to model input → detect). This improves
+ * face detection quality because faces occupy a larger fraction of the model
+ * input, giving better landmark accuracy for ArcFace recognition.
+ *
+ * Falls back to full-frame detection when no person detections are available.
+ *
+ * Per-person deduplication: at most ONE face per person bbox (highest confidence).
+ */
 static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* face_recognizer,
                         const uint8_t* frame, int width, int height,
                         const Detection* person_dets, int num_person_dets,
@@ -461,40 +485,141 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
     if (!face_detector || !frame || !out_faces) return 0;
 
     FaceIdentity detected[20];
-    int num_detected = yolov5_face_detector_detect_faces(face_detector, frame, width, height, detected, 20);
+    int num_detected = 0;
+
+    /* ── ROI mode: per-person head crop detection ──
+     * More accurate face landmarks because faces appear larger relative
+     * to the 320×320 model input.  ROI covers head + shoulders (top ~40%
+     * of person bbox with 10% horizontal margin). */
+    if (num_person_dets > 0) {
+        uint8_t* roi_buf = (uint8_t*)malloc(320 * 320 * 3);
+        if (roi_buf) {
+            for (int p = 0; p < num_person_dets && num_detected < 20; p++) {
+                const BoundingBox* pb = &person_dets[p].bbox;
+                float person_h = bbox_height(pb);
+                if (person_h < 40.0f) continue;  /* too distant to detect face */
+
+                /* Head ROI: top portion of person bbox */
+                int roi_x = (int)(pb->x_min - person_h * 0.10f);
+                int roi_y = (int)(pb->y_min);
+                int roi_w = (int)(bbox_width(pb) + person_h * 0.20f);
+                int roi_h = (int)(person_h * 0.40f);
+
+                /* Clamp to frame */
+                if (roi_x < 0) { roi_w += roi_x; roi_x = 0; }
+                if (roi_y < 0) { roi_h += roi_y; roi_y = 0; }
+                if (roi_x + roi_w > width)  roi_w = width  - roi_x;
+                if (roi_y + roi_h > height) roi_h = height - roi_y;
+                if (roi_w < 24 || roi_h < 24) continue;
+
+                /* Crop ROI → contiguous buffer, then resize to model input.
+                 * Cannot pass frame+offset directly to utils_resize_image because
+                 * the source stride is full-frame width, not roi_w. */
+                uint8_t* crop_temp = (uint8_t*)malloc((size_t)roi_w * roi_h * 3);
+                if (!crop_temp) continue;
+                utils_crop_image(frame, width, height,
+                                 roi_x, roi_y, roi_w, roi_h, crop_temp);
+                utils_resize_image(crop_temp, roi_w, roi_h,
+                                   roi_buf, 320, 320, 3);
+                free(crop_temp);
+
+                /* Run face detection on ROI */
+                FaceIdentity roi_faces[3];
+                int n_roi = yolov5_face_detector_detect_faces(
+                    face_detector, roi_buf, 320, 320, roi_faces, 3);
+
+                /* Map ROI-space coords back to full-frame.
+                 * The face detector's internal yolo_preprocess maps back via
+                 * scale/pad_x/pad_y (letterbox). For ROI mode, input is already
+                 * 320×320 → scale≈1.0, pad≈0.  The detector returns coords in
+                 * the 320×320 space; we scale back to ROI dimensions then offset. */
+                float sx = (float)roi_w / 320.0f;
+                float sy = (float)roi_h / 320.0f;
+
+                for (int f = 0; f < n_roi && num_detected < 20; f++) {
+                    detected[num_detected] = roi_faces[f];
+                    detected[num_detected].bbox.x_min =
+                        roi_faces[f].bbox.x_min * sx + (float)roi_x;
+                    detected[num_detected].bbox.y_min =
+                        roi_faces[f].bbox.y_min * sy + (float)roi_y;
+                    detected[num_detected].bbox.x_max =
+                        roi_faces[f].bbox.x_max * sx + (float)roi_x;
+                    detected[num_detected].bbox.y_max =
+                        roi_faces[f].bbox.y_max * sy + (float)roi_y;
+                    num_detected++;
+                }
+            }
+            free(roi_buf);
+
+            if (num_detected > 0) goto face_recognition;
+        }
+    }
+
+    /* ── Fallback: full-frame detection ── */
+    num_detected = yolov5_face_detector_detect_faces(
+        face_detector, frame, width, height, detected, 20);
+
+face_recognition:
+    if (num_detected <= 0) return 0;
 
     int num_faces = 0;
+
+    /* ── Per-person deduplication ──
+     * At most one face per person: keep the highest-confidence face whose
+     * center falls inside the person bbox. ROI-detected faces are already
+     * per-person by construction, but full-frame fallback may have multiples. */
+    int matched_persons[20] = {0};  /* track which person index got a face */
+    int num_matched = 0;
+
     for (int i = 0; i < num_detected && num_faces < max_faces; i++) {
-        /* ── Face-to-person association ──
-         * Only accept faces that fall within a detected person bounding box.
-         * This prevents face recognition on false positives (e.g. faces on
-         * posters, reflections, or non-person objects).  The face center must
-         * be inside at least one person bbox. */
-        bool inside_person = (num_person_dets == 0);  /* if no person dets, accept all */
+        /* Find which person this face belongs to */
+        int best_person = -1;
         if (num_person_dets > 0) {
             float face_cx = bbox_center_x(&detected[i].bbox);
             float face_cy = bbox_center_y(&detected[i].bbox);
             for (int p = 0; p < num_person_dets; p++) {
-                if (face_cx >= person_dets[p].bbox.x_min && face_cx <= person_dets[p].bbox.x_max &&
-                    face_cy >= person_dets[p].bbox.y_min && face_cy <= person_dets[p].bbox.y_max) {
-                    inside_person = true;
+                if (face_cx >= person_dets[p].bbox.x_min &&
+                    face_cx <= person_dets[p].bbox.x_max &&
+                    face_cy >= person_dets[p].bbox.y_min &&
+                    face_cy <= person_dets[p].bbox.y_max) {
+                    best_person = p;
                     break;
                 }
             }
         }
-        if (!inside_person) continue;
+
+        /* Skip faces not inside any person (when persons are known) */
+        if (num_person_dets > 0 && best_person < 0) continue;
+
+        /* Per-person dedup: keep only highest-confidence face per person */
+        if (best_person >= 0) {
+            bool already_matched = false;
+            for (int m = 0; m < num_matched; m++) {
+                if (matched_persons[m] == best_person) {
+                    already_matched = true;
+                    break;
+                }
+            }
+            if (already_matched) continue;
+            if (num_matched < 20) {
+                matched_persons[num_matched++] = best_person;
+            }
+        }
 
         if (face_recognizer) {
             uint8_t* face_crop = (uint8_t*)malloc(112 * 112 * 3);
             if (!face_crop) continue;
 
-            yolov5_face_detector_crop_face(face_detector, frame, width, height, &detected[i], face_crop, 112, 112);
+            yolov5_face_detector_crop_face(face_detector, frame, width, height,
+                                            &detected[i], face_crop, 112, 112);
 
-            FaceIdentity identity = arcface_recognizer_recognize(face_recognizer, face_crop, 112, 112);
+            FaceIdentity identity = arcface_recognizer_recognize(
+                face_recognizer, face_crop, 112, 112);
             identity.bbox = detected[i].bbox;
             identity.confidence = detected[i].confidence;
             identity.has_keypoints = detected[i].has_keypoints;
-            memcpy(identity.keypoints, detected[i].keypoints, sizeof(detected[i].keypoints));
+            memcpy(identity.keypoints, detected[i].keypoints,
+                   sizeof(detected[i].keypoints));
 
             out_faces[num_faces++] = identity;
             free(face_crop);
@@ -509,7 +634,7 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
 /*
  * ── Cascade state management (v2 — Multi-Person Aware) ──
  *
- * KEY FIX: In TRACKING mode, we now run the SECONDARY detector (YOLO11n) at
+ * KEY FIX: In TRACKING mode, we now run the SECONDARY detector (YOLOv11n) at
  * reduced frequency (every `secondary_interval` frames) instead of skipping
  * it entirely.  This allows NEW people entering the scene to be detected
  * promptly — previously they'd only be caught during the periodic full-res
@@ -601,13 +726,13 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
      * ── ADAPTIVE CASCADE STRATEGY (v2 — Multi-Person + Partial-Body Aware) ──
      *
      * PIPELINE_CASCADE_SEARCHING:  No confirmed tracks.
-     *   → Run YOLOv8-Pose (PRIMARY) + YOLO11n (SECONDARY) at 640×640.
+     *   → Run YOLOv8n-Pose (PRIMARY) + YOLOv11n (SECONDARY) at 640×640.
      *   → Apply keypoint anatomical + partial-body validation.
      *   → Maximum recall, higher latency.
      *
      * PIPELINE_CASCADE_TRACKING:   ≥1 confirmed track.
      *   → Run YOLOv8-Pose every frame (PRIMARY).
-     *   → Run YOLO11n every `secondary_interval` frames (NEW: was skipped entirely).
+     *   → Run YOLOv11n every `secondary_interval` frames (NEW: was skipped entirely).
      *   → This ensures new people entering the scene are promptly detected.
      *   → Lower latency than SEARCHING, but still multi-person capable.
      *
@@ -625,7 +750,7 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
          * performance gain, the model input size should also be reduced.
          * Since the ONNX model has a fixed input shape (640×640), the ORT
          * resize happens during preprocessing anyway.  The key saving comes
-         * from SKIPPING the YOLO11n secondary model entirely.
+         * from SKIPPING the YOLOv11n secondary model entirely.
          */
         out_result->num_poses = estimate_poses_fullframe(pipeline->pose_estimator,
                                                      frame_data, width, height,
@@ -679,15 +804,30 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
         }
     }
 
-    /* ── Step 4: Action recognition from pose keypoints ── */
+    /* ── Step 4: Action recognition from pose keypoints ──
+     * Push poses to ST-GCN sliding window (fast, ~10μs).
+     * Actual inference runs async on CPU 2 via stgcn_action_recognizer_run_async().
+     * Result read below via stgcn_action_recognizer_get_latest(). */
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_ACTION) && pipeline->action_recognizer
         && out_result->num_poses > 0) {
-        for (int p = 0; p < out_result->num_poses; p++) {
-            stgcn_action_recognizer_push_pose(pipeline->action_recognizer, &out_result->poses[p], width, height);
+        /* ST-GCN expects ONE skeleton per timestep.  Select the highest-
+         * confidence pose to avoid corrupting the temporal buffer with
+         * interleaved multi-person skeletons. */
+        int best_p = 0;
+        float best_conf = out_result->poses[0].confidence;
+        for (int p = 1; p < out_result->num_poses; p++) {
+            if (out_result->poses[p].confidence > best_conf) {
+                best_conf = out_result->poses[p].confidence;
+                best_p = p;
+            }
         }
-        if (pipeline->frame_counter % pipeline->action_inference_interval == 0) {
-            out_result->action = stgcn_action_recognizer_recognize(pipeline->action_recognizer);
-            out_result->has_action = (out_result->action.num_actions > 0);
+        stgcn_action_recognizer_push_pose(pipeline->action_recognizer,
+            &out_result->poses[best_p], width, height);
+        /* Non-blocking: read latest async result if available */
+        ActionResult latest;
+        if (stgcn_action_recognizer_get_latest(pipeline->action_recognizer, &latest)) {
+            out_result->action = latest;
+            out_result->has_action = (latest.num_actions > 0);
         }
     }
 

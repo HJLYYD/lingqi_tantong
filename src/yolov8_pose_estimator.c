@@ -134,6 +134,11 @@ bool yolov8_pose_estimator_load_model(YOLOv8PoseEstimator* est, const char* mode
     est->ctx = ort_ctx_create(est->session, est->input_width, est->input_height, 3);
     if (!est->ctx) {
         log_error("YOLOv8Pose: failed to create inference context");
+        const OrtApi* ort = ort_get_api();
+        if (est->session && ort) {
+            ort->ReleaseSession(est->session);
+            est->session = NULL;
+        }
         return false;
     }
     strncpy(est->ctx->input_name, est->input_name, sizeof(est->ctx->input_name) - 1);

@@ -3,6 +3,7 @@
 
 #include "core_types.h"
 #include <stddef.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,6 +44,20 @@ typedef struct {
     size_t prealloc_pts_size;               /* element count of pts tensor */
     size_t prealloc_mot_size;               /* element count of mot tensor */
     bool prealloc_valid;                    /* true if all pre-allocations succeeded */
+
+    /* ── Thread safety for async recognition ──
+     * push_pose (inference thread, CPU1) and recognize (ST-GCN thread, CPU2)
+     * both access skeleton_buffer.  Lock protects the buffer + buffer_frames. */
+    pthread_mutex_t mutex;
+
+    /* ── Latest async recognition result ──
+     * Written by ST-GCN thread, read by postprocess thread.
+     * Protected by a separate read-write convention:
+     *   writer sets has_new_result=true after writing
+     *   reader sets has_new_result=false after reading */
+    ActionResult latest_action;
+    bool has_new_action;
+    pthread_mutex_t result_mutex;
 } STGCNActionRecognizer;
 
 STGCNActionRecognizer* stgcn_action_recognizer_create(const char* model_path,
@@ -62,6 +77,17 @@ void stgcn_action_recognizer_push_pose(STGCNActionRecognizer* recognizer,
 ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer);
 
 void stgcn_action_recognizer_reset(STGCNActionRecognizer* recognizer);
+
+/* ── Async recognition API (multi-threaded K1 pipeline) ── */
+
+/** Lock, run ST-GCN inference, store result, unlock.
+ *  Called from ST-GCN async thread (CPU 2). */
+void stgcn_action_recognizer_run_async(STGCNActionRecognizer* recognizer);
+
+/** Non-blocking read of latest async result.
+ *  Returns true if a new result is available, copies into *out. */
+bool stgcn_action_recognizer_get_latest(const STGCNActionRecognizer* recognizer,
+                                        ActionResult* out);
 
 const char* stgcn_get_action_name(int action_id);
 

@@ -5,6 +5,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <errno.h>
 
 #ifdef HAS_ONNX_RUNTIME
 #include <onnxruntime_c_api.h>
@@ -62,6 +64,20 @@ STGCNActionRecognizer* stgcn_action_recognizer_create(const char* model_path,
     rec->buffer_person_id = -1;
     rec->model_loaded = false;
 
+    /* Init mutexes for async recognition */
+    if (pthread_mutex_init(&rec->mutex, NULL) != 0) {
+        log_error("STGCNActionRecognizer: mutex init failed: %s", strerror(errno));
+        free(rec);
+        return NULL;
+    }
+    if (pthread_mutex_init(&rec->result_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&rec->mutex);
+        free(rec);
+        return NULL;
+    }
+    memset(&rec->latest_action, 0, sizeof(rec->latest_action));
+    rec->has_new_action = false;
+
     if (!model_path || !stgcn_action_recognizer_load_model(rec, model_path)) {
         log_error("STGCNActionRecognizer: failed to load model %s", model_path ? model_path : "(null)");
         free(rec);
@@ -81,6 +97,8 @@ void stgcn_action_recognizer_destroy(STGCNActionRecognizer* recognizer) {
     free(recognizer->prealloc_pts);
     free(recognizer->prealloc_mot);
     free(recognizer->prealloc_padded);
+    pthread_mutex_destroy(&recognizer->mutex);
+    pthread_mutex_destroy(&recognizer->result_mutex);
     free(recognizer);
 }
 
@@ -107,9 +125,16 @@ bool stgcn_action_recognizer_load_model(STGCNActionRecognizer* recognizer, const
                                       recognizer->num_frames,
                                       recognizer->num_keypoints,
                                       STGCN_NUM_CHANNELS);
-    if (recognizer->ctx) {
-        recognizer->ctx->input_name[0] = '\0';
+    if (!recognizer->ctx) {
+        log_error("STGCNActionRecognizer: failed to create inference context");
+        const OrtApi* ort = ort_get_api();
+        if (recognizer->session && ort) {
+            ort->ReleaseSession(recognizer->session);
+            recognizer->session = NULL;
+        }
+        return false;
     }
+    recognizer->ctx->input_name[0] = '\0';
 
     const OrtApi* ort = ort_get_api();
 
@@ -181,7 +206,8 @@ bool stgcn_action_recognizer_load_model(STGCNActionRecognizer* recognizer, const
         ort->ReleaseTypeInfo(type_info);
     }
 
-    recognizer->model_loaded = true;
+    /* model_loaded only when ctx AND session are both valid */
+    recognizer->model_loaded = (recognizer->ctx != NULL && recognizer->session != NULL);
 
     /* ── Pre-allocate inference tensors ──
      * Eliminates per-frame malloc/free in stgcn_action_recognizer_recognize().
@@ -222,6 +248,8 @@ void stgcn_action_recognizer_push_pose(STGCNActionRecognizer* recognizer,
                                         int img_width, int img_height) {
     if (!recognizer || !pose) return;
 
+    pthread_mutex_lock(&recognizer->mutex);
+
     int T = recognizer->num_frames;
     int V = recognizer->num_keypoints;
     int M = recognizer->num_persons;
@@ -258,6 +286,8 @@ void stgcn_action_recognizer_push_pose(STGCNActionRecognizer* recognizer,
     }
 
     recognizer->buffer_frames++;
+
+    pthread_mutex_unlock(&recognizer->mutex);
 }
 
 ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer) {
@@ -266,8 +296,10 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
 
     if (!recognizer || !recognizer->session) return result;
 
+    pthread_mutex_lock(&recognizer->mutex);
+
     const OrtApi* g_ort = ort_get_api();
-    if (!g_ort) return result;
+    if (!g_ort) { pthread_mutex_unlock(&recognizer->mutex); return result; }
 
     int T = recognizer->num_frames;
     int V = recognizer->num_keypoints;
@@ -288,7 +320,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
         pts_tensor = (float*)calloc(tensor_count, sizeof(float));
         pts_dynamic = true;
     }
-    if (!pts_tensor) return result;
+    if (!pts_tensor) { pthread_mutex_unlock(&recognizer->mutex); return result; }
 
     int valid_frames = (recognizer->buffer_frames < T) ? recognizer->buffer_frames : T;
     if (valid_frames > 0) {
@@ -311,6 +343,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     if (status) {
         g_ort->ReleaseStatus(status);
         if (pts_dynamic) free(pts_tensor);
+        pthread_mutex_unlock(&recognizer->mutex);
         return result;
     }
 
@@ -397,6 +430,8 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
 
     const char* output_names[1] = {NULL};
     OrtAllocator* allocator = NULL;
+    bool output_name_from_allocator = false;
+
     OrtStatus* st_alloc = g_ort->GetAllocatorWithDefaultOptions(&allocator);
     if (st_alloc) g_ort->ReleaseStatus(st_alloc);
 
@@ -406,11 +441,14 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
         if (s) {
             g_ort->ReleaseStatus(s);
             output_names[0] = "output";
+            output_name_from_allocator = false;
         } else {
             output_names[0] = name_ptr;
+            output_name_from_allocator = true;
         }
     } else {
         output_names[0] = "output";
+        output_name_from_allocator = false;
     }
 
     OrtValue* output_val = NULL;
@@ -420,7 +458,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     g_ort->ReleaseValue(pts_ort);
     if (mot_ort) g_ort->ReleaseValue(mot_ort);
 
-    if (allocator && output_names[0]) {
+    if (allocator && output_names[0] && output_name_from_allocator) {
         OrtStatus* st_f = g_ort->AllocatorFree(allocator, (void*)output_names[0]);
         if (st_f) g_ort->ReleaseStatus(st_f);
     }
@@ -429,6 +467,7 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
         const char* msg = g_ort->GetErrorMessage(status);
         log_error("ST-GCN inference failed: %s", msg ? msg : "unknown");
         g_ort->ReleaseStatus(status);
+        pthread_mutex_unlock(&recognizer->mutex);
         return result;
     }
 
@@ -486,14 +525,44 @@ ActionResult stgcn_action_recognizer_recognize(STGCNActionRecognizer* recognizer
     if (st_mut) g_ort->ReleaseStatus(st_mut);
 
     g_ort->ReleaseValue(output_val);
+    pthread_mutex_unlock(&recognizer->mutex);
     return result;
+}
+
+/* ── Async recognition API ── */
+
+void stgcn_action_recognizer_run_async(STGCNActionRecognizer* recognizer) {
+    if (!recognizer) return;
+    ActionResult r = stgcn_action_recognizer_recognize(recognizer);
+    /* recognize() handles its own mutex; store result under result_mutex */
+    pthread_mutex_lock(&recognizer->result_mutex);
+    recognizer->latest_action = r;
+    recognizer->has_new_action = true;
+    pthread_mutex_unlock(&recognizer->result_mutex);
+}
+
+bool stgcn_action_recognizer_get_latest(const STGCNActionRecognizer* recognizer,
+                                        ActionResult* out) {
+    if (!recognizer || !out) return false;
+    /* Cast away const for mutex — internal synchronization only */
+    STGCNActionRecognizer* rw = (STGCNActionRecognizer*)recognizer;
+    pthread_mutex_lock(&rw->result_mutex);
+    bool has = rw->has_new_action;
+    if (has) {
+        *out = rw->latest_action;
+        rw->has_new_action = false;
+    }
+    pthread_mutex_unlock(&rw->result_mutex);
+    return has;
 }
 
 void stgcn_action_recognizer_reset(STGCNActionRecognizer* recognizer) {
     if (!recognizer) return;
+    pthread_mutex_lock(&recognizer->mutex);
     memset(recognizer->skeleton_buffer, 0, sizeof(recognizer->skeleton_buffer));
     recognizer->buffer_frames = 0;
     recognizer->buffer_person_id = -1;
+    pthread_mutex_unlock(&recognizer->mutex);
 }
 
 const char* stgcn_get_action_name(int action_id) {

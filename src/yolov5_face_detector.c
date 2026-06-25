@@ -205,15 +205,19 @@ static float decode_5d_proposal(const float* feat,   /* [16] raw logits */
     out_bbox->x_max = cx_model + w_model * 0.5f;
     out_bbox->y_max = cy_model + h_model * 0.5f;
 
-    /* ── Landmark decode (5 keypoints × 2 coords, at feat[5..14]) ── */
+    /* ── Landmark decode (5 keypoints × 2 coords, at feat[5..14]) ──
+     * Official formula (deepcam-cn/yolov5-face, community consensus):
+     *   lm_x = raw_pred_x * anchor_w + grid_x * stride
+     *   lm_y = raw_pred_y * anchor_h + grid_y * stride
+     * Landmarks use LINEAR regression (no sigmoid) with anchor_w/h as the
+     * scale reference — this makes predictions scale-invariant to face size.
+     * See: docs/INFERENCE_OPTIMIZATION_ANALYSIS.md §1.1 */
     for (int k = 0; k < YOLOV5_FACE_NUM_KEYPOINTS; k++) {
-        float lx = feat[5 + k * 2 + 0];  /* landmarks start at index 5 */
+        float lx = feat[5 + k * 2 + 0];  /* raw logit — NO sigmoid */
         float ly = feat[5 + k * 2 + 1];
-        float slx = utils_sigmoid(lx);
-        float sly = utils_sigmoid(ly);
 
-        out_kpts[k][0] = (slx * 2.0f - 0.5f + (float)grid_x) * (float)stride;
-        out_kpts[k][1] = (sly * 2.0f - 0.5f + (float)grid_y) * (float)stride;
+        out_kpts[k][0] = lx * anchor_w + (float)grid_x * (float)stride;
+        out_kpts[k][1] = ly * anchor_h + (float)grid_y * (float)stride;
     }
 
     return confidence;
@@ -223,7 +227,8 @@ static float decode_5d_proposal(const float* feat,   /* [16] raw logits */
  * Decode 5D format output: [1, anchors, H, W, features] × 3 strides.
  *
  * This is the xquant-split output where the Detect head is removed.
- * All values are raw logits — we must apply sigmoid + anchor decode.
+ * Bbox + obj/cls: raw logits → must apply sigmoid + anchor decode.
+ * Landmarks: raw logits → linear regression (NO sigmoid).
  *
  * 5D tensor layout (ONNX row-major):
  *   data[a * H * W * F + h * W * F + w * F + feat_idx]
@@ -408,29 +413,36 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
 
     /* ── Auto-detect output format and decode ──
      *
-     * Strategy: probe the first output's rank.
+     * Strategy: probe the first output's rank ONCE, then cache.
      *   num_dims == 5 → xquant-split 5D format (raw logits, anchor decode)
-     *   num_dims == 4 → check channel count:
-     *     channels >= 16 → standard 4D format (Detect layer baked in)
-     *     channels <  16 → skip (partial xquant output like DFL reg)
+     *   num_dims == 4 → standard 4D format (Detect layer baked in)
      */
+
+    /* Probe & cache output format on first frame */
     RawFaceDetection raw_faces[YOLOV5_FACE_MAX_FACES];
     int num_raw = 0;
-    bool use_5d_decode = false;
 
-    /* Probe first output for format detection */
-    if (num_outputs > 0 && output_vals[0]) {
-        OrtTensorTypeAndShapeInfo* si = NULL;
-        if (ort->GetTensorTypeAndShape(output_vals[0], &si) == NULL) {
-            size_t nd = 0;
-            { OrtStatus* _s = ort->GetDimensionsCount(si, &nd); if (_s) ort->ReleaseStatus(_s); }
-            if (nd == 5) {
-                use_5d_decode = true;
-                log_info("YOLOv5Face: detected 5D output format (%zu outputs), using xquant anchor decode", num_outputs);
+    if (det->output_format_cached == 0) {
+        if (num_outputs > 0 && output_vals[0]) {
+            OrtTensorTypeAndShapeInfo* si = NULL;
+            if (ort->GetTensorTypeAndShape(output_vals[0], &si) == NULL) {
+                size_t nd = 0;
+                { OrtStatus* _s = ort->GetDimensionsCount(si, &nd); if (_s) ort->ReleaseStatus(_s); }
+                if (nd == 5) {
+                    det->output_format_cached = 2;
+                    log_info("YOLOv5Face: detected 5D output format (%zu outputs), using xquant anchor decode", num_outputs);
+                } else {
+                    det->output_format_cached = 1;
+                    log_info("YOLOv5Face: detected 4D output format (%zu outputs), using standard decode", num_outputs);
+                }
+                ort->ReleaseTensorTypeAndShapeInfo(si);
             }
-            ort->ReleaseTensorTypeAndShapeInfo(si);
+        }
+        if (det->output_format_cached == 0) {
+            det->output_format_cached = 1; /* default to 4D on probe failure */
         }
     }
+    bool use_5d_decode = (det->output_format_cached == 2);
 
     if (use_5d_decode) {
         /* ── xquant-split 5D format path ── */

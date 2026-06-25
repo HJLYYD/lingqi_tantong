@@ -47,6 +47,7 @@ struct VideoProcessor {
     int v4l2_buffer_count;
     uint32_t v4l2_pixelformat;
     bool v4l2_streaming;
+    bool v4l2_is_mplane;    /* true if driver uses V4L2_CAP_VIDEO_CAPTURE_MPLANE (K1 CCIC1) */
 #endif
 };
 
@@ -87,7 +88,8 @@ VideoProcessor* video_processor_create(const char* input_path, int target_width,
 static void v4l2_close_stream(VideoProcessor* vp) {
     if (vp->v4l2_fd < 0) return;
     if (vp->v4l2_streaming) {
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        enum v4l2_buf_type type = vp->v4l2_is_mplane ?
+            V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(vp->v4l2_fd, VIDIOC_STREAMOFF, &type);
         vp->v4l2_streaming = false;
     }
@@ -146,17 +148,27 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
         close(fd);
         return -1;
     }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+    /* K1 CCIC1 driver uses V4L2_CAP_VIDEO_CAPTURE_MPLANE (Multiplanar).
+     * Standard UVC/V4L2 drivers use V4L2_CAP_VIDEO_CAPTURE (single-planar).
+     * Accept either — both indicate a usable camera device. */
+    bool is_mplane = (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) != 0;
+    bool is_capture = (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) != 0;
+    if ((!is_capture && !is_mplane) ||
         !(cap.capabilities & V4L2_CAP_STREAMING)) {
-        log_error("V4L2: device %s lacks capture/streaming capability (caps=0x%x)",
+        log_error("V4L2: device %s lacks capture/streaming capability (caps=0x%08x)",
                   device_path, cap.capabilities);
         close(fd);
         return -1;
     }
+    vp->v4l2_is_mplane = is_mplane;
 
-    log_info("V4L2: device %s (%s, %s)", device_path,
+    log_info("V4L2: device %s (%s, %s) [%s]", device_path,
              cap.card[0] ? (const char*)cap.card : "unknown",
-             cap.driver[0] ? (const char*)cap.driver : "unknown");
+             cap.driver[0] ? (const char*)cap.driver : "unknown",
+             is_mplane ? "MPLANE" : "single-planar");
+
+    enum v4l2_buf_type buf_type = is_mplane ?
+        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     uint32_t want_fmt = V4L2_PIX_FMT_MJPEG;
     if (preferred_format) {
@@ -171,27 +183,39 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
 
     struct v4l2_format vfmt;
     memset(&vfmt, 0, sizeof(vfmt));
-    vfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    vfmt.fmt.pix.width = (uint32_t)width;
-    vfmt.fmt.pix.height = (uint32_t)height;
-    vfmt.fmt.pix.pixelformat = want_fmt;
-    vfmt.fmt.pix.field = V4L2_FIELD_ANY;
+    vfmt.type = buf_type;
+    if (is_mplane) {
+        vfmt.fmt.pix_mp.width       = (uint32_t)width;
+        vfmt.fmt.pix_mp.height      = (uint32_t)height;
+        vfmt.fmt.pix_mp.pixelformat = want_fmt;
+        vfmt.fmt.pix_mp.field       = V4L2_FIELD_ANY;
+        vfmt.fmt.pix_mp.num_planes  = 1;
+    } else {
+        vfmt.fmt.pix.width       = (uint32_t)width;
+        vfmt.fmt.pix.height      = (uint32_t)height;
+        vfmt.fmt.pix.pixelformat = want_fmt;
+        vfmt.fmt.pix.field       = V4L2_FIELD_ANY;
+    }
     if (ioctl(fd, VIDIOC_S_FMT, &vfmt) != 0) {
         log_error("V4L2: VIDIOC_S_FMT failed: %s", strerror(errno));
         close(fd);
         return -1;
     }
-    if (vfmt.fmt.pix.pixelformat != want_fmt) {
-        uint32_t got = vfmt.fmt.pix.pixelformat;
-        log_warning("V4L2: requested pixfmt 0x%x, driver chose 0x%x", want_fmt, got);
+    {
+        uint32_t got = is_mplane ? vfmt.fmt.pix_mp.pixelformat : vfmt.fmt.pix.pixelformat;
+        int got_w    = is_mplane ? (int)vfmt.fmt.pix_mp.width  : (int)vfmt.fmt.pix.width;
+        int got_h    = is_mplane ? (int)vfmt.fmt.pix_mp.height : (int)vfmt.fmt.pix.height;
+        if (got != want_fmt) {
+            log_warning("V4L2: requested pixfmt 0x%x, driver chose 0x%x", want_fmt, got);
+        }
+        vp->v4l2_pixelformat = got;
+        vp->original_width   = got_w;
+        vp->original_height  = got_h;
     }
-    vp->v4l2_pixelformat = vfmt.fmt.pix.pixelformat;
-    vp->original_width = (int)vfmt.fmt.pix.width;
-    vp->original_height = (int)vfmt.fmt.pix.height;
 
     struct v4l2_streamparm parm;
     memset(&parm, 0, sizeof(parm));
-    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.type = buf_type;
     if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0 &&
         (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
         parm.parm.capture.timeperframe.numerator = 1;
@@ -206,8 +230,8 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
-    req.count = VP_V4L2_BUFFER_COUNT;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.count  = VP_V4L2_BUFFER_COUNT;
+    req.type   = buf_type;
     req.memory = V4L2_MEMORY_MMAP;
     if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
         log_error("V4L2: VIDIOC_REQBUFS failed: %s", strerror(errno));
@@ -222,23 +246,31 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
 
     for (uint32_t i = 0; i < req.count; i++) {
         struct v4l2_buffer buf;
+        struct v4l2_plane plane;
         memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        memset(&plane, 0, sizeof(plane));
+        buf.type   = buf_type;
         buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
+        buf.index  = i;
+        if (is_mplane) {
+            buf.m.planes    = &plane;
+            buf.length      = 1;
+        }
         if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
             log_error("V4L2: VIDIOC_QUERYBUF[%u] failed: %s", i, strerror(errno));
             close(fd);
             return -1;
         }
-        void* ptr = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        size_t buf_len   = is_mplane ? plane.length   : buf.length;
+        uint32_t buf_off = is_mplane ? plane.m.mem_offset : buf.m.offset;
+        void* ptr = mmap(NULL, buf_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf_off);
         if (ptr == MAP_FAILED) {
             log_error("V4L2: mmap[%u] failed: %s", i, strerror(errno));
             close(fd);
             return -1;
         }
-        vp->v4l2_buffers[i] = (uint8_t*)ptr;
-        vp->v4l2_buffer_sizes[i] = buf.length;
+        vp->v4l2_buffers[i]      = (uint8_t*)ptr;
+        vp->v4l2_buffer_sizes[i] = buf_len;
         if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
             log_error("V4L2: VIDIOC_QBUF[%u] failed: %s", i, strerror(errno));
             close(fd);
@@ -247,7 +279,7 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
     }
     vp->v4l2_buffer_count = (int)req.count;
 
-    enum v4l2_buf_type stype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    enum v4l2_buf_type stype = buf_type;
     if (ioctl(fd, VIDIOC_STREAMON, &stype) != 0) {
         log_error("V4L2: VIDIOC_STREAMON failed: %s", strerror(errno));
         close(fd);
@@ -277,16 +309,27 @@ static FrameData* v4l2_read_frame(VideoProcessor* vp) {
         return NULL;
     }
 
+    bool is_mplane = vp->v4l2_is_mplane;
+    enum v4l2_buf_type buf_type = is_mplane ?
+        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
     struct v4l2_buffer buf;
+    struct v4l2_plane plane;
     memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    memset(&plane, 0, sizeof(plane));
+    buf.type   = buf_type;
     buf.memory = V4L2_MEMORY_MMAP;
+    if (is_mplane) {
+        buf.m.planes = &plane;
+        buf.length   = 1;
+    }
     if (ioctl(vp->v4l2_fd, VIDIOC_DQBUF, &buf) != 0) {
         if (errno != EAGAIN) log_warning("V4L2: VIDIOC_DQBUF failed: %s", strerror(errno));
         return NULL;
     }
     if (buf.index >= (uint32_t)vp->v4l2_buffer_count) {
         log_error("V4L2: DQBUF returned bad index %u", buf.index);
+        ioctl(vp->v4l2_fd, VIDIOC_QBUF, &buf);
         return NULL;
     }
 
@@ -311,7 +354,7 @@ static FrameData* v4l2_read_frame(VideoProcessor* vp) {
     }
 
     const uint8_t* payload = vp->v4l2_buffers[buf.index];
-    size_t payload_len = buf.bytesused;
+    size_t payload_len = is_mplane ? plane.bytesused : buf.bytesused;
     int decode_ok = 0;
 
     if (vp->v4l2_pixelformat == V4L2_PIX_FMT_MJPEG) {

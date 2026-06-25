@@ -245,7 +245,7 @@ OrtSession* ort_create_session(const char* model_path, int num_threads, bool use
 #endif
 
 use_cpu:  /* fallthrough label for EP skip */
-
+    ;
     int intra;
     int inter;
     if (want_ep) {

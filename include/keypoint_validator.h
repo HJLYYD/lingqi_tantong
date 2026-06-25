@@ -27,9 +27,9 @@ extern "C" {
  */
 
 /* ── Tunable thresholds ── */
-#define KV_DEFAULT_MIN_KEYPOINTS       6     /* raised from 5: stronger FP rejection */
-#define KV_DEFAULT_KPT_CONF_THRESHOLD  0.30f
-#define KV_DEFAULT_VALIDITY_THRESHOLD  0.50f  /* raised from 0.40: stronger FP rejection */
+#define KV_DEFAULT_MIN_KEYPOINTS       3     /* lowered from 6: 320x320 model weak keypoints */
+#define KV_DEFAULT_KPT_CONF_THRESHOLD  0.10f /* lowered from 0.30: INT8-quantized kpt confidence */
+#define KV_DEFAULT_VALIDITY_THRESHOLD  0.25f /* lowered from 0.50: accept partial-body detections */
 #define KV_DEFAULT_IN_BBOX_RATIO       0.70f
 #define KV_DEFAULT_SYMMETRY_TOLERANCE  0.15f
 

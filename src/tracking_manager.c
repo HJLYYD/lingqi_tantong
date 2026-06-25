@@ -1190,6 +1190,7 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
      * Full pose-based appearance features are computed during pose association. */
     AppearanceFeature det_features[MAX_DETECTIONS_PER_FRAME];
     int num_det_features = 0;
+    (void)num_det_features;
     /* Clear all — features computed lazily */
     for (int d = 0; d < num_detections; d++) {
         memset(&det_features[d], 0, sizeof(AppearanceFeature));

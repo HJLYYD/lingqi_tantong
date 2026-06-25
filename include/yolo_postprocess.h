@@ -8,9 +8,9 @@
 extern "C" {
 #endif
 
-void yolo_softmax_stable(float* x, int n);
+void yolo_softmax_stable(float* restrict x, int n);
 
-float yolo_dfl_decode_position(const float* reg_data, int pix, int hw, float dists_out[4]);
+float yolo_dfl_decode_position(const float* restrict reg_data, int pix, int hw, float dists_out[4]);
 
 void yolo_preprocess(const uint8_t* image_data, int width, int height,
                      float* out_tensor, int target_w, int target_h,
