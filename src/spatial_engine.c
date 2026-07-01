@@ -31,6 +31,22 @@ SpatialLocalizationEngine* spatial_engine_create(const float* camera_matrix, con
     SpatialLocalizationEngine* engine = (SpatialLocalizationEngine*)calloc(1, sizeof(SpatialLocalizationEngine));
     if (!engine) return NULL;
 
+    /* Validate focal length / camera matrix to prevent division-by-zero downstream */
+    if (focal_length <= 0.0f && (!camera_matrix || camera_matrix[0] <= 0.0f)) {
+        log_error("[Spatial] Invalid focal length — requires fx > 0 (got focal=%.2f, fx=%.2f)",
+                  (double)focal_length, camera_matrix ? (double)camera_matrix[0] : 0.0);
+        free(engine);
+        return NULL;
+    }
+    /* Also validate fy: element [4] is the vertical focal length (fy).
+     * If fy=0 with fx>0, all depth projection divides by zero. */
+    if (camera_matrix && camera_matrix[4] <= 0.0f) {
+        log_error("[Spatial] Invalid camera matrix — fy=%.2f must be > 0",
+                  (double)camera_matrix[4]);
+        free(engine);
+        return NULL;
+    }
+
     if (camera_matrix) {
         memcpy(engine->camera_matrix, camera_matrix, 9 * sizeof(float));
     } else {
@@ -165,9 +181,14 @@ static float estimate_depth_from_pose(const SpatialLocalizationEngine* engine,
     float pitch_rad = engine->has_camera_pose ? engine->camera_pitch * ((float)M_PI / 180.0f) : 0.0f;
     float cos_tilt = cosf(pitch_rad);
 
-    /* Collect keypoint y-coordinates with per-kpt confidence */
+    /* Collect keypoint y-coordinates with per-kpt confidence.
+     * Zero-init all 17 slots — if num_keypoints < 17, unvisited indices
+     * remain 0.0f (safe sentinel; confidence=0 means DEPTH_MIN_KEYPOINT_CONF
+     * filter rejects them). */
     float kp_y[17];
     float kp_c[17];
+    memset(kp_y, 0, sizeof(kp_y));
+    memset(kp_c, 0, sizeof(kp_c));
     for (int i = 0; i < 17 && i < pose->num_keypoints; i++) {
         kp_y[i] = pose->keypoints[i].y;
         kp_c[i] = pose->keypoints[i].confidence;
@@ -178,8 +199,8 @@ static float estimate_depth_from_pose(const SpatialLocalizationEngine* engine,
 
     /* Define measurement pairs: {upper_kpt, lower_kpt, body_ratio, label} */
     struct { int upper; int lower; float ratio; } pairs[] = {
-        {KPT_NOSE,          KPT_LEFT_ANKLE,  ANTHRO_ANKLE_TO_HEIGHT},  /* nose→ankle ≈ full height */
-        {KPT_NOSE,          KPT_RIGHT_ANKLE, ANTHRO_ANKLE_TO_HEIGHT},
+        {KPT_NOSE,          KPT_LEFT_ANKLE,  ANTHRO_NOSE_TO_ANKLE_RATIO},  /* nose→ankle ≈ 90% of full height */
+        {KPT_NOSE,          KPT_RIGHT_ANKLE, ANTHRO_NOSE_TO_ANKLE_RATIO},
         {KPT_LEFT_SHOULDER, KPT_LEFT_ANKLE,  ANTHRO_SHOULDER_TO_HEIGHT - ANTHRO_ANKLE_TO_HEIGHT},
         {KPT_RIGHT_SHOULDER,KPT_RIGHT_ANKLE, ANTHRO_SHOULDER_TO_HEIGHT - ANTHRO_ANKLE_TO_HEIGHT},
         {KPT_LEFT_HIP,      KPT_LEFT_ANKLE,  ANTHRO_HIP_TO_HEIGHT - ANTHRO_ANKLE_TO_HEIGHT},
@@ -286,8 +307,11 @@ static float estimate_depth_from_bbox(const SpatialLocalizationEngine* engine,
     float alpha = atan2f(fabsf(v_center - cy), fy);
     float cos_alpha = cosf(alpha);
 
-    /* 3-point sampling at head, shoulder, hip proportions */
-    float ratios[] = {ANTHRO_ANKLE_TO_HEIGHT,           /* ≈ full height */
+    /* 3-point sampling: full body → shoulder → hip proportions.
+     * The bbox spans the full person, so ratio=1.0 is the primary estimate.
+     * ANTHRO_ANKLE_TO_HEIGHT (0.039) is NOT suitable here — it's the ankle
+     * height above ground, not the bbox height. */
+    float ratios[] = {1.0f,                              /* full body height */
                       ANTHRO_SHOULDER_TO_HEIGHT,         /* shoulder→foot */
                       ANTHRO_HIP_TO_HEIGHT};             /* hip→foot */
     float estimates[3];
@@ -547,12 +571,44 @@ bool spatial_engine_get_velocity(SpatialLocalizationEngine* engine, int track_id
     const TrajectoryBuffer* buf = &engine->trajectories[track_id];
     if (buf->count < 2) return false;
 
-    const SpatialPosition* last = &buf->positions[buf->count - 1];
-    const SpatialPosition* prev = &buf->positions[buf->count - 2];
+    /* ── 线性回归速度估计 (Savitzky-Golay N=1, M=5) ──
+     * 用最近 N 个轨迹点拟合直线, 斜率 = 速度.
+     * 比 2 点差分约降低 √5 ≈ 2.2× 噪声 (Rivolo et al. 2015).
+     *
+     * 参数选择:
+     *   M=5 样本, @15fps → 0.33s 窗口 < 1/3 步行周期 (~1.2s)
+     *   直线拟合 (常数速度) 在短窗口内是合理近似
+     *
+     * 公式: slope = (n·Σ(i·x_i) - Σ(i)·Σ(x_i)) / (n·Σ(i²) - Σ(i)²) */
+    #define VEL_REGRESSION_N  5
+    int n = UTILS_MIN(VEL_REGRESSION_N, buf->count);
+    int start = buf->count - n;
 
-    out_velocity[0] = (last->x - prev->x) / dt;
-    out_velocity[1] = (last->y - prev->y) / dt;
-    out_velocity[2] = (last->z - prev->z) / dt;
+    float sum_i = 0.0f, sum_i2 = 0.0f;
+    float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
+    float sum_ix = 0.0f, sum_iy = 0.0f, sum_iz = 0.0f;
+
+    for (int i = 0; i < n; i++) {
+        float idx = (float)i;
+        const SpatialPos* p = &buf->positions[start + i];
+        sum_i += idx;
+        sum_i2 += idx * idx;
+        sum_x += p->x;
+        sum_y += p->y;
+        sum_z += p->z;
+        sum_ix += idx * p->x;
+        sum_iy += idx * p->y;
+        sum_iz += idx * p->z;
+    }
+
+    float denom = (float)n * sum_i2 - sum_i * sum_i;
+    if (fabsf(denom) < 1e-6f) return false;
+
+    /* slope = 斜率 (米/索引), 除以 dt 转换为 m/s */
+    float inv_denom_dt = 1.0f / (denom * dt);
+    out_velocity[0] = ((float)n * sum_ix - sum_i * sum_x) * inv_denom_dt;
+    out_velocity[1] = ((float)n * sum_iy - sum_i * sum_y) * inv_denom_dt;
+    out_velocity[2] = ((float)n * sum_iz - sum_i * sum_z) * inv_denom_dt;
 
     float speed = sqrtf(out_velocity[0]*out_velocity[0] + out_velocity[1]*out_velocity[1] + out_velocity[2]*out_velocity[2]);
     if (speed > 50.0f) return false;
@@ -574,6 +630,11 @@ void spatial_engine_clear_trajectories(SpatialLocalizationEngine* engine) {
 int spatial_engine_get_active_tracks(const SpatialLocalizationEngine* engine, int* out_ids, int max_count) {
     if (!engine || !out_ids) return 0;
 
+    /* Defensive: validate max_count to prevent stack overflow */
+    if (max_count <= 0 || max_count > SPATIAL_MAX_PERSONS) {
+        max_count = SPATIAL_MAX_PERSONS;
+    }
+
     int count = 0;
     for (int i = 0; i < SPATIAL_MAX_PERSONS && count < max_count; i++) {
         if (engine->trajectory_active[i]) {
@@ -581,6 +642,24 @@ int spatial_engine_get_active_tracks(const SpatialLocalizationEngine* engine, in
         }
     }
     return count;
+}
+
+void spatial_engine_reset_origin(SpatialLocalizationEngine* engine,
+                                  const SpatialPosition* new_origin) {
+    if (!engine) return;
+
+    if (new_origin) {
+        engine->world_origin = *new_origin;
+        engine->world_initialized = true;
+        log_info("[Spatial] Origin manually set to (%.2f, %.2f, %.2f)m",
+                 new_origin->x, new_origin->y, new_origin->z);
+    } else {
+        engine->world_initialized = false;
+        memset(&engine->world_origin, 0, sizeof(SpatialPosition));
+        /* 清除轨迹缓存避免引用过期坐标 */
+        spatial_engine_clear_trajectories(engine);
+        log_info("[Spatial] Origin reset to uninitialized (lazy re-init on next detection)");
+    }
 }
 
 void spatial_engine_set_camera_pose(SpatialLocalizationEngine* engine, float pitch, float roll, float yaw) {

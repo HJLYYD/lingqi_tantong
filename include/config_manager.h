@@ -60,6 +60,7 @@ void config_set_string(ConfigManager* cm, const char* key_path, const char* val)
 
 void config_load_defaults(ConfigManager* cm);
 int  config_load_from_file(ConfigManager* cm, const char* path);
+int  config_save_to_file(const ConfigManager* cm, const char* path);
 
 #ifdef __cplusplus
 }

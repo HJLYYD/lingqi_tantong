@@ -2,12 +2,14 @@
 #define INFERENCE_PIPELINE_H
 
 #include "core_types.h"
+#include <stdatomic.h>
 #include "config_manager.h"
 #include "yolov8_pose_estimator.h"
 #include "yolov5_face_detector.h"
 #include "arcface_recognizer.h"
 #include "stgcn_action_recognizer.h"
 #include "keypoint_validator.h"
+#include "frame_diff.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,12 +57,14 @@ typedef struct {
     int cascade_tracking_w;            /* reduced resolution width when tracking */
     int cascade_tracking_h;            /* reduced resolution height when tracking */
     int cascade_lost_counter;          /* consecutive frames with 0 confirmed tracks */
-    /* Cross-thread in K1 pipeline: written by PostProcess thread, read by Inference thread.
-     * RISC-V 64-bit aligned int load/store is hardware-atomic. 'volatile' prevents
-     * compiler from hoisting/caching across the inference call.  Stale-by-1-frame is
-     * acceptable for the cascade state machine — no mutex needed. */
-    volatile int confirmed_track_count;
-    volatile int total_track_count;
+    /* BUGFIX: _Atomic for RISC-V weak memory (was volatile).
+     * Written by PostProcess thread, read by Inference thread.
+     * RVWMO requires acquire/release ordering — plain ld/sd (volatile)
+     * does NOT provide cross-hart visibility.  C11 _Atomic with
+     * memory_order_relaxed is sufficient here since stale-by-1-frame
+     * is acceptable for cascade state machine. */
+    _Atomic int confirmed_track_count;
+    _Atomic int total_track_count;
 
     /* ── Keypoint validator ── */
     KeypointValidator* keypoint_validator;
@@ -72,6 +76,20 @@ typedef struct {
 
     /* ── Action recognition config ── */
     int action_inference_interval;     /* frames between ST-GCN inference runs */
+
+    /* ── NEW: Model warm-up ── */
+    bool warmed_up;                    /* true after pipeline_warmup() completes */
+
+    /* ── NEW: Dynamic frame skip ── */
+    bool dynamic_skip_enabled;         /* enable frame skipping when saturated */
+    int  skip_counter;                 /* consecutive skipped face/action frames */
+    int  max_consecutive_skip;         /* max skips before forcing full frame */
+
+    /* ── NEW: Frame differencing for adaptive frame skip ── */
+    FrameDiff* frame_diff;             /* fast subsampled MAD frame comparison */
+    bool      frame_diff_enabled;      /* master switch from config */
+    InferResult last_full_result;      /* cached result from last processed frame */
+    bool      has_last_result;         /* true after first processed frame */
 } AIInferencePipeline;
 
 AIInferencePipeline* inference_pipeline_create(void);
@@ -89,6 +107,16 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
 
 void inference_pipeline_configure(AIInferencePipeline* pipeline, uint32_t stages);
 void inference_pipeline_reset(AIInferencePipeline* pipeline);
+
+/**
+ * Run model warm-up: 3 dummy inferences to populate TCM/NPU caches and
+ * initialize ONNX Runtime session memory pools.
+ * Must be called after load_models() and before first process_frame().
+ * Skipped if already warmed up (idempotent).
+ *
+ * @return 0 = success, -1 = warmup failed
+ */
+int inference_pipeline_warmup(AIInferencePipeline* pipeline, int width, int height);
 
 #ifdef __cplusplus
 }

@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "keypoint_validator.h"
 #include "tracking_manager.h"
+#include "frame_diff.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,17 +22,13 @@
  * Face detection runs at reduced frequency as optional supplement.
  * ByteTrack does two-stage matching for final filtering. */
 #define PERSON_CLASS_ID             0
-#define MIN_PERSON_CONFIDENCE       0.15f   /* DFL geomean: uniform=0.0625, weak=0.10, clear=0.25+.
-                                               Raised from 0.10 to 0.15 (2.4× uniform baseline) to
-                                               suppress false positives from the broken cls head.
-                                               Only detections with moderately peaked DFL distributions
-                                               pass — effectively filters ~60% of noise. */
+#define MIN_PERSON_CONFIDENCE       0.03f   /* Tuned for 320×320 INT8 model: DFL peaks 0.04-0.12 */
 #define MIN_PERSON_AREA_RATIO       0.005f  /* raised from 0.002: tiny blobs <0.5% of frame are noise */
 #define MAX_PERSON_AREA_RATIO       0.40f   /* lowered from 0.45: person >40% of frame is improbable */
 #define MIN_PERSON_ASPECT_RATIO     0.30f   /* tightened from 0.20: standing/walking person is 0.35-0.65 */
 #define MAX_PERSON_ASPECT_RATIO     1.80f   /* tightened from 2.0: arms-out pose at most ~1.5-1.8 */
 #define MIN_PERSON_HEIGHT_RATIO     0.04f   /* raised from 0.03: distant person still >4% of frame height */
-#define MAX_PERSON_HEIGHT_RATIO     0.75f   /* lowered from 0.80: very close person <75% of frame */
+#define MAX_PERSON_HEIGHT_RATIO     0.95f   /* allows close-up person up to 95% of frame height */
 #define PERSON_NMS_IOU_THRESHOLD    0.30f   /* lowered from 0.40: more aggressive intra-model NMS.
                                                ByteTrack best practice: detector NMS should be tighter
                                                than tracker IOU to avoid passing duplicate boxes. */
@@ -86,6 +83,17 @@ AIInferencePipeline* inference_pipeline_create(void) {
     /* ── Action recognition defaults ── */
     pipeline->action_inference_interval = 10;  /* default: run ST-GCN every 10 frames */
 
+    /* ── Frame differencing init (disabled until explicitly configured) ── */
+    pipeline->frame_diff = NULL;
+    pipeline->frame_diff_enabled = false;
+    pipeline->has_last_result = false;
+    memset(&pipeline->last_full_result, 0, sizeof(pipeline->last_full_result));
+
+    /* ── Dynamic skip defaults (legacy, may be superseded by frame_diff) ── */
+    pipeline->dynamic_skip_enabled = false;
+    pipeline->skip_counter = 0;
+    pipeline->max_consecutive_skip = 10;
+
     return pipeline;
 }
 
@@ -107,6 +115,9 @@ void inference_pipeline_destroy(AIInferencePipeline* pipeline) {
     if (pipeline->keypoint_validator) {
         keypoint_validator_destroy(pipeline->keypoint_validator);
     }
+    if (pipeline->frame_diff) {
+        frame_diff_destroy(pipeline->frame_diff);
+    }
 
     free(pipeline);
 }
@@ -126,25 +137,46 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
      *   5. ST-GCN        — CPU EP only (FP32)
      */
 
-    /* ── Step 1: YOLOv8n-pose (PRIMARY, REQUIRED) ── */
+    /* ── Step 1: YOLO-Pose (PRIMARY, REQUIRED) ──
+     * Select model via pose.model_variant config key.
+     * Supported: "yolov8n-pose", "yolo11n-pose".
+     * Falls back to pose.model_path if variant is unrecognised. */
     {
-        const char* m = config_get_string(config, "pose.model_path", NULL);
-        if (!m || m[0] == '\0') {
-            log_critical("pose.model_path not set in config — PRIMARY model is REQUIRED");
+        const char* variant = config_get_string(config, "pose.model_variant", "yolov8n-pose");
+        const char* model_path = NULL;
+
+        if (strcmp(variant, "yolo11n-pose") == 0) {
+            model_path = "models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx";
+        } else if (strcmp(variant, "yolov8n-pose") == 0) {
+            model_path = "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx";
+        } else {
+            /* Legacy: use explicit model_path from config */
+            model_path = config_get_string(config, "pose.model_path", NULL);
+            if (model_path && model_path[0] != '\0') {
+                log_info("Pose: using explicit model_path: %s", model_path);
+            }
+        }
+
+        if (!model_path || model_path[0] == '\0') {
+            log_critical("Pose model not configured — set pose.model_variant "
+                         "('yolov8n-pose' or 'yolo11n-pose') or pose.model_path");
             return -1;
         }
-        strncpy(path_buf, m, sizeof(path_buf) - 1);
+        strncpy(path_buf, model_path, sizeof(path_buf) - 1);
+        path_buf[sizeof(path_buf) - 1] = '\0';  /* ensure null termination */
+
         int w = config_get_int(config, "pose.input_size.0", 640);
         int h = config_get_int(config, "pose.input_size.1", 640);
         float conf = config_get_float(config, "pose.confidence_threshold", 0.08f);
         float iou  = config_get_float(config, "pose.iou_threshold", 0.40f);
         pipeline->pose_estimator = yolov8_pose_estimator_create(path_buf, w, h, conf, iou);
         if (!pipeline->pose_estimator) {
-            log_critical("Failed to load PRIMARY pose model: %s", path_buf);
+            log_critical("Failed to load PRIMARY pose model (variant=%s): %s",
+                         variant, path_buf);
             return -1;
         }
         pipeline->models_loaded[1] = true;
-        log_info("Pose estimator loaded (PRIMARY): %s", path_buf);
+        log_info("Pose estimator loaded (PRIMARY, %s): %s", variant, path_buf);
     }
 
     /* ── Step 3: Face detection ── */
@@ -152,11 +184,13 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         const char* m = config_get_string(config, "face.detection_model_path", NULL);
         if (m && m[0] != '\0') {
             strncpy(path_buf, m, sizeof(path_buf) - 1);
+            path_buf[sizeof(path_buf) - 1] = '\0';
             int w = config_get_int(config, "face.input_size.0", 320);
             int h = config_get_int(config, "face.input_size.1", 320);
             float conf = config_get_float(config, "face.confidence_threshold", 0.5f);
             float iou  = config_get_float(config, "face.iou_threshold", 0.4f);
-            pipeline->face_detector = yolov5_face_detector_create(path_buf, w, h, conf, iou);
+            bool  face_ep = config_get_bool(config, "face.use_ep", false);
+            pipeline->face_detector = yolov5_face_detector_create(path_buf, w, h, conf, iou, face_ep);
             if (pipeline->face_detector) {
                 pipeline->models_loaded[2] = true;
                 log_info("Face detector loaded: %s", path_buf);
@@ -174,6 +208,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         const char* m = config_get_string(config, "face.recognition_model_path", NULL);
         if (m && m[0] != '\0') {
             strncpy(path_buf, m, sizeof(path_buf) - 1);
+            path_buf[sizeof(path_buf) - 1] = '\0';
             pipeline->face_recognizer = arcface_recognizer_create(path_buf, 112, 112, 0.55f);
             if (pipeline->face_recognizer) {
                 pipeline->models_loaded[3] = true;
@@ -192,6 +227,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         const char* m = config_get_string(config, "action.model_path", NULL);
         if (m && m[0] != '\0') {
             strncpy(path_buf, m, sizeof(path_buf) - 1);
+            path_buf[sizeof(path_buf) - 1] = '\0';
             int nf = config_get_int(config, "action.num_frames", 30);
             int nk = config_get_int(config, "action.num_keypoints", 14);
             int np = config_get_int(config, "action.num_persons", 1);
@@ -237,6 +273,44 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
                  pipeline->cascade_secondary_interval,
                  pipeline->cascade_tracking_w, pipeline->cascade_tracking_h);
         log_info("Action: inference_interval=%d frames", pipeline->action_inference_interval);
+    }
+
+    /* ── Frame differencing (adaptive frame skip) ──
+     * Configured from config section "frame_diff" with sensible defaults.
+     * When enabled, near-identical frames skip YOLO inference entirely,
+     * reusing the last result.  This saves ~150ms/frame on K1. */
+    {
+        pipeline->frame_diff_enabled = config_get_bool(config, "frame_diff.enabled", true);
+
+        if (pipeline->frame_diff_enabled) {
+            int fd_grid_w   = config_get_int(config, "frame_diff.grid_w", 8);
+            int fd_grid_h   = config_get_int(config, "frame_diff.grid_h", 8);
+            int fd_stride   = config_get_int(config, "frame_diff.subsample", 4);
+            float fd_cell   = config_get_float(config, "frame_diff.cell_threshold", 8.0f);
+            float fd_change = config_get_float(config, "frame_diff.change_threshold", 0.15f);
+
+            pipeline->frame_diff = frame_diff_create(fd_grid_w, fd_grid_h, fd_stride,
+                                                      fd_cell, fd_change);
+            if (pipeline->frame_diff) {
+                pipeline->frame_diff->adaptive_enabled =
+                    config_get_bool(config, "frame_diff.adaptive_enabled", true);
+                pipeline->frame_diff->max_static_skip =
+                    config_get_int(config, "frame_diff.max_static_skip", 20);
+                pipeline->frame_diff->max_low_motion_skip =
+                    config_get_int(config, "frame_diff.max_low_motion_skip", 5);
+                pipeline->frame_diff->force_process_every =
+                    config_get_int(config, "frame_diff.force_process_every", 30);
+                log_info("FrameDiff: enabled grid=%dx%d stride=%d cell=%.0f change=%.2f",
+                         fd_grid_w, fd_grid_h, fd_stride,
+                         (double)fd_cell, (double)fd_change);
+            } else {
+                log_warning("FrameDiff: creation failed — disabled");
+                pipeline->frame_diff_enabled = false;
+            }
+        } else {
+            log_info("FrameDiff: DISABLED (frame_diff.enabled=false)");
+            pipeline->frame_diff = NULL;
+        }
     }
 
     int loaded = 0;
@@ -338,7 +412,7 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
 
                 /* ── Count visible keypoints in each category ── */
                 int n_upper = 0, n_left = 0, n_right = 0;
-                float kpt_conf = 0.30f;
+                float kpt_conf = 0.08f;  /* INT8 at 320×320 rarely >0.15 */
                 {
                     for (int k = 0; k <= 10 && k < matched_pose->num_keypoints; k++) {
                         if (matched_pose->keypoints[k].confidence >= kpt_conf &&
@@ -722,6 +796,78 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
     int64_t start_time = utils_get_time_ms();
     pipeline->frame_counter++;
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * ── FRAME DIFFERENCING: Adaptive Frame Skip ──
+     *
+     * Before running expensive YOLO inference (~150-400ms on K1), compute a
+     * fast subsampled MAD between the current frame and the last fully-
+     * processed reference frame.  If the scene is static or has only minor
+     * changes, skip inference entirely and reuse the previous result.
+     *
+     * This is the single most impactful optimization for real-world videos:
+     *   - Static scenes (empty room, nobody moving): skip up to 20 frames
+     *   - Low-motion (person standing still): skip up to 5 frames
+     *   - Active (person walking/running): process every frame
+     *
+     * Cost: ~0.2ms for frame diff vs ~150ms for YOLO inference → 750× faster.
+     *
+     * When skipping, we still:
+     *   1. Push the best pose from the last result to ST-GCN (temporal cont.)
+     *   2. Read the latest ST-GCN async result
+     *   3. Keep the reference frame unchanged (drift accumulates naturally)
+     * ═══════════════════════════════════════════════════════════════════════ */
+    if (pipeline->frame_diff_enabled && pipeline->frame_diff && pipeline->has_last_result) {
+        /* Compute fast frame difference */
+        float change_ratio = frame_diff_compute(pipeline->frame_diff, frame_data, width, height);
+
+        if (!frame_diff_should_process(pipeline->frame_diff)) {
+            /* ── SKIP: reuse previous inference result ── */
+            *out_result = pipeline->last_full_result;
+
+            /* Still push best pose to ST-GCN for temporal continuity */
+            if ((pipeline->enabled_stages & PIPELINE_ENABLE_ACTION) &&
+                pipeline->action_recognizer &&
+                out_result->num_poses > 0) {
+                int best_p = 0;
+                float best_conf = out_result->poses[0].confidence;
+                for (int p = 1; p < out_result->num_poses; p++) {
+                    if (out_result->poses[p].confidence > best_conf) {
+                        best_conf = out_result->poses[p].confidence;
+                        best_p = p;
+                    }
+                }
+                stgcn_action_recognizer_push_pose(pipeline->action_recognizer,
+                    &out_result->poses[best_p], width, height);
+
+                /* Read latest async ST-GCN result */
+                ActionResult latest;
+                if (stgcn_action_recognizer_get_latest(pipeline->action_recognizer, &latest)) {
+                    out_result->action = latest;
+                    out_result->has_action = (latest.num_actions > 0);
+                }
+            }
+
+            out_result->processing_time_ms = (float)(utils_get_time_ms() - start_time);
+            frame_diff_mark_skipped(pipeline->frame_diff);
+
+            /* Periodic skip log */
+            if (pipeline->frame_diff->consecutive_skips % 10 == 0 &&
+                pipeline->frame_diff->consecutive_skips > 0) {
+                int proc, skip;
+                float ratio;
+                frame_diff_get_stats(pipeline->frame_diff, &proc, &skip, &ratio);
+                log_debug("FrameDiff: skip #%d (change=%.3f, %s, total skip=%.0f%%)",
+                         pipeline->frame_diff->consecutive_skips,
+                         (double)change_ratio,
+                         frame_diff_activity_name(pipeline->frame_diff->last_activity),
+                         (double)(ratio * 100.0f));
+            }
+
+            return 0;
+        }
+        /* ── PROCESS: full inference needed ── */
+    }
+
     /*
      * ── ADAPTIVE CASCADE STRATEGY (v2 — Multi-Person + Partial-Body Aware) ──
      *
@@ -859,6 +1005,17 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
         }
     }
 
+    /* ── Post-inference: update frame differencing reference ──
+     * Store the current frame as the new reference for future comparisons.
+     * Also cache the full inference result for reuse on skipped frames. */
+    if (pipeline->frame_diff_enabled && pipeline->frame_diff) {
+        frame_diff_set_reference(pipeline->frame_diff, frame_data, width, height);
+        frame_diff_mark_processed(pipeline->frame_diff);
+        /* Cache result for skip reuse */
+        pipeline->last_full_result = *out_result;
+        pipeline->has_last_result = true;
+    }
+
     return 0;
 }
 
@@ -871,5 +1028,11 @@ void inference_pipeline_configure(AIInferencePipeline* pipeline, uint32_t stages
 void inference_pipeline_reset(AIInferencePipeline* pipeline) {
     if (!pipeline) return;
     pipeline->frame_counter = 0;
+    /* Reset frame differencing state (source changed or scene cut) */
+    if (pipeline->frame_diff) {
+        frame_diff_reset(pipeline->frame_diff);
+    }
+    pipeline->has_last_result = false;
+    memset(&pipeline->last_full_result, 0, sizeof(pipeline->last_full_result));
     log_info("AI inference pipeline reset");
 }

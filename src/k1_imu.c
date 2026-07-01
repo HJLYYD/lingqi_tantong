@@ -29,9 +29,20 @@
 #define ITG_REG_PWR_MGMT      0x3E
 #define ITG_REG_GYRO_XH       0x1D
 
-/* ── 缩放因子 ── */
-#define ACCEL_SCALE  ((2.0f * 9.80665f) / 32768.0f)   /* ±2g → m/s² */
-#define GYRO_SCALE   (((float)M_PI / 180.0f) / 14.375f)  /* ITG3205 fixed ±2000dps, 14.375 LSB/°/s */
+/* ── 缩放因子 ──
+ *
+ * ADXL345 DATA_FORMAT=0x08: FULL_RES=1, ±2g range, right-justified.
+ * At ±2g, the sensor outputs 10-bit data right-justified in the 16-bit register:
+ *   bits[9:0] = data, bits[15:10] = sign extension.
+ * Scale: 3.9 mg/LSB (datasheet Table 1) → 4g / 1024 LSB = 0.038307 m/s²/LSB.
+ *
+ * The OLD formula (2g/32768) was WRONG by 64× — data is 10-bit, not 16-bit.
+ */
+#define ACCEL_SCALE  ((4.0f * 9.80665f) / 1024.0f)
+
+/* ITG3205 fixed ±2000°/s range: sensitivity = 14.375 LSB/(°/s).
+ * Convert to rad/s: (°/s) / 14.375 × (π/180) = (π/180) / 14.375 rad/s per LSB. */
+#define GYRO_SCALE   (((float)M_PI / 180.0f) / 14.375f)
 
 /* ═══════════════════════════════════════════════════════════
  *  I2C 底层
@@ -56,12 +67,22 @@ static int i2c_select(int fd, uint8_t addr) {
     return 0;
 }
 
-static int16_t i2c_read_s16_le(int fd, uint8_t reg) {
-    /* ADXL345 / ITG3205: 小端序 16-bit */
+/* BUGFIX: return bool with out-param so callers can distinguish
+ * I2C bus errors (return false) from valid zero readings. */
+static bool i2c_read_s16_be(int fd, uint8_t reg, int16_t* out) {
     uint8_t buf[2];
-    if (write(fd, &reg, 1) != 1) return 0;
-    if (read(fd, buf, 2) != 2)  return 0;
-    return (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+    if (write(fd, &reg, 1) != 1) return false;
+    if (read(fd, buf, 2) != 2)  return false;
+    *out = (int16_t)(((uint16_t)buf[0] << 8) | (uint16_t)buf[1]);
+    return true;
+}
+
+static bool i2c_read_s16_le(int fd, uint8_t reg, int16_t* out) {
+    uint8_t buf[2];
+    if (write(fd, &reg, 1) != 1) return false;
+    if (read(fd, buf, 2) != 2)  return false;
+    *out = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+    return true;
 }
 
 static bool i2c_write_reg(int fd, uint8_t reg, uint8_t val) {
@@ -75,20 +96,75 @@ static bool i2c_write_reg(int fd, uint8_t reg, uint8_t val) {
 
 static bool init_adxl345(int fd) {
     if (i2c_select(fd, K1_IMU_ADXL345_ADDR) < 0) return false;
-    /* ±2g, 10-bit模式 */
-    if (!i2c_write_reg(fd, ADXL_REG_DATA_FORMAT, 0x00)) return false;
-    /* 测量模式 */
+    /* FULL_RES=1, ±2g range, right-justified → stable 3.9 mg/LSB scale.
+     * The OLD setting (0x00 = 10-bit mode) combined with a 16-bit scale
+     * factor caused a 64× under-read of acceleration values. */
+    if (!i2c_write_reg(fd, ADXL_REG_DATA_FORMAT, 0x08)) return false;
+    /* 测量模式 (wakeup=8Hz, sleep=0) */
     if (!i2c_write_reg(fd, ADXL_REG_POWER_CTL, 0x08)) return false;
+    usleep(50000);  /* 50ms for first valid conversion */
     return true;
 }
 
 static bool init_itg3205(int fd) {
-    if (i2c_select(fd, K1_IMU_ITG3205_ADDR) < 0) return false;
-    /* 复位 */
-    if (!i2c_write_reg(fd, ITG_REG_PWR_MGMT, 0x80)) return false;
+    int rc;
+
+    rc = i2c_select(fd, K1_IMU_ITG3205_ADDR);
+    if (rc < 0) {
+        log_error("[K1-IMU] ITG3205 i2c_select(0x%02X) failed: %s",
+                  K1_IMU_ITG3205_ADDR, strerror(errno));
+        return false;
+    }
+
+    /* Verify chip is alive by reading WHO_AM_I (register 0x00 = 0x69) */
+    uint8_t whoami_reg = 0x00;
+    uint8_t whoami_val = 0;
+    if (write(fd, &whoami_reg, 1) != 1 || read(fd, &whoami_val, 1) != 1) {
+        log_error("[K1-IMU] ITG3205 WHO_AM_I read failed — chip not responding at 0x%02X: %s",
+                  K1_IMU_ITG3205_ADDR, strerror(errno));
+        return false;
+    }
+    if (whoami_val != 0x69) {
+        log_warning("[K1-IMU] ITG3205 unexpected WHO_AM_I=0x%02X (expected 0x69) — continuing anyway",
+                    whoami_val);
+    }
+
+    /* 复位设备 */
+    if (!i2c_write_reg(fd, ITG_REG_PWR_MGMT, 0x80)) {
+        log_error("[K1-IMU] ITG3205 reset (PWR_MGMT=0x80) write failed");
+        return false;
+    }
     usleep(100000);  /* 100ms 复位等待 */
-    /* DLPF_CFG=3(42Hz) + internal OSC, ±2000dps */
-    if (!i2c_write_reg(fd, ITG_REG_DLPF_FS, 0x1B)) return false;
+
+    /* DLPF_CFG=3(42Hz low-pass) + FS_SEL=3(±2000dps) */
+    if (!i2c_write_reg(fd, ITG_REG_DLPF_FS, 0x1B)) {
+        log_error("[K1-IMU] ITG3205 DLPF_FS=0x1B write failed");
+        return false;
+    }
+
+    /* CRITICAL: CLK_SEL=1 (PLL with X gyro reference).
+     * After reset, CLK_SEL=0 (internal oscillator) which is unstable
+     * and causes massive gyro drift (>700°/s bias observed).
+     * PLL locks to the X-axis gyro MEMS element for a stable clock.
+     * Bits: CLK_SEL=001, SLEEP=0, STBY=0 → 0x01 */
+    if (!i2c_write_reg(fd, ITG_REG_PWR_MGMT, 0x01)) {
+        log_error("[K1-IMU] ITG3205 PWR_MGMT=0x01 (PLL enable) write failed");
+        return false;
+    }
+    usleep(50000);  /* 50ms for PLL lock */
+
+    /* Read back PWR_MGMT to verify PLL locked */
+    uint8_t pm_reg = ITG_REG_PWR_MGMT;
+    uint8_t pm_val = 0;
+    if (write(fd, &pm_reg, 1) == 1 && read(fd, &pm_val, 1) == 1) {
+        if (pm_val != 0x01) {
+            log_warning("[K1-IMU] ITG3205 PWR_MGMT readback=0x%02X (expected 0x01) — PLL may not be locked",
+                        pm_val);
+        }
+    }
+
+    log_info("[K1-IMU] ITG3205 initialized (WHO_AM_I=0x%02X, PWR_MGMT=0x%02X)",
+             whoami_val, pm_val);
     return true;
 }
 
@@ -99,9 +175,13 @@ static bool init_itg3205(int fd) {
 static bool read_adxl345(int fd, float* ax, float* ay, float* az) {
     if (i2c_select(fd, K1_IMU_ADXL345_ADDR) < 0) return false;
 
-    int16_t rx = i2c_read_s16_le(fd, ADXL_REG_DATAX0);
-    int16_t ry = i2c_read_s16_le(fd, ADXL_REG_DATAX0 + 2);
-    int16_t rz = i2c_read_s16_le(fd, ADXL_REG_DATAX0 + 4);
+    int16_t rx, ry, rz;
+    if (!i2c_read_s16_le(fd, ADXL_REG_DATAX0, &rx) ||
+        !i2c_read_s16_le(fd, ADXL_REG_DATAX0 + 2, &ry) ||
+        !i2c_read_s16_le(fd, ADXL_REG_DATAX0 + 4, &rz)) {
+        log_error("[K1-IMU] ADXL345 I2C read failed");
+        return false;
+    }
 
     *ax = rx * ACCEL_SCALE;
     *ay = ry * ACCEL_SCALE;
@@ -112,9 +192,13 @@ static bool read_adxl345(int fd, float* ax, float* ay, float* az) {
 static bool read_itg3205(int fd, float* gx, float* gy, float* gz) {
     if (i2c_select(fd, K1_IMU_ITG3205_ADDR) < 0) return false;
 
-    int16_t rx = i2c_read_s16_le(fd, ITG_REG_GYRO_XH);
-    int16_t ry = i2c_read_s16_le(fd, ITG_REG_GYRO_XH + 2);
-    int16_t rz = i2c_read_s16_le(fd, ITG_REG_GYRO_XH + 4);
+    int16_t rx, ry, rz;
+    if (!i2c_read_s16_be(fd, ITG_REG_GYRO_XH, &rx) ||
+        !i2c_read_s16_be(fd, ITG_REG_GYRO_XH + 2, &ry) ||
+        !i2c_read_s16_be(fd, ITG_REG_GYRO_XH + 4, &rz)) {
+        log_error("[K1-IMU] ITG3205 I2C read failed");
+        return false;
+    }
 
     *gx = rx * GYRO_SCALE;
     *gy = ry * GYRO_SCALE;

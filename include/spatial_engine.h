@@ -7,10 +7,10 @@
 extern "C" {
 #endif
 
-#define SPATIAL_MAX_TRAJECTORY      300
+#define SPATIAL_MAX_TRAJECTORY      120
 #define SPATIAL_MIN_DEPTH           0.3f
 #define SPATIAL_MAX_DEPTH           120.0f
-#define SPATIAL_MAX_PERSONS         256
+#define SPATIAL_MAX_PERSONS         64
 
 /* ── Anatomical body ratios (from anthropometric research) ── */
 #define ANTHRO_HEAD_TO_HEIGHT       0.130f   /* head top to chin ≈ 13% of total height */
@@ -19,6 +19,7 @@ extern "C" {
 #define ANTHRO_KNEE_TO_HEIGHT       0.285f   /* knee to floor */
 #define ANTHRO_ANKLE_TO_HEIGHT      0.039f   /* ankle to floor */
 #define ANTHRO_SHOULDER_WIDTH_RATIO 0.259f   /* shoulder width / height */
+#define ANTHRO_NOSE_TO_ANKLE_RATIO  0.900f   /* nose≈93.9% ankle≈3.9% → vertical span ≈90% of height */
 
 /* ── Depth estimation tuning ── */
 #define DEPTH_EMA_ALPHA             0.30f   /* exponential moving average for depth smoothing */
@@ -102,6 +103,15 @@ void spatial_engine_clear_trajectories(SpatialLocalizationEngine* engine);
 int  spatial_engine_get_active_tracks(const SpatialLocalizationEngine* engine, int* out_ids, int max_count);
 
 void spatial_engine_set_camera_pose(SpatialLocalizationEngine* engine, float pitch, float roll, float yaw);
+
+/*
+ * 重置世界坐标原点.
+ * 传入 NULL 则清除 initialized 标志, 下次检测时懒重新初始化.
+ * 传入非 NULL 的 new_origin 则直接设置原点.
+ * 同时清除所有轨迹和深度 EMA 缓存.
+ */
+void spatial_engine_reset_origin(SpatialLocalizationEngine* engine,
+                                  const SpatialPosition* new_origin);
 
 #ifdef __cplusplus
 }

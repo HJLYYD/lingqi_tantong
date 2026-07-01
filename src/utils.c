@@ -19,9 +19,6 @@
 #include <turbojpeg.h>
 #endif
 
-#ifdef HAS_K1_JPU_LIB
-#include "k1_jpu.h"
-#endif
 
 #ifdef HAS_RVV_OPT
 #if defined(__GNUC__) && !defined(__clang__)
@@ -342,10 +339,42 @@ void utils_matrix_multiply_abt(const float a[7][7], const float b[7][7], float o
     }
 }
 
+/**
+ * Compute out = F * P * F^T  — correct Kalman covariance propagation.
+ *
+ * 方差传播规则: 若 x ~ N(μ, P)，则 Fx ~ N(Fμ, FPF^T)
+ * 参考: Kalman (1960), Bar-Shalom et al. (2001)
+ *
+ * @param F  State transition matrix [7][7]
+ * @param P  Current covariance matrix [7][7] (must be symmetric)
+ * @param out Result matrix [7][7] = F * P * F^T
+ */
+void utils_matrix_multiply_fpfT(const float f[7][7], const float p[7][7], float out[7][7]) {
+    float temp[7][7] = {{0}};
+    /* temp = F * P */
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                temp[i][j] += f[i][k] * p[k][j];
+            }
+        }
+    }
+    /* out = temp * F^T  (F^T[k][j] = F[j][k]) */
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            out[i][j] = 0.0f;
+            for (int k = 0; k < 7; k++) {
+                out[i][j] += temp[i][k] * f[j][k];  /* f[j][k] = F^T[k][j] */
+            }
+        }
+    }
+}
+
 float utils_median_float(float* arr, int len) {
-    if (len <= 0) return 0.0f;
+    if (len <= 0 || !arr) return 0.0f;
     float* copy = (float*)malloc(len * sizeof(float));
-    memcpy(copy, arr, len * sizeof(float));
+    if (!copy) return arr[len / 2];  /* fallback: return midpoint of original */
+    memcpy(copy, arr, len * sizeof(float));  /* BUGFIX: was sorting uninitialized memory */
     qsort(copy, len, sizeof(float), compare_float_desc);
     float median = (len % 2 == 0) ? (copy[len/2 - 1] + copy[len/2]) * 0.5f : copy[len/2];
     free(copy);
@@ -384,24 +413,6 @@ int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
                     jpeg_len > 1 ? jpeg_data[1] : 0);
         return -2;
     }
-
-    /*
-     * K1 JPU hardware decode (优先): 释放 CPU 给推理任务。
-     * 需要 k1x-jpu SDK (cmake -DK1_JPU_DIR=/path/to/k1x-jpu)。
-     * 失败时静默回退到 libjpeg-turbo 软解码。
-     */
-#ifdef HAS_K1_JPU_LIB
-    if (k1_jpu_is_available()) {
-        int jpu_ret = k1_jpu_decode_to_rgb(jpeg_data, jpeg_len, rgb_out, out_w, out_h);
-        if (jpu_ret == 0) return 0;  /* JPU 硬解码成功 */
-        /* JPU 失败 → 回退到 libjpeg-turbo 软解码 */
-        static int jpu_fallback_count = 0;
-        if (++jpu_fallback_count <= 3 || jpu_fallback_count % 50 == 0) {
-            log_warning("JPU decode failed (ret=%d), falling back to software (%d fallbacks)",
-                      jpu_ret, jpu_fallback_count);
-        }
-    }
-#endif
 
 #ifdef HAS_LIBJPEG_TURBO
     tjhandle handle = tjInitDecompress();

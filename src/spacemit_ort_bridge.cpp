@@ -3,6 +3,9 @@
 #ifdef HAS_SPACEMIT_EP
 #include <onnxruntime_cxx_api.h>
 #include "spacemit_ort_env.h"
+extern "C" {
+#include "terminal_ui.h"
+}
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -39,14 +42,14 @@
 static std::atomic<bool> g_terminate_installed{false};
 
 static void spacemit_terminate_handler() noexcept {
-    std::fputs("=== spacemit_ort_bridge: std::terminate called ===\n", stderr);
+    tui_fail("SpacemiT EP: std::terminate called (worker thread crash)");
     try {
         std::exception_ptr ep = std::current_exception();
         if (ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "  uncaught std::exception: %s\n", e.what() ? e.what() : "(null)");
+                tui_fail("SpacemiT EP: uncaught exception: %s", e.what() ? e.what() : "(null)");
             } catch (...) {
                 std::fputs("  uncaught non-std::exception\n", stderr);
             }
@@ -100,40 +103,38 @@ extern "C" int spacemit_ort_check_tcm_available(void) {
  *   4. Previous EP session not fully released (TCM leak in driver)
  */
 extern "C" void spacemit_ort_dump_tcm_diagnostics(const char* model_path) {
-    std::fprintf(stderr, "── TCM Diagnostic for %s ──\n",
-                 model_path ? model_path : "(unknown)");
+    tui_diag("tcm", "Diagnostic for %s", model_path ? model_path : "(unknown)");
 
     /* 1. Device node */
     if (access("/dev/tcm", F_OK) == 0) {
-        std::fprintf(stderr, "  /dev/tcm: EXISTS\n");
+        tui_diag("tcm", "/dev/tcm: EXISTS");
         if (access("/dev/tcm", R_OK | W_OK) == 0) {
-            std::fprintf(stderr, "  /dev/tcm: readable & writable\n");
+            tui_diag("tcm", "/dev/tcm: readable & writable");
         } else {
-            std::fprintf(stderr, "  /dev/tcm: PERMISSION DENIED (try: sudo chmod 666 /dev/tcm)\n");
+            tui_diag("tcm", "/dev/tcm: PERMISSION DENIED (try: sudo chmod 666 /dev/tcm)");
         }
     } else {
-        std::fprintf(stderr, "  /dev/tcm: MISSING (TCM driver not loaded?)\n");
+        tui_diag("tcm", "/dev/tcm: MISSING (TCM driver not loaded?)");
     }
 
     /* 2. Check for TCM holder processes via /proc */
-    std::fprintf(stderr, "  Checking /proc for TCM holders...\n");
-    /* Try opening /dev/tcm to test if another process holds it exclusively */
+    tui_diag("tcm", "Checking /proc for TCM holders...");
     int tcm_fd = open("/dev/tcm", O_RDONLY | O_NONBLOCK);
     if (tcm_fd >= 0) {
-        std::fprintf(stderr, "  /dev/tcm: open() succeeded (fd=%d) — not locked\n", tcm_fd);
+        tui_diag("tcm", "/dev/tcm: open() succeeded (fd=%d) — not locked", tcm_fd);
         close(tcm_fd);
     } else {
-        std::fprintf(stderr, "  /dev/tcm: open() failed (errno=%d: %s) — may be held exclusively\n",
-                     errno, strerror(errno));
+        tui_diag("tcm", "/dev/tcm: open() failed (errno=%d: %s) — may be held exclusively",
+                 errno, strerror(errno));
     }
 
     /* 3. Kernel log hints */
-    std::fprintf(stderr, "  To check kernel TCM state, run on board:\n");
-    std::fprintf(stderr, "    sudo dmesg | grep -i tcm | tail -20\n");
-    std::fprintf(stderr, "    sudo fuser /dev/tcm\n");
-    std::fprintf(stderr, "    ls -la /dev/tcm\n");
-    std::fprintf(stderr, "    cat /sys/kernel/debug/tcm/stats 2>/dev/null || echo 'debugfs not mounted'\n");
-    std::fprintf(stderr, "── End TCM Diagnostic ──\n");
+    tui_muted("To check kernel TCM state, run on board:");
+    tui_muted("  sudo dmesg | grep -i tcm | tail -20");
+    tui_muted("  sudo fuser /dev/tcm");
+    tui_muted("  ls -la /dev/tcm");
+    tui_muted("  cat /sys/kernel/debug/tcm/stats 2>/dev/null || echo 'debugfs not mounted'");
+    tui_diag("tcm", "Diagnostic complete");
     std::fflush(stderr);
 }
 
@@ -156,18 +157,18 @@ extern "C" int spacemit_ort_probe_ep_ex(
     if (child_stderr_out && child_stderr_size > 0) child_stderr_out[0] = '\0';
 
     if (spacemit_ort_check_tcm_available() != 1) {
-        std::fprintf(stderr, "SpacemiT EP probe: /dev/tcm not found, EP unavailable\n");
+        tui_diag("ep", "/dev/tcm not found, EP unavailable");
         return 1;
     }
 
     if (model_path && model_path[0]) {
         if (spacemit_ort_check_model_accessible(model_path) != 0) {
-            std::fprintf(stderr, "SpacemiT EP probe: model not accessible: %s\n", model_path);
+            tui_diag("ep", "model not accessible: %s", model_path);
             return 1;
         }
         char chk_err[512] = {0};
         if (spacemit_ort_check_model_supported(model_path, chk_err, sizeof(chk_err)) != 0) {
-            std::fprintf(stderr, "SpacemiT EP probe: model not quantized: %s\n", chk_err);
+            tui_diag("ep", "model not quantized: %s", chk_err);
             return 1;
         }
     }
@@ -176,17 +177,17 @@ extern "C" int spacemit_ort_probe_ep_ex(
 
     int err_pipe[2];
     if (pipe(err_pipe) != 0) {
-        std::fprintf(stderr, "SpacemiT EP probe: pipe() failed\n");
+        tui_diag("ep", "pipe() failed for probe");
         return 1;
     }
 
-    std::fprintf(stderr, "SpacemiT EP probe: forking child for %s...\n",
-                 model_path ? model_path : "init-check");
+    tui_diag("ep", "forking child to probe %s...",
+             model_path ? model_path : "init-check");
 
     pid_t pid = fork();
     if (pid < 0) {
         close(err_pipe[0]); close(err_pipe[1]);
-        std::fprintf(stderr, "SpacemiT EP probe: fork() failed\n");
+        tui_diag("ep", "fork() failed");
         return 1;
     }
 
@@ -367,7 +368,7 @@ extern "C" int spacemit_ort_probe_ep_ex(
         pid_t ret = waitpid(pid, &wstatus, WNOHANG);
         if (ret > 0) { child_done = true; break; }
         if (ret < 0) {
-            std::fprintf(stderr, "SpacemiT EP probe: waitpid error (errno=%d)\n", errno);
+            tui_diag("ep", "waitpid error (errno=%d)", errno);
             close(err_pipe[0]);
             return 1;
         }
@@ -376,7 +377,7 @@ extern "C" int spacemit_ort_probe_ep_ex(
     }
 
     if (!child_done) {
-        std::fprintf(stderr, "SpacemiT EP probe: child timed out after %d ms, killing\n", PROBE_TIMEOUT_MS);
+        tui_diag("ep", "child timed out after %d ms, killing", PROBE_TIMEOUT_MS);
         kill(pid, SIGKILL);
         waitpid(pid, &wstatus, 0);
         close(err_pipe[0]);
@@ -405,8 +406,8 @@ extern "C" int spacemit_ort_probe_ep_ex(
     close(err_pipe[0]);
 
     if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) {
-        std::fprintf(stderr, "SpacemiT EP probe: SUCCESS — EP functional for %s\n",
-                     model_path ? model_path : "init-check");
+        tui_ok("SpacemiT EP probe: EP functional for %s",
+               model_path ? model_path : "init-check");
         /* Let kernel fully release child's /dev/tcm mmap */
         usleep(300000);
         return 0;
@@ -414,10 +415,10 @@ extern "C" int spacemit_ort_probe_ep_ex(
 
     int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
     int sig = WIFSIGNALED(wstatus) ? WTERMSIG(wstatus) : 0;
-    std::fprintf(stderr, "SpacemiT EP probe: FAILED (exit=%d, sig=%d) for %s\n",
-                 exit_code, sig, model_path ? model_path : "init-check");
+    tui_fail("SpacemiT EP probe: FAILED (exit=%d, sig=%d) for %s",
+             exit_code, sig, model_path ? model_path : "init-check");
     if (child_stderr_out && child_stderr_out[0]) {
-        std::fprintf(stderr, "SpacemiT EP probe: child stderr: %s\n", child_stderr_out);
+        tui_muted("EP probe child stderr: %s", child_stderr_out);
     }
     return 1;
 }

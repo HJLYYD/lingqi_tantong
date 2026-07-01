@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 #define STGCN_MAX_FRAMES        300
-#define STGCN_NUM_KEYPOINTS     17
+#define STGCN_NUM_KEYPOINTS     25   /* NTU-RGB+D standard (25 joints); COCO-17 is remapped on push */
 #define STGCN_MAX_PERSONS       2
 #define STGCN_NUM_CHANNELS      3
 #define STGCN_MAX_CLASSES       60   /* max known class labels; actual model output auto-detected at load time */

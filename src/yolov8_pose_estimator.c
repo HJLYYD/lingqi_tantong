@@ -374,10 +374,14 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
             return 0;
         }
         int num_temp = 0;
+        if (num_pose_groups > 3) num_pose_groups = 3;  /* safety cap: groups array is [3][3] */
 
         for (int g = 0; g < num_pose_groups; g++) {
             int reg_idx = pose_split_groups[g][0];
             int kpt_idx = pose_split_groups[g][2];
+            /* Guard: skip if group wasn't filled or index is out of bounds */
+            if (reg_idx < 0 || reg_idx >= (int)num_outputs) continue;
+            if (kpt_idx < 0 || kpt_idx >= (int)num_outputs) continue;
 
             float* reg_data = NULL;
             OrtStatus* st_r = ort->GetTensorMutableData(all_output_vals[reg_idx], (void**)&reg_data);
@@ -490,8 +494,6 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
                             pose->keypoints[k].y = -1.0f;
                             pose->keypoints[k].confidence = 0.0f;
                         }
-                        strncpy(pose->keypoints[k].name, COCO_KEYPOINT_NAMES[k], MAX_STRING_LEN - 1);
-                        pose->keypoints[k].name[MAX_STRING_LEN - 1] = '\0';
                     }
                     pose->num_keypoints = num_kpt;
                     out_contrib++;
@@ -772,8 +774,6 @@ int yolov8_pose_estimator_estimate(YOLOv8PoseEstimator* est, const uint8_t* imag
                 pose->keypoints[k].y = -1.0f;
                 pose->keypoints[k].confidence = 0.0f;
             }
-            strncpy(pose->keypoints[k].name, COCO_KEYPOINT_NAMES[k], MAX_STRING_LEN - 1);
-            pose->keypoints[k].name[MAX_STRING_LEN - 1] = '\0';
         }
         pose->num_keypoints = YOLOV8_POSE_NUM_KEYPOINTS;
     }

@@ -113,88 +113,159 @@ struct CoapReceiver {
  *  WiFi 自动连接 (nmcli)
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * WiFi auto-connect with TIMEOUT guards.
+ *
+ * Design:
+ *   - CoAP/UDP only needs IP connectivity to ESP32 — no special WiFi setup required.
+ *   - All system() calls are TIME-BOUND (timeout wrapper) so the realtime pipeline
+ *     never blocks indefinitely during init.
+ *   - Pre-connection is strongly recommended: connect before running lingqi_tantong.
+ *
+ * Detection order (fastest → slowest):
+ *   1. iw dev $iface info | grep 'ssid <name>'   — kernel-level, no nmcli, ~1ms
+ *   2. nmcli -t -f ACTIVE,SSID dev wifi           — WiFi scan cache, ~100ms
+ *   3. nmcli -t -f NAME connection show --active  — connection profiles, ~100ms
+ *
+ * Connection:
+ *   4. nmcli dev wifi connect <ssid>              — with timeout, ~2-15s
+ */
+
+/* ── Shell-safe quoting for SSID ──
+ * Replaces single-quotes in the SSID with the sequence: '\'' (end quote,
+ * escaped literal quote, resume quote) so the value is safe inside
+ * single-quoted shell strings. */
+static void shell_quote_ssid(const char* ssid, char* out, size_t out_sz) {
+    size_t j = 0;
+    for (size_t i = 0; ssid[i] && j + 4 < out_sz; i++) {
+        if (ssid[i] == '\'') {
+            if (j + 4 >= out_sz) break;
+            out[j++] = '\''; out[j++] = '\\'; out[j++] = '\''; out[j++] = '\'';
+        } else {
+            out[j++] = ssid[i];
+        }
+    }
+    out[j] = '\0';
+}
+
+#define WIFI_CMD_TIMEOUT_S  15
+
 static bool wifi_connect(const char* ssid, const char* password) {
     if (!ssid || ssid[0] == '\0') {
         log_info("[CoapRX] No WiFi SSID given, assuming user pre-connected");
         return true;
     }
 
-    /* ── Check if already connected to target SSID ──
-     * Try multiple methods, from fastest to slowest:
-     *   1. iwgetid -r  (returns raw SSID of current connection, sub-ms)
-     *   2. nmcli dev wifi list (available networks + active status)
-     *   3. nmcli connection show --active (active connection profiles) */
+    /* Shell-safe copy of SSID */
+    char safe_ssid[128];
+    shell_quote_ssid(ssid, safe_ssid, sizeof(safe_ssid));
+
     bool already_connected = false;
 
-    /* Method 1: iwgetid — direct kernel query, no nmcli overhead */
+    /* ── Method 1: iw dev (kernel-level, no nmcli dependency, ~1ms) ── */
     {
-        char check[256];
+        char check[512];
         snprintf(check, sizeof(check),
-            "iwgetid -r 2>/dev/null | grep -qxF '%s'", ssid);
+            "for iface in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do "
+            "iw dev \"$iface\" info 2>/dev/null | grep -q 'ssid %s' && exit 0; "
+            "done; exit 1", safe_ssid);
         if (system(check) == 0) {
             already_connected = true;
+            log_info("[CoapRX] WiFi check (iw dev): already on '%s'", ssid);
         }
     }
 
-    /* Method 2: nmcli WiFi scan (cached, fast) */
+    /* ── Method 2: nmcli WiFi scan cache (SSID match, not connection name) ── */
     if (!already_connected) {
         char check[256];
         snprintf(check, sizeof(check),
-            "nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep -q '^yes:%s$'", ssid);
+            "timeout 3 nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | grep -q '^yes:%s$'",
+            safe_ssid);
         if (system(check) == 0) {
             already_connected = true;
+            log_info("[CoapRX] WiFi check (nmcli scan): already on '%s'", ssid);
         }
     }
 
-    /* Method 3: nmcli active connections */
+    /* ── Method 3: nmcli connection profiles (fallback — profile name may ≠ SSID) ── */
     if (!already_connected) {
         char check[256];
         snprintf(check, sizeof(check),
-            "nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF '%s'", ssid);
+            "timeout 3 nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF '%s'",
+            safe_ssid);
         if (system(check) == 0) {
             already_connected = true;
+            log_info("[CoapRX] WiFi check (nmcli profile): already on '%s'", ssid);
         }
     }
 
     if (already_connected) {
-        log_info("[CoapRX] Already connected to WiFi: %s (skipping reconnect)", ssid);
+        log_info("[CoapRX] WiFi already connected to '%s' — skipping connect", ssid);
         return true;
     }
 
-    log_info("[CoapRX] Connecting to WiFi: %s ...", ssid);
+    /* ── Method 4: Connect (with timeout guard) ── */
+    log_info("[CoapRX] Connecting to WiFi '%s' (timeout=%ds)...",
+             ssid, WIFI_CMD_TIMEOUT_S);
+
     char cmd[512];
     if (password && password[0] != '\0') {
+        /* nmcli handles password securely internally; the shell only sees the
+         * password as a quoted argument.  Use single quotes around both. */
+        char safe_pw[128];
+        shell_quote_ssid(password, safe_pw, sizeof(safe_pw));
         snprintf(cmd, sizeof(cmd),
-            "nmcli dev wifi connect \"%s\" password \"%s\" 2>&1", ssid, password);
+            "timeout %d nmcli dev wifi connect '%s' password '%s' 2>&1",
+            WIFI_CMD_TIMEOUT_S, safe_ssid, safe_pw);
     } else {
         snprintf(cmd, sizeof(cmd),
-            "nmcli dev wifi connect \"%s\" 2>&1", ssid);
+            "timeout %d nmcli dev wifi connect '%s' 2>&1",
+            WIFI_CMD_TIMEOUT_S, safe_ssid);
     }
+
     int rc = system(cmd);
-    if (rc != 0) {
-        /* nmcli may need root; try with sudo as fallback */
+    if (rc == 124) {
+        /* timeout(1) exit code 124 = killed by SIGTERM after timeout */
+        log_warning("[CoapRX] WiFi connect to '%s' timed out after %ds — "
+                    "nmcli/D-Bus may be hung. UDP will still be attempted. "
+                    "Tip: pre-connect before running lingqi_tantong.",
+                    ssid, WIFI_CMD_TIMEOUT_S);
+    } else if (rc == 127) {
+        /* shell returns 127 = command not found */
+        log_warning("[CoapRX] 'nmcli' not found — WiFi connection skipped. "
+                    "UDP packets to %s will be sent on existing interface. "
+                    "Install: sudo apt install network-manager",
+                    ssid);
+    } else if (rc != 0) {
+        /* nmcli failed — try sudo */
         if (password && password[0] != '\0') {
+            char safe_pw[128];
+            shell_quote_ssid(password, safe_pw, sizeof(safe_pw));
             snprintf(cmd, sizeof(cmd),
-                "sudo nmcli dev wifi connect \"%s\" password \"%s\" 2>&1", ssid, password);
+                "timeout %d sudo nmcli dev wifi connect '%s' password '%s' 2>&1",
+                WIFI_CMD_TIMEOUT_S, safe_ssid, safe_pw);
         } else {
             snprintf(cmd, sizeof(cmd),
-                "sudo nmcli dev wifi connect \"%s\" 2>&1", ssid);
+                "timeout %d sudo nmcli dev wifi connect '%s' 2>&1",
+                WIFI_CMD_TIMEOUT_S, safe_ssid);
         }
         int rc2 = system(cmd);
-        if (rc2 != 0) {
-            log_warning("[CoapRX] nmcli wifi connect failed (rc=%d, sudo rc=%d, SSID=%s) — "
-                        "UDP packets may not reach ESP32. "
-                        "Tip: pre-connect with 'sudo nmcli dev wifi connect \"%s\"' before running.",
-                        rc, rc2, ssid, ssid);
+        if (rc2 == 124) {
+            log_warning("[CoapRX] WiFi sudo connect timed out after %ds", WIFI_CMD_TIMEOUT_S);
+        } else if (rc2 != 0) {
+            log_warning("[CoapRX] WiFi connect failed (rc=%d, sudo rc=%d) for '%s'. "
+                        "UDP may not reach ESP32. Pre-connect manually.",
+                        rc, rc2, ssid);
         } else {
-            log_info("[CoapRX] WiFi connected to %s (via sudo)", ssid);
+            log_info("[CoapRX] WiFi connected to '%s' (via sudo)", ssid);
         }
     } else {
-        log_info("[CoapRX] WiFi connected to %s", ssid);
+        log_info("[CoapRX] WiFi connected to '%s'", ssid);
     }
-    usleep(500000);
+
     return true;
 }
+#undef WIFI_CMD_TIMEOUT_S
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  UDP socket 工具
@@ -316,7 +387,8 @@ static int build_coap_get(const char* path, uint16_t msg_id,
 
     /* CoAP 头: Ver(2bit)=1, Type(2bit)=CON(0), TKL(4bit)=4 */
     int pos = 0;
-    if (pos + 4 > out_max) return 0;
+    /* BUGFIX: check for header(4) + token(TKL=4) = 8 bytes total */
+    if (pos + 4 + 4 > out_max) return 0;
     out[pos++] = (1 << 6) | (COAP_TYPE_CON << 4) | 4;  /* TKL=4 */
     out[pos++] = COAP_CODE_GET;
     write_u16_be(out + pos, msg_id);
@@ -979,14 +1051,26 @@ CoapReceiver* coap_receiver_create(const char* esp_ip, int esp_port,
 
 void coap_receiver_destroy(CoapReceiver* r) {
     if (!r) return;
+    log_info("[CoapRX] Destroy: signaling reader thread to stop");
+    log_flush();
     r->running = false;
     r->shutdown = true;
+    log_info("[CoapRX] Destroy: joining reader thread");
+    log_flush();
     pthread_join(r->reader_thread, NULL);
+    log_info("[CoapRX] Destroy: reader thread joined, closing socket");
+    log_flush();
     udp_close(&r->sock_fd);
+    log_info("[CoapRX] Destroy: freeing assembly buffer");
+    log_flush();
     assembly_destroy(&r->assembly);
+    log_info("[CoapRX] Destroy: freeing jpeg buffer");
+    log_flush();
     free(r->jpeg_buf);
     pthread_mutex_destroy(&r->mutex);
     free(r);
+    log_info("[CoapRX] Destroy: complete");
+    log_flush();
 }
 
 void coap_receiver_update(CoapReceiver* r) {

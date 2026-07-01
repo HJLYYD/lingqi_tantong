@@ -29,14 +29,13 @@ option(USE_OPENMP "Enable OpenMP parallel processing" ON)
 option(ENABLE_K1_PIPELINE "Enable K1 dual-cluster pipeline parallelism" ON)
 option(ENABLE_K1_TCM "Enable K1 TCM (Tightly Coupled Memory) for AI weights" ON)
 option(ENABLE_K1_VPU "Enable K1 VPU hardware video/JPEG acceleration" ON)
-option(ENABLE_K1_JPU "Enable K1 JPU hardware JPEG decode" ON)
-option(ENABLE_SDL2_DISPLAY "Enable SDL2 desktop window display (auto if available)" ON)
+
+
 
 set(MUSE_PI_ARCH "rv64gcv0p7" CACHE STRING "Target RISC-V arch: rv64gcv0p7 (K1) or rv64gcv1p0")
 set(BIANBU_SYSROOT "" CACHE PATH "Bianbu OS sysroot path (for cross-compilation)")
 set(ONNX_RUNTIME_DIR "" CACHE PATH "Path to ONNX Runtime installation directory")
 set(K1_MPP_DIR "" CACHE PATH "Path to K1 MPP (Media Process Platform) SDK")
-set(K1_JPU_DIR "" CACHE PATH "Path to K1 JPU hardware JPEG decode library")
 
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64" OR CMAKE_C_COMPILER MATCHES "riscv64")
     set(BUILDING_FOR_RISCV64 TRUE)
@@ -104,10 +103,10 @@ if(BUILDING_FOR_RISCV64)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang")
         find_program(LLD_EXECUTABLE NAMES ld.lld-20 ld.lld-19 ld.lld-18 ld.lld-17 ld.lld)
         if(LLD_EXECUTABLE)
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${LLD_EXECUTABLE} -Wl,--allow-shlib-undefined -Wl,--export-dynamic")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${LLD_EXECUTABLE}")
             message(STATUS "K1 linker: ${LLD_EXECUTABLE}")
         else()
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -Wl,--allow-shlib-undefined -Wl,--export-dynamic")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
         endif()
     endif()
 
@@ -205,9 +204,6 @@ if(BUILDING_FOR_RISCV64)
         if(ENABLE_K1_VPU)
             message(STATUS "K1 VPU hardware acceleration enabled")
         endif()
-        if(ENABLE_K1_JPU)
-            message(STATUS "K1 JPU hardware JPEG decode enabled")
-        endif()
     endif()
 
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${RISCV_ARCH_FLAGS} ${RISCV_COMMON_FLAGS}")
@@ -287,20 +283,27 @@ endif()
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/lib/mongoose
 )
 
 set(CORE_SOURCES
     src/logger.c
+    src/json_writer.c
     src/utils.c
+    src/pipeline_state.c
+    src/terminal_ui.c
     src/config_manager.c
     src/ort_common.c
     src/ort_inference_context.c
     src/core_types.c
     src/k1_platform.c
     src/k1_imu.c
-    src/k1_jpu.c
+    src/k1_odometry.c
     src/yolo_postprocess.c
     src/keypoint_validator.c
+    src/frame_diff.c
+    src/web_server.c
+    lib/mongoose/mongoose.c
 )
 
 set(DATA_SOURCES
@@ -321,14 +324,12 @@ set(BUSINESS_SOURCES
     src/inference_pipeline.c
     src/tracking_manager.c
     src/spatial_engine.c
+    src/world_coord.c
     src/result_manager.c
 )
 
-set(PRESENTATION_SOURCES
-    src/visualizer.c
-    src/ar_renderer.c
+set(OUTPUT_SOURCES
     src/video_writer.c
-    src/display_output.c
 )
 
 set(UTILS_SOURCES
@@ -344,7 +345,7 @@ set(ALL_LIB_SOURCES
     ${DATA_SOURCES}
     ${MODEL_SOURCES}
     ${BUSINESS_SOURCES}
-    ${PRESENTATION_SOURCES}
+    ${OUTPUT_SOURCES}
     ${UTILS_SOURCES}
 )
 
@@ -530,7 +531,10 @@ if(USE_ONNX_RUNTIME)
         target_sources(lingqi_tantong_core PRIVATE src/spacemit_ort_bridge.cpp)
         target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SPACEMIT_EP)
         target_link_libraries(lingqi_tantong_core PRIVATE stdc++)
-        list(APPEND ALL_LIB_CXX_SOURCES src/spacemit_ort_bridge.cpp)
+        # NOTE: target_sources() above already adds the .cpp to the library.
+        # ALL_LIB_CXX_SOURCES is NOT updated here because the library was
+        # already created at this point (see add_library above).
+        # The conditional stdc++ link is handled by line 533 above.
         message(STATUS "SpacemiT EP: YES (${SPACEMIT_ORT_ENV_H})")
     else()
         if(BUILDING_FOR_RISCV64)
@@ -608,66 +612,9 @@ if(BUILDING_FOR_RISCV64 AND DETECTED_RISCV_ARCH STREQUAL "rv64gcv1p0")
         endif()
     endif()
 
-    # ── JPU auto-detection ──
-    if(ENABLE_K1_JPU)
-        if(K1_JPU_DIR)
-            # NOTE: Do NOT link libjpu.so directly — it has an unresolved
-            # "LogMsg" symbol.  k1_jpu.c loads it at runtime via dlopen/dlsym.
-            target_include_directories(lingqi_tantong_core PRIVATE "${K1_JPU_DIR}/include")
-            target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_JPU_LIB)
-            message(STATUS "K1 JPU: ${K1_JPU_DIR}")
-        else()
-            find_library(K1_JPU_LIB NAMES jpu PATHS /usr/lib /usr/lib/riscv64-linux-gnu NO_DEFAULT_PATH)
-            if(K1_JPU_LIB)
-                # Do NOT direct-link libjpu.so — libspacemit_mpp.so also exports
-                # AsrJpuDecOpen, and the global linker resolves it to the wrong
-                # implementation (→ segfault).  k1_jpu.c dlopens libjpu.so with
-                # RTLD_LOCAL and binds the correct symbols via dlsym.
-                # LogMsg is satisfied by our stub + --export-dynamic.
-                target_compile_definitions(lingqi_tantong_core PRIVATE HAS_K1_JPU_LIB)
-                message(STATUS "K1 JPU: auto-detected (${K1_JPU_LIB})")
-            else()
-                message(FATAL_ERROR
-                    "ENABLE_K1_JPU=ON but libjpu.so not found.\n"
-                    "  Auto-probed: /usr/lib/, /usr/lib/riscv64-linux-gnu/ — not found.\n"
-                    "  Install: sudo apt install k1x-jpu\n"
-                    "  Or set: -DK1_JPU_DIR=/path/to/k1x-jpu\n"
-                    "  Or disable JPU: -DENABLE_K1_JPU=OFF")
-            endif()
-        endif()
-    endif()
 endif()
 
-# ── SDL2 desktop window display ──────────────────────────────────────────
-set(HAS_SDL2_DISPLAY FALSE)
-if(ENABLE_SDL2_DISPLAY)
-    find_package(SDL2 QUIET)
-    if(SDL2_FOUND)
-        set(HAS_SDL2_DISPLAY TRUE)
-        target_include_directories(lingqi_tantong_core PRIVATE ${SDL2_INCLUDE_DIRS})
-        target_link_libraries(lingqi_tantong PRIVATE ${SDL2_LIBRARIES})
-        target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SDL2)
-        message(STATUS "SDL2 display:       YES (desktop window)")
-    else()
-        find_package(PkgConfig QUIET)
-        if(PKG_CONFIG_FOUND)
-            pkg_check_modules(SDL2_PC sdl2)
-            if(SDL2_PC_FOUND)
-                set(HAS_SDL2_DISPLAY TRUE)
-                target_include_directories(lingqi_tantong_core PRIVATE ${SDL2_PC_INCLUDE_DIRS})
-                target_link_libraries(lingqi_tantong PRIVATE ${SDL2_PC_LIBRARIES})
-                target_compile_definitions(lingqi_tantong_core PRIVATE HAS_SDL2)
-                message(STATUS "SDL2 display:       YES (pkg-config)")
-            endif()
-        endif()
-    endif()
-    if(NOT HAS_SDL2_DISPLAY)
-        message(STATUS "SDL2 display:       NO — fbdev fallback (sudo apt install libsdl2-dev for window)")
-    endif()
-endif()
-if(HAS_SDL2_DISPLAY)
-    target_sources(lingqi_tantong_core PRIVATE src/display_sdl2.c)
-endif()
+# ── No frontend / display ── headless inference-only build
 
 install(TARGETS lingqi_tantong DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
@@ -705,5 +652,4 @@ message(STATUS "RVV Optimize:      ${ENABLE_RVV_OPT}")
 message(STATUS "K1 Pipeline:       ${ENABLE_K1_PIPELINE}")
 message(STATUS "K1 TCM:            ${ENABLE_K1_TCM}")
 message(STATUS "K1 VPU/MPP:        ${ENABLE_K1_VPU}")
-message(STATUS "K1 JPU:            ${ENABLE_K1_JPU}")
 message(STATUS "============================================")

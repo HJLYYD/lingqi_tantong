@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -25,42 +26,74 @@ struct K1Platform {
 };
 
 static K1Platform* g_k1_plat = NULL;
+static pthread_once_t g_k1_plat_once = PTHREAD_ONCE_INIT;
+
+static void detect_k1_capabilities(K1Platform* plat);  /* forward decl */
+
+static void k1_platform_init_once(void) {
+    K1Platform* plat = (K1Platform*)calloc(1, sizeof(K1Platform));
+    if (!plat) return;
+
+    plat->tcm_fd = -1;
+    plat->tcm_mapped = NULL;
+    plat->tcm_mapped_size = 0;
+
+    detect_k1_capabilities(plat);
+    g_k1_plat = plat;
+
+    /* Log detected capabilities (runs once, thread-safe) */
+    const char* caps_str[9] = {"RVV1.0","AI-IME","TCM","VPU","JPU","GPU","MPP","Spacengine","SpacemiT_EP"};
+    log_info("K1 Platform: %s, %d CPUs, Capabilities:", plat->is_k1 ? "DETECTED" : "NOT DETECTED", plat->cpu_count);
+    for (int i = 0; i < 9; i++) {
+        if (plat->capabilities & (1 << i)) {
+            log_info("  [+] %s", caps_str[i]);
+        }
+    }
+}
 
 static void detect_k1_capabilities(K1Platform* plat) {
     plat->capabilities = 0;
     plat->tcm_size = 0;
     plat->cpu_count = K1_CPU_CORES;
 
-    plat->is_k1 = true;
-    plat->cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (plat->cpu_count <= 0) plat->cpu_count = K1_CPU_CORES;
-    if (plat->cpu_count > K1_CPU_CORES) plat->cpu_count = K1_CPU_CORES;
-
-    plat->capabilities |= K1_CAP_RVV_1_0;
-    plat->capabilities |= K1_CAP_SPACEMIT_EP;
-
-    int tcm_fd = open("/dev/tcm", O_RDWR);
-    if (tcm_fd >= 0) {
-        plat->capabilities |= K1_CAP_TCM;
-        plat->tcm_size = K1_TCM_SIZE;
-        close(tcm_fd);
-    }
-
+    /* Detect is_k1 from device-tree — only set true on confirmed K1 hardware */
+    plat->is_k1 = false;
     FILE* fp = fopen("/proc/device-tree/compatible", "r");
     if (fp) {
         char buf[256] = {0};
         size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
         fclose(fp);
-        if (n > 0 && (strstr(buf, "spacemit") || strstr(buf, "k1"))) {
+        if (n > 0 && strstr(buf, "spacemit,k1")) {
             plat->is_k1 = true;
         }
+    }
+
+    plat->cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (plat->cpu_count <= 0) plat->cpu_count = K1_CPU_CORES;
+    if (plat->cpu_count > K1_CPU_CORES) plat->cpu_count = K1_CPU_CORES;
+
+    if (plat->is_k1) {
+        plat->capabilities |= K1_CAP_RVV_1_0;
+        plat->capabilities |= K1_CAP_SPACEMIT_EP;
+    }
+
+    /* TCM is reserved for SpacemiT EP — app layer should not use it.
+     * We probe /dev/tcm for diagnostics only; do NOT advertise K1_CAP_TCM
+     * because k1_tcm_alloc() always returns NULL (TCM is EP-exclusive). */
+    int tcm_fd = open("/dev/tcm", O_RDWR);
+    if (tcm_fd >= 0) {
+        plat->tcm_size = K1_TCM_SIZE;
+        close(tcm_fd);
+        log_info("K1 TCM present (%zu MB, reserved for SpacemiT EP)",
+                 (size_t)(K1_TCM_SIZE / (1024 * 1024)));
     }
 
     if (access("/dev/video0", F_OK) == 0) {
         plat->capabilities |= K1_CAP_VPU;
     }
 
-    if (access("/dev/jpu", F_OK) == 0) {
+    /* JPU hardware presence (informational only — JPEG decode uses libjpeg-turbo) */
+    if (access("/dev/jpu", F_OK) == 0 || access("/dev/jpu0", F_OK) == 0) {
         plat->capabilities |= K1_CAP_JPU;
     }
 
@@ -70,42 +103,8 @@ static void detect_k1_capabilities(K1Platform* plat) {
 }
 
 K1Platform* k1_platform_init(void) {
-    if (g_k1_plat) return g_k1_plat;
-
-    K1Platform* plat = (K1Platform*)calloc(1, sizeof(K1Platform));
-    if (!plat) return NULL;
-
-    plat->tcm_fd = -1;
-    plat->tcm_mapped = NULL;
-    plat->tcm_mapped_size = 0;
-
-    detect_k1_capabilities(plat);
-
-    g_k1_plat = plat;
-
-    /*
-     * IMPORTANT: do NOT mmap /dev/tcm here.
-     *
-     * SpacemiT EP (libspacemit_ep.so) needs exclusive access to /dev/tcm to
-     * allocate per-core TCM buffers internally. If we mmap the whole TCM
-     * region first, SpacemiT EP throws std::runtime_error("tcm buffer alloc
-     * failed for core id N") from inside its worker threads, which can't be
-     * caught across the C-API boundary and aborts the process.
-     *
-     * We still expose K1_CAP_TCM capability so K1 hardware is recognized
-     * (SpacemiT EP itself uses TCM under the hood), but only as a flag —
-     * the actual TCM lifecycle is owned by libspacemit_ep.so.
-     */
-
-    const char* caps_str[9] = {"RVV1.0", "AI-IME", "TCM", "VPU", "JPU", "GPU", "MPP", "Spacengine", "SpacemiT_EP"};
-    log_info("K1 Platform: %s, %d CPUs, Capabilities:", plat->is_k1 ? "DETECTED" : "NOT DETECTED", plat->cpu_count);
-    for (int i = 0; i < 9; i++) {
-        if (plat->capabilities & (1 << i)) {
-            log_info("  [+] %s", caps_str[i]);
-        }
-    }
-
-    return plat;
+    pthread_once(&g_k1_plat_once, k1_platform_init_once);
+    return g_k1_plat;
 }
 
 void k1_platform_destroy(K1Platform* plat) {
@@ -120,8 +119,10 @@ void k1_platform_destroy(K1Platform* plat) {
         plat->tcm_fd = -1;
     }
 
-    free(plat);
+    /* BUGFIX: null the global pointer BEFORE freeing, so concurrent
+     * accessors in other threads see NULL instead of freed memory. */
     if (g_k1_plat == plat) g_k1_plat = NULL;
+    free(plat);
 }
 
 bool k1_platform_is_k1(void) {

@@ -503,3 +503,48 @@ int config_load_from_file(ConfigManager* cm, const char* path) {
     log_info("YAML config loaded from %s: %d keys parsed", path, parsed_count);
     return 0;
 }
+
+int config_save_to_file(const ConfigManager* cm, const char* path) {
+    if (!cm || !path) return -1;
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        log_error("Config save: cannot open %s for writing", path);
+        return -1;
+    }
+    for (int s = 0; s < cm->num_sections; s++) {
+        const ConfigSection* sec = &cm->sections[s];
+        if (sec->num_entries == 0) continue;
+        fprintf(f, "%s:\n", sec->section);
+        for (int e = 0; e < sec->num_entries; e++) {
+            const ConfigEntry* ent = &sec->entries[e];
+            fprintf(f, "  %s: ", ent->key);
+            switch (ent->type) {
+            case CONFIG_TYPE_INT:
+                fprintf(f, "%d\n", ent->value.int_val);
+                break;
+            case CONFIG_TYPE_FLOAT:
+                fprintf(f, "%.6g\n", ent->value.float_val);
+                break;
+            case CONFIG_TYPE_BOOL:
+                fprintf(f, "%s\n", ent->value.bool_val ? "true" : "false");
+                break;
+            case CONFIG_TYPE_STRING:
+                /* Quote strings that contain special chars */
+                if (strchr(ent->value.string_val, ':') || strchr(ent->value.string_val, '#') ||
+                    ent->value.string_val[0] == '\0') {
+                    fprintf(f, "\"%s\"\n", ent->value.string_val);
+                } else {
+                    fprintf(f, "%s\n", ent->value.string_val);
+                }
+                break;
+            default:
+                fprintf(f, "\n");
+                break;
+            }
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    log_info("Config saved to %s: %d sections", path, cm->num_sections);
+    return 0;
+}

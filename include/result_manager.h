@@ -1,6 +1,7 @@
 #ifndef RESULT_MANAGER_H
 #define RESULT_MANAGER_H
 
+#include <stdio.h>
 #include "core_types.h"
 #include "spatial_engine.h"
 
@@ -50,6 +51,7 @@ typedef struct {
     SessionResult sessions[RM_MAX_SESSIONS];
     int num_sessions;
     SessionResult* current_session;
+    FILE* frame_meta_file;  /* Open handle for incremental per-frame JSONL metadata */
 } ResultManager;
 
 ResultManager* result_manager_create(const char* base_output_dir);
@@ -72,6 +74,18 @@ int result_manager_save_frame(const ResultManager* rm, const char* session_id, c
 int result_manager_save_frame_metadata(const ResultManager* rm, const char* session_id,
                                         int frame_num, int num_detections, int num_poses,
                                         int num_faces, int num_tracked, int has_action);
+
+/**
+ * Get session-based annotated video path: "<base>/<session_id>/annotated.mp4".
+ * Returns 0 on success, -1 on error.
+ */
+int result_manager_get_video_path(const ResultManager* rm, const char* session_id,
+                                   char* out_path, int path_len);
+
+/**
+ * Flush per-frame metadata to disk (called periodically for crash-recovery).
+ */
+void result_manager_flush(ResultManager* rm);
 
 #ifdef __cplusplus
 }

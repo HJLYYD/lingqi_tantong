@@ -52,6 +52,7 @@ void utils_sort_detections_by_confidence(Detection* dets, int len);
 
 int utils_matrix_inverse_4x4(const float src[4][4], float dst[4][4]);
 void utils_matrix_multiply_abt(const float a[7][7], const float b[7][7], float out[7][7]);
+void utils_matrix_multiply_fpfT(const float f[7][7], const float p[7][7], float out[7][7]);
 
 int64_t utils_get_time_ms(void);
 void utils_sleep_ms(int ms);

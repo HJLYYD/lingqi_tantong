@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>灵柒探瞳 — 边缘AI管线</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./three.module.js",
+    "three/addons/": "./"
+  }
+}
+</script>
+<style>
+/* ═══════════════════════════════════════════════════
+   陶瓷白设计 — 灵柒探瞳
+   ═══════════════════════════════════════════════════ */
+:root {
+  --bg-page:       #FDF7ED;
+  --bg-sidebar:    #FAF6F0;
+  --bg-card:       #FFFFFF;
+  --bg-hover:      #F5EDE3;
+  --bg-input:      #FDF9F4;
+  --text-primary:  #1a1a1a;
+  --text-secondary:#333333;
+  --text-muted:    #555555;
+  --accent:        #5B8C7A;
+  --accent-hover:  #4A7565;
+  --accent-light:  #E8F2ED;
+  --danger:        #C47777;
+  --danger-light:  #FDF0F0;
+  --danger-hover:  #B56565;
+  --warning:       #C49A6C;
+  --warning-light: #FFF8F0;
+  --warning-hover: #B58855;
+  --info:          #6B9EC4;
+  --info-light:    #F0F6FA;
+  --border:        #E5DDD2;
+  --border-light:  #F0EAE2;
+  --shadow-sm:     0 1px 3px rgba(61,48,40,0.04);
+  --shadow:        0 2px 8px rgba(61,48,40,0.06);
+  --shadow-lg:     0 4px 16px rgba(61,48,40,0.08);
+  --radius:        10px;
+  --radius-sm:     6px;
+  --radius-lg:     14px;
+  --radius-full:   9999px;
+  --font:          system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono:     'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --transition:    0.15s ease;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  background: #FDF7ED;
+  color: #111;
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#side {
+  width: 280px; min-width: 280px;
+  background: #FAF6F0;
+  border-right: 1px solid #E5DDD2;
+  display: flex; flex-direction: column;
+  padding: 20px; gap: 14px;
+  overflow-y: auto; z-index: 10;
+}
+#logo { font-size: 20px; font-weight: 700; color: #111; letter-spacing: 1px; }
+#logo span { font-weight: 400; font-size: 11px; color: #444; display: block; margin-top: 1px; letter-spacing: 0; }
+
+#status-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: #fff;
+  border-radius: 6px; border: 1px solid #F0EAE2;
+}
+#st { font-size: 10px; font-weight: 600; padding: 3px 10px; border-radius: 9999px; letter-spacing: 0.4px; }
+.st-idle    { background: #E8F2ED; color: #5B8C7A; }
+.st-starting,.st-stopping { background: #FFF8F0; color: #C49A6C; }
+.st-running { background: #F0F6FA; color: #6B9EC4; }
+.st-error   { background: #FDF0F0; color: #C47777; }
+#dot { width: 8px; height: 8px; border-radius: 50%; background: #C47777; flex-shrink: 0; transition: background 0.15s; }
+#dot.on { background: #5B8C7A; box-shadow: 0 0 6px rgba(91,140,122,0.4); }
+#ws-txt { font-size: 10px; color: #555; }
+
+#ctls { display: flex; flex-direction: column; gap: 6px; }
+.btn {
+  display: block; width: 100%; padding: 9px 14px;
+  border: none; border-radius: 6px;
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  font-family: var(--font); transition: all 0.15s;
+  text-align: center;
+}
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-start  { background: #5B8C7A; color: #fff; }
+.btn-start:hover:not(:disabled)  { background: #4A7565; }
+.btn-stop   { background: #C47777; color: #fff; }
+.btn-stop:hover:not(:disabled)   { background: #B56565; }
+.btn-warn   { background: #C49A6C; color: #fff; }
+.btn-warn:hover:not(:disabled)   { background: #B58855; }
+.btn-reset  { background: transparent; color: #111; border: 1px solid #E5DDD2; }
+.btn-reset:hover:not(:disabled)  { background: #F5EDE3; }
+.btn-cfg   { background: #6B9EC4; color: #fff; }
+.btn-cfg:hover:not(:disabled)  { background: #5A8DB5; }
+
+#stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.stat {
+  background: #fff; border-radius: 6px;
+  padding: 10px 12px; border: 1px solid #F0EAE2;
+}
+.stat .v { font-size: 20px; font-weight: 600; color: #111; line-height: 1.2; }
+.stat .l { font-size: 9px; letter-spacing: 0.5px; color: #444; margin-top: 2px; }
+
+#diag {
+  font-size: 10px; padding: 6px 10px; border-radius: 6px;
+  background: #FFF8F0; color: #C49A6C;
+  border: 1px solid #E8D5B0; display: none; word-break: break-all;
+}
+
+#log-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#log-wrap h4 { font-size: 10px; color: #555; margin-bottom: 6px; letter-spacing: 0.5px; }
+#log {
+  flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 9px;
+  line-height: 1.7; color: #333;
+  background: #fff; border-radius: 6px;
+  padding: 8px 10px; border: 1px solid #F0EAE2;
+  max-height: 160px; word-break: break-all;
+}
+#log .g { color: #4A8C6A; } #log .w { color: #C49A6C; }
+#log .e { color: #C47777; } #log .b { color: #6B9EC4; }
+
+#main { flex: 1; display: flex; flex-direction: column; background: #FDF7ED; min-width: 0; }
+
+#tabs { display: flex; gap: 0; background: #FAF6F0; border-bottom: 1px solid #E5DDD2; padding: 0 16px; }
+.tab {
+  padding: 12px 20px; font-size: 13px; font-weight: 500;
+  cursor: pointer; color: #444;
+  border-bottom: 2px solid transparent; transition: all 0.15s;
+  background: none; border-top: none; border-left: none; border-right: none;
+  font-family: var(--font);
+}
+.tab:hover { color: #111; }
+.tab.on { color: #5B8C7A; border-bottom-color: #5B8C7A; }
+.tab-count { font-size: 9px; color: #555; margin-left: 4px; }
+
+#views { flex: 1; position: relative; overflow: hidden; }
+.vt { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: none; overflow: hidden; }
+.vt.on { display: flex; align-items: center; justify-content: center; }
+
+#v-cam { background: #111; }
+#vid-wrap {
+  position: relative; width: 100%; height: 100%;
+  overflow: hidden;
+}
+#vid {
+  display: none;
+  width: 100%; height: 100%;
+  object-fit: contain;
+}
+#ovl { position: absolute; top: 0; left: 0; pointer-events: none; }
+#ph {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%); text-align: center;
+  color: #444; z-index: 1;
+}
+#ph p { font-size: 14px; margin: 4px 0; }
+#ph small { font-size: 11px; display: block; color: #555; }
+
+#v-map { background: #F0EDE6; flex-direction: column; }
+#mc-wrap { width: 100%; height: 100%; position: relative; }
+#mc { width: 100%; height: 100%; display: block; }
+#map-info {
+  position: absolute; bottom: 12px; left: 16px;
+  font-size: 11px; color: #333;
+  background: #fff; padding: 6px 12px;
+  border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  pointer-events: none;
+}
+#map-fallback-msg {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  text-align: center; color: #555; display: none;
+}
+
+#v-cfg { background: #FDF7ED; overflow-y: auto; padding: 20px; align-items: flex-start; justify-content: flex-start; flex-direction: column; }
+#cfg-ct { width: 100%; max-width: 800px; }
+.cfg-section {
+  background: #fff; border-radius: 10px;
+  border: 1px solid #F0EAE2; padding: 16px 20px;
+  margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.cfg-section h4 {
+  font-size: 13px; font-weight: 600; color: #111;
+  margin-bottom: 12px; padding-bottom: 8px;
+  border-bottom: 1px solid #F0EAE2;
+}
+.cfg-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 0; gap: 12px;
+}
+.cfg-row + .cfg-row { border-top: 1px solid #F0EAE2; }
+.cfg-label { font-size: 11px; color: #444; min-width: 140px; flex-shrink: 0; word-break: break-all; }
+.cfg-label code { font-size: 10px; color: #5B8C7A; background: #E8F2ED; padding: 1px 5px; border-radius: 3px; }
+.cfg-control { flex: 1; max-width: 320px; min-width: 0; }
+
+input, select {
+  font-family: var(--font); font-size: 12px;
+  padding: 7px 10px; border: 1px solid #E5DDD2;
+  border-radius: 6px; background: #FDF9F4;
+  color: #111; transition: border-color 0.15s;
+  width: 100%;
+}
+input:focus, select:focus { outline: none; border-color: #5B8C7A; box-shadow: 0 0 0 2px #E8F2ED; }
+input[type="checkbox"] { width: auto; accent-color: #5B8C7A; }
+input[type="range"] { width: 100%; accent-color: #5B8C7A; padding: 0; }
+select { cursor: pointer; }
+
+.tgl { position: relative; display: inline-block; width: 42px; height: 24px; flex-shrink: 0; }
+.tgl input { opacity: 0; width: 0; height: 0; }
+.tgl .slider {
+  position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+  background: #E5DDD2; border-radius: 9999px; transition: 0.15s;
+}
+.tgl .slider::before {
+  content: ""; position: absolute; height: 18px; width: 18px;
+  left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.15s;
+}
+.tgl input:checked + .slider { background: #5B8C7A; }
+.tgl input:checked + .slider::before { transform: translateX(18px); }
+
+.range-val { font-size: 11px; color: #5B8C7A; font-weight: 600; min-width: 36px; text-align: right; }
+.cfg-dirty .cfg-label::after { content: " ●"; color: #C49A6C; font-size: 8px; }
+
+#cfg-actions {
+  display: none; gap: 10px; margin-top: 20px; padding: 16px 20px;
+  border-top: 2px solid #E5DDD2;
+  width: 100%; max-width: 800px;
+  background: #fff; border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06); position: sticky; bottom: 10px;
+  align-items: center; flex-wrap: wrap;
+}
+#cfg-actions .btn { width: auto; padding: 11px 28px; font-size: 13px; font-weight: 600; }
+
+@media (max-width: 768px) {
+  body { flex-direction: column; }
+  #side { width: 100%; min-width: 0; max-height: 40vh; }
+  #log { max-height: 80px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════ 侧边栏 ═══════════════════════ -->
+<div id="side">
+  <div id="logo">灵柒探瞳<span>边缘AI · SpacemiT K1</span></div>
+
+  <div id="status-bar">
+    <div id="st" class="st-idle">空闲</div>
+    <div id="dot"></div>
+    <div id="ws-txt">未连接</div>
+  </div>
+
+  <div id="ctls">
+    <button class="btn btn-start" id="b1" disabled>启动管线</button>
+    <button class="btn btn-stop" id="b2" disabled>停止</button>
+    <button class="btn btn-warn" id="b3" disabled>重启</button>
+    <button class="btn btn-reset" id="b4">重置原点</button>
+  </div>
+
+  <div id="stats">
+    <div class="stat"><div class="v" id="sv-fps">--</div><div class="l">帧率</div></div>
+    <div class="stat"><div class="v" id="sv-frame">0</div><div class="l">帧号</div></div>
+    <div class="stat"><div class="v" id="sv-tracks">0</div><div class="l">追踪</div></div>
+    <div class="stat"><div class="v" id="sv-dets">0</div><div class="l">检测</div></div>
+    <div class="stat"><div class="v" id="sv-action">--</div><div class="l">动作</div></div>
+    <div class="stat"><div class="v" id="sv-uptime">0秒</div><div class="l">运行</div></div>
+  </div>
+
+  <div id="diag"></div>
+
+  <div id="log-wrap">
+    <h4>事件日志</h4>
+    <div id="log"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════ 主区域 ═══════════════════════ -->
+<div id="main">
+  <div id="tabs">
+    <button class="tab on" data-tab="cam">相机</button>
+    <button class="tab" data-tab="map">世界地图 <span class="tab-count" id="map-count"></span></button>
+    <button class="tab" data-tab="cfg">配置</button>
+  </div>
+
+  <div id="views">
+    <div id="v-cam" class="vt on">
+      <div id="vid-wrap">
+        <div id="ph"><p>等待管线帧...</p><small>启动管线开始采集</small></div>
+        <img id="vid" alt="相机画面">
+        <canvas id="ovl"></canvas>
+      </div>
+    </div>
+
+    <div id="v-map" class="vt">
+      <div id="mc-wrap">
+        <canvas id="mc"></canvas>
+        <div id="map-info">K1 原点 · 追踪 0 人</div>
+        <div id="map-fallback-msg"><p>3D 视图需要 WebGL 支持</p><small>回退至 2D 地图</small></div>
+      </div>
+    </div>
+
+    <div id="v-cfg" class="vt">
+      <div id="cfg-ct"><p style="color:#555;padding:40px;text-align:center">正在加载配置...</p></div>
+      <div id="cfg-actions">
+        <button class="btn btn-cfg" id="cfg-save">保存配置</button>
+        <button class="btn btn-start" id="cfg-start">保存并启动管线</button>
+        <span id="cfg-status" style="font-size:11px;color:#444;margin-left:auto"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════ Three.js 模块加载 ═══════════════════════ -->
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/OrbitControls.js';
+window.THREE = THREE;
+window.OrbitControls = OrbitControls;
+window.__threeReady = true;
+</script>
+
+<!-- ═══════════════════════ 主脚本 ═══════════════════════ -->
+<script>
+(function(){ 'use strict';
+
+var D = {};
+['st','dot','ws-txt','b1','b2','b3','b4',
+ 'sv-fps','sv-frame','sv-tracks','sv-dets','sv-action','sv-uptime',
+ 'diag','log','vid','ovl','ph','mc','map-info','map-fallback-msg',
+ 'map-count','cfg-ct','cfg-actions','cfg-save','cfg-start','cfg-status',
+ 'mc-wrap'].forEach(function(id){
+  var el = document.getElementById(id);
+  D[id] = el;
+  if (!el) console.warn('Missing #'+id);
+});
+
+var wsTxt = D['ws-txt'], svFps = D['sv-fps'], svFrame = D['sv-frame'];
+var svTracks = D['sv-tracks'], svDets = D['sv-dets'], svAction = D['sv-action'];
+var svUptime = D['sv-uptime'];
+
+/* 中文状态映射 */
+var ST_CN = {idle:'空闲', starting:'启动中', running:'运行中', stopping:'停止中', error:'错误'};
+
+var SK = [[15,13],[13,11],[16,14],[14,12],[11,12],[5,11],[6,12],[5,6],[5,7],[6,8],[7,9],[8,10],[1,2],[0,1],[0,2],[1,3],[2,4],[3,5],[4,6]];
+var KC = ['#ff0','#0ff','#0ff','#f0f','#f0f','#0f0','#0f0','#f80','#f80','#f00','#f00','#08f','#08f','#44f','#44f','#48f','#48f'];
+var PC = ['#5B8C7A','#E05555','#C49A6C','#5588CC','#C47777','#A07CC4','#3DA0A0','#D4883D','#6B9EC4','#CC5599'];
+
+var fullCfg = {};
+var worldTrails = {};
+var connStart = 0;
+var currentTab = 'cam';
+var mapMode = '2d';
+var threeReady = false;
+var lastFrame = null;
+
+function log(msg, cls) {
+  var t = new Date().toLocaleTimeString([], {hour12: false});
+  var el = document.createElement('div');
+  if (cls) el.innerHTML = '<span style="color:#555">'+t+'</span> <span class="'+cls+'">'+msg+'</span>';
+  else el.innerHTML = '<span style="color:#555">'+t+'</span> '+msg;
+  D.log.appendChild(el);
+  while (D.log.children.length > 200) D.log.removeChild(D.log.firstChild);
+  D.log.scrollTop = D.log.scrollHeight;
+}
+
+function setState(s) {
+  D.st.textContent = ST_CN[s] || s.toUpperCase();
+  D.st.className = 'st-' + s;
+  var run = (s === 'running' || s === 'starting');
+  var idle = (s === 'idle');
+  D.b1.disabled = !idle;
+  D.b2.disabled = !run;
+  D.b3.disabled = !run;
+  if (D['cfg-start']) D['cfg-start'].disabled = !idle;
+}
+
+function setConnected(ok) {
+  D.dot.className = ok ? 'on' : '';
+  wsTxt.textContent = ok ? '已连接' : '未连接';
+  if (ok) connStart = Date.now();
+}
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.classList.toggle('on', t.dataset.tab === name);
+  });
+  document.getElementById('v-cam').classList.toggle('on', name === 'cam');
+  document.getElementById('v-map').classList.toggle('on', name === 'map');
+  document.getElementById('v-cfg').classList.toggle('on', name === 'cfg');
+  if (name === 'map') { resizeMap(); if (threeReady && mapMode === '3d') start3DRenderLoop(); }
+  if (name === 'cfg' && !fullCfg._rendered) ConfigPanel.render();
+}
+document.querySelectorAll('.tab').forEach(function(t){
+  t.addEventListener('click', function(){ switchTab(t.dataset.tab); });
+});
+
+/* ═══════════════════════ 2D 叠加层 ═══════════════════════ */
+var CAM_W = 640, CAM_H = 480;
+
+function alignOverlay() {
+  var img = D.vid, ovl = D.ovl, wrap = document.getElementById('vid-wrap');
+  if (!img.naturalWidth || !img.naturalHeight) return;
+  if (img.style.display === 'none') return;
+
+  /* Use image natural size as canvas logical coordinate space.
+   * Detection bbox coordinates must match this space.
+   * Server sends bboxes in camera-native resolution (640x480),
+   * scaled by naturalWidth/cameraWidth ratio in push_frame_to_web. */
+  var cw = wrap.clientWidth, ch = wrap.clientHeight;
+  var iw = img.naturalWidth, ih = img.naturalHeight;
+  if (cw < 2 || ch < 2) return;
+
+  var scale = Math.min(cw / iw, ch / ih);
+  var dispW = iw * scale, dispH = ih * scale;
+  var offX = (cw - dispW) / 2, offY = (ch - dispH) / 2;
+
+  ovl.style.left   = offX + 'px';
+  ovl.style.top    = offY + 'px';
+  ovl.style.width  = dispW + 'px';
+  ovl.style.height = dispH + 'px';
+  /* Canvas logical pixels = image natural pixels */
+  ovl.width  = iw;
+  ovl.height = ih;
+}
+
+function renderOvl(m) {
+  alignOverlay();
+  var c = D.ovl;
+  var W = c.width, H = c.height;
+  if (W < 1 || H < 1) { W = CAM_W; H = CAM_H; c.width = W; c.height = H; }
+  var ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  var dets = m.d || [];
+  for (var i = 0; i < dets.length; i++) {
+    var d = dets[i];
+    ctx.strokeStyle = 'rgba(255,220,40,0.85)'; ctx.lineWidth = 2;
+    ctx.strokeRect(d[0], d[1], d[2]-d[0], d[3]-d[1]);
+    ctx.fillStyle = 'rgba(255,220,40,0.95)';
+    ctx.font = 'bold 14px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(Math.round(d[4]*100)+'%', d[0]+2, d[1] > 18 ? d[1]-4 : d[1]+18);
+  }
+
+  var poses = m.p || [];
+  for (var pi = 0; pi < poses.length; pi++) {
+    var p = poses[pi], k = p.k || [];
+    if (p.b) {
+      ctx.strokeStyle = 'rgba(0,220,120,0.5)'; ctx.setLineDash([5,5]); ctx.lineWidth = 1.5;
+      ctx.strokeRect(p.b[0], p.b[1], p.b[2]-p.b[0], p.b[3]-p.b[1]); ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = 'rgba(0,240,130,0.6)'; ctx.lineWidth = 2.5;
+    for (var si = 0; si < SK.length; si++) {
+      var a = SK[si][0], b = SK[si][1];
+      if (!k[a] || !k[b]) continue;
+      ctx.beginPath(); ctx.moveTo(k[a][0], k[a][1]); ctx.lineTo(k[b][0], k[b][1]); ctx.stroke();
+    }
+    for (var ki = 0; ki < k.length; ki++) {
+      if (!k[ki]) continue;
+      ctx.fillStyle = KC[ki] || '#0f0';
+      ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 4, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 4, 0, Math.PI*2); ctx.stroke();
+    }
+  }
+
+  var trks = m.t || [];
+  for (var ti = 0; ti < trks.length; ti++) {
+    var t = trks[ti];
+    if (!t.b) continue;
+    ctx.strokeStyle = 'rgba(64,160,255,0.75)'; ctx.setLineDash([6,4]); ctx.lineWidth = 2.5;
+    ctx.strokeRect(t.b[0], t.b[1], t.b[2]-t.b[0], t.b[3]-t.b[1]); ctx.setLineDash([]);
+    ctx.fillStyle = '#4090ff';
+    ctx.font = 'bold 13px ' + getComputedStyle(document.body).fontFamily;
+    var lbl = '#'+t.i;
+    if (t.p) lbl += ' '+t.p[0].toFixed(1)+','+t.p[2].toFixed(1)+'m';
+    ctx.fillText(lbl, t.b[0]+2, t.b[1] > 18 ? t.b[1]-4 : t.b[1]+18);
+  }
+
+  var barH = 30;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, barH);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('帧 '+m.n+'  帧率 '+m.f+'  追踪 '+trks.length+'  检测 '+dets.length+(m.a?'  动作 '+m.a[0]:''), 10, 21);
+}
+
+/* ═══════════════════════ 2D 地图（回退） ═══════════════════════ */
+function render2DMap(m) {
+  if (mapMode !== '2d') return;
+  var wrap = D['mc-wrap'] || document.getElementById('mc-wrap');
+  var W = wrap ? wrap.clientWidth : 400, H = wrap ? wrap.clientHeight : 300;
+  if (W < 1 || H < 1) return;
+  var c = D.mc;
+  c.width = W; c.height = H;
+  var ctx = c.getContext('2d');
+  var S = Math.min(W, H) / 18;
+  var cx = W/2, cy = H/2;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#F0EDE6'; ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(0,0,0,0.06)'; ctx.lineWidth = 1;
+  for (var g = -8; g <= 8; g += 2) {
+    ctx.beginPath(); ctx.moveTo(cx+g*S, cy-8*S); ctx.lineTo(cx+g*S, cy+8*S); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx-8*S, cy+g*S); ctx.lineTo(cx+8*S, cy+g*S); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(107,158,196,0.4)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx, cy-8*S); ctx.lineTo(cx, cy+8*S); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-8*S, cy); ctx.lineTo(cx+8*S, cy); ctx.stroke();
+
+  ctx.fillStyle = '#555'; ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('北', cx-5, cy-8.5*S); ctx.fillText('东', cx+8.5*S, cy+4);
+
+  ctx.fillStyle = '#5B8C7A'; ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#1a1a1a'; ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('K1', cx+8, cy+4);
+
+  var now = Date.now(), activeCount = 0;
+  var trks = m.t || [];
+  for (var i = 0; i < trks.length; i++) {
+    var t = trks[i];
+    if (!t.p) continue;
+    activeCount++;
+    var wx = cx + t.p[0]*S, wy = cy - t.p[2]*S;
+    var color = PC[t.i % PC.length];
+    var trail = worldTrails[t.i] || [];
+    trail.push({x: wx, y: wy, ts: now});
+    if (trail.length > 60) trail.shift();
+    worldTrails[t.i] = trail;
+    if (trail.length > 1) {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.moveTo(trail[0].x, trail[0].y);
+      for (var k = 1; k < trail.length; k++) ctx.lineTo(trail[k].x, trail[k].y);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(wx, wy, 5, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    var dist = Math.sqrt(t.p[0]*t.p[0] + t.p[2]*t.p[2]);
+    ctx.fillStyle = '#1a1a1a'; ctx.font = '9px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText('#'+t.i+' '+dist.toFixed(1)+'m', wx+8, wy-8);
+  }
+
+  var sbx = W-70, sby = H-20;
+  ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(sbx, sby); ctx.lineTo(sbx+S*2, sby); ctx.stroke();
+  ctx.fillStyle = '#333'; ctx.font = '9px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('2m', sbx, sby-4);
+
+  Object.keys(worldTrails).forEach(function(k){
+    var t = worldTrails[k];
+    if (t && t.length && (now - t[t.length-1].ts > 60000)) delete worldTrails[k];
+  });
+
+  D['map-info'].textContent = 'K1 原点 · 追踪 '+activeCount+' 人';
+  if (D['map-count']) D['map-count'].textContent = activeCount > 0 ? activeCount : '';
+}
+
+/* ═══════════════════════ Three.js 3D 地图 ═══════════════════════ */
+var threeScene, threeCamera, threeRenderer, threeControls;
+var threeObjects = {};
+var threePersonMeshes = {};   /* track_id -> Group (body+head+shadow+label) */
+var threePersonTrails = {};   /* track_id -> {points, line} */
+var threeAnimId = null;
+
+/* Create a canvas-texture sprite label for 3D person markers */
+function makePersonLabel(trackId, dist, colorHex) {
+  var c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  var ctx = c.getContext('2d');
+  /* Background pill — manual rounded rect for broad browser compat */
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  var w = 220, h = 44, x = 18, y = 10, r = 22;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y);
+  ctx.arcTo(x+w, y, x+w, y+r, r); ctx.lineTo(x+w, y+h-r);
+  ctx.arcTo(x+w, y+h, x+w-r, y+h, r); ctx.lineTo(x+r, y+h);
+  ctx.arcTo(x, y+h, x, y+h-r, r); ctx.lineTo(x, y+r);
+  ctx.arcTo(x, y, x+r, y, r); ctx.closePath();
+  ctx.fill();
+  /* ID */
+  ctx.fillStyle = colorHex; ctx.font = 'bold 20px system-ui,sans-serif';
+  ctx.fillText('#'+trackId, x+14, y+30);
+  /* Distance */
+  ctx.fillStyle = '#fff'; ctx.font = '16px system-ui,sans-serif';
+  ctx.fillText(dist.toFixed(1)+'m', x+80, y+30);
+  var tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  var mat = new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false});
+  var sprite = new THREE.Sprite(mat);
+  sprite.scale.set(2.0, 0.5, 1);
+  sprite.position.y = 1.4;
+  return sprite;
+}
+
+function init3DMap() {
+  if (typeof THREE === 'undefined') {
+    mapMode = '2d';
+    if (D['map-fallback-msg']) D['map-fallback-msg'].style.display = 'block';
+    log('Three.js 未加载，使用 2D 地图', 'w');
+    return;
+  }
+  if (!window.WebGLRenderingContext) {
+    mapMode = '2d';
+    if (D['map-fallback-msg']) D['map-fallback-msg'].style.display = 'block';
+    log('WebGL 不支持，使用 2D 地图', 'w');
+    return;
+  }
+  try {
+    var wrap = D['mc-wrap'] || document.getElementById('mc-wrap');
+    var W = wrap.clientWidth || 600, H = wrap.clientHeight || 400;
+
+    threeScene = new THREE.Scene();
+    threeScene.background = new THREE.Color('#F0EDE6');
+    threeScene.fog = new THREE.Fog('#F0EDE6', 15, 30);
+
+    threeCamera = new THREE.PerspectiveCamera(50, W/H, 0.5, 50);
+    threeCamera.position.set(8, 10, 12);
+    threeCamera.lookAt(0, 0, 0);
+
+    threeRenderer = new THREE.WebGLRenderer({antialias: true, canvas: D.mc});
+    threeRenderer.setSize(W, H);
+    threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    threeRenderer.shadowMap.enabled = false;
+
+    threeScene.add(new THREE.AmbientLight('#FFF5EB', 1.2));
+    threeScene.add(new THREE.HemisphereLight('#FFEEDD', '#C4B5A5', 0.6));
+
+    var ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshLambertMaterial({color: '#E8E0D5', side: THREE.DoubleSide})
+    );
+    ground.rotation.x = -Math.PI/2;
+    threeScene.add(ground);
+
+    threeScene.add(new THREE.GridHelper(20, 10, '#D5CCC0', '#D5CCC0'));
+
+    var k1Mat = new THREE.MeshStandardMaterial({color: '#5B8C7A', emissive: '#3D6A5A', emissiveIntensity: 0.4});
+    var k1Marker = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), k1Mat);
+    k1Marker.position.y = 0.15;
+    threeScene.add(k1Marker);
+    threeObjects['k1'] = k1Marker;
+
+    var cone = new THREE.Mesh(
+      new THREE.ConeGeometry(0.12, 0.4, 8),
+      new THREE.MeshStandardMaterial({color: '#5B8C7A'})
+    );
+    cone.position.set(0, 0.5, 0.3);
+    cone.rotation.x = -Math.PI/2;
+    threeScene.add(cone);
+
+    if (typeof OrbitControls !== 'undefined') {
+      threeControls = new OrbitControls(threeCamera, threeRenderer.domElement);
+      threeControls.enableDamping = true;
+      threeControls.dampingFactor = 0.1;
+      threeControls.target.set(0, 0, 0);
+      threeControls.maxPolarAngle = Math.PI/2.2;
+      threeControls.minDistance = 4;
+      threeControls.maxDistance = 25;
+      threeControls.update();
+    }
+
+    function makeLabel(text, x, y, z, color) {
+      var canvas = document.createElement('canvas');
+      canvas.width = 64; canvas.height = 32;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = color; ctx.font = 'bold 20px system-ui'; ctx.textAlign = 'center';
+      ctx.fillText(text, 32, 22);
+      var tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      var sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
+      sprite.position.set(x, y, z); sprite.scale.set(0.8, 0.4, 1);
+      return sprite;
+    }
+    threeScene.add(makeLabel('北', 0, 0.3, 10, '#C49A6C'));
+    threeScene.add(makeLabel('南', 0, 0.3, -10, '#C49A6C'));
+    threeScene.add(makeLabel('东', 10, 0.3, 0, '#C49A6C'));
+    threeScene.add(makeLabel('西', -10, 0.3, 0, '#C49A6C'));
+
+    mapMode = '3d';
+    threeReady = true;
+    log('3D 地图已初始化 (Three.js + WebGL)', 'g');
+  } catch(e) {
+    log('3D 地图初始化失败: '+e.message, 'e');
+    mapMode = '2d';
+    if (D['map-fallback-msg']) D['map-fallback-msg'].style.display = 'block';
+  }
+}
+
+function update3DMap(m) {
+  if (mapMode !== '3d' || !threeReady || !threeScene) return;
+  var activeCount = 0;
+  var trks = m.t || [];
+
+  for (var i = 0; i < trks.length; i++) {
+    var t = trks[i];
+    if (!t.p) continue;
+    activeCount++;
+    var pos = new THREE.Vector3(t.p[0], 0.85, -t.p[2]);
+    var color = parseInt(PC[t.i % PC.length].replace('#',''), 16);
+
+    var mesh = threePersonMeshes[t.i];
+    var dist = Math.sqrt(t.p[0]*t.p[0] + t.p[2]*t.p[2]);
+    if (!mesh) {
+      var group = new THREE.Group();
+      var body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.15, 0.18, 0.9, 12),
+        new THREE.MeshLambertMaterial({color: color})
+      );
+      body.position.y = 0.45;
+      group.add(body);
+      var head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.12, 8, 8),
+        new THREE.MeshLambertMaterial({color: color})
+      );
+      head.position.y = 1.0;
+      group.add(head);
+      var shadow = new THREE.Mesh(
+        new THREE.CircleGeometry(0.18, 8),
+        new THREE.MeshBasicMaterial({color: 0x000000, transparent: true, opacity: 0.15})
+      );
+      shadow.rotation.x = -Math.PI/2; shadow.position.y = 0.01;
+      group.add(shadow);
+      /* Label sprite with ID + distance */
+      var label = makePersonLabel(t.i, dist, PC[t.i % PC.length]);
+      group.add(label);
+      group.userData = {label: label};
+      group.position.copy(pos);
+      threeScene.add(group);
+      threePersonMeshes[t.i] = group;
+    } else {
+      /* Update label text every 30 frames */
+      if (!mesh.userData._frameCnt) mesh.userData._frameCnt = 0;
+      mesh.userData._frameCnt++;
+      if (mesh.userData._frameCnt % 30 === 0) {
+        var lbl = mesh.userData && mesh.userData.label;
+        if (lbl && Math.abs((mesh.userData._lastDist||0) - dist) > 0.3) {
+          /* Redraw on the existing canvas — no new texture allocation */
+          var texCanvas = lbl.material.map.image;
+          if (texCanvas) {
+            var tctx = texCanvas.getContext('2d');
+            tctx.clearRect(0, 0, texCanvas.width, texCanvas.height);
+            tctx.fillStyle = 'rgba(0,0,0,0.65)';
+            var r2 = 22;
+            tctx.beginPath();
+            tctx.moveTo(18+r2,10); tctx.lineTo(238-r2,10);
+            tctx.arcTo(238,10,238,10+r2,r2); tctx.lineTo(238,54-r2);
+            tctx.arcTo(238,54,238-r2,54,r2); tctx.lineTo(18+r2,54);
+            tctx.arcTo(18,54,18,54-r2,r2); tctx.lineTo(18,10+r2);
+            tctx.arcTo(18,10,18+r2,10,r2); tctx.closePath();
+            tctx.fill();
+            tctx.fillStyle = PC[t.i % PC.length]; tctx.font = 'bold 20px system-ui,sans-serif';
+            tctx.fillText('#'+t.i, 32, 40);
+            tctx.fillStyle = '#fff'; tctx.font = '16px system-ui,sans-serif';
+            tctx.fillText(dist.toFixed(1)+'m', 98, 40);
+            lbl.material.map.needsUpdate = true;
+          }
+          mesh.userData._lastDist = dist;
+        }
+      }
+    }
+
+    threePersonMeshes[t.i].position.lerp(pos, 0.3);
+
+    var trailData = threePersonTrails[t.i];
+    if (!trailData) { trailData = {points: []}; threePersonTrails[t.i] = trailData; }
+    trailData.points.push(pos.clone());
+    if (trailData.points.length > 60) trailData.points.shift();
+    if (trailData.points.length > 1) {
+      if (!trailData.line) {
+        var trailGeo = new THREE.BufferGeometry().setFromPoints(trailData.points);
+        trailData.line = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.5}));
+        threeScene.add(trailData.line);
+      } else {
+        /* Update existing geometry — much cheaper than recreating */
+        var posAttr = trailData.line.geometry.getAttribute('position');
+        if (posAttr && posAttr.count !== trailData.points.length) {
+          trailData.line.geometry.dispose();
+          trailData.line.geometry = new THREE.BufferGeometry().setFromPoints(trailData.points);
+        } else if (posAttr) {
+          for (var pi2 = 0; pi2 < trailData.points.length; pi2++) {
+            posAttr.setXYZ(pi2, trailData.points[pi2].x, trailData.points[pi2].y, trailData.points[pi2].z);
+          }
+          posAttr.needsUpdate = true;
+        }
+      }
+    }
+  }
+
+  var seen = {};
+  for (var j = 0; j < trks.length; j++) { if (trks[j].p) seen[trks[j].i] = true; }
+  Object.keys(threePersonMeshes).forEach(function(id){
+    if (!seen[+id]) {
+      var mesh = threePersonMeshes[+id];
+      threeScene.remove(mesh);
+      mesh.traverse(function(child){ if (child.geometry) child.geometry.dispose(); if (child.material) child.material.dispose(); });
+      delete threePersonMeshes[+id];
+      var td = threePersonTrails[+id];
+      if (td && td.line) { threeScene.remove(td.line); td.line.geometry.dispose(); td.line.material.dispose(); }
+      delete threePersonTrails[+id];
+    }
+  });
+
+  D['map-info'].textContent = 'K1 原点 · 追踪 '+activeCount+' 人';
+  if (D['map-count']) D['map-count'].textContent = activeCount > 0 ? activeCount : '';
+}
+
+function start3DRenderLoop() {
+  if (threeAnimId) cancelAnimationFrame(threeAnimId);
+  function loop() {
+    if (currentTab !== 'map' || !threeReady || !threeRenderer) { threeAnimId = null; return; }
+    if (threeControls) threeControls.update();
+    threeRenderer.render(threeScene, threeCamera);
+    threeAnimId = requestAnimationFrame(loop);
+  }
+  loop();
+}
+
+function resizeMap() {
+  if (mapMode === '3d' && threeRenderer && threeCamera) {
+    var wrap = D['mc-wrap'] || document.getElementById('mc-wrap');
+    var W = wrap.clientWidth, H = wrap.clientHeight;
+    if (W > 0 && H > 0) { threeRenderer.setSize(W, H); threeCamera.aspect = W/H; threeCamera.updateProjectionMatrix(); }
+  }
+}
+
+/* ═══════════════════════ 配置面板 ═══════════════════════ */
+var ConfigPanel = {
+  dirty: {},
+  modelsCache: null,
+  showAdvanced: false,
+
+  QUICK_KEYS: {
+    'visualization.record_to_video':    '保存视频',
+    'visualization.video_output_path':  '视频输出路径',
+    'video.output_path':               '离线输出路径',
+    'video.camera_device':             '摄像头设备',
+    'video.camera_width':              '摄像头宽度',
+    'video.camera_height':             '摄像头高度',
+    'system.log_level':                '日志级别',
+    'detection.confidence_threshold':  '检测置信度',
+    'detection.model_path':            '检测模型',
+    'pose.model_variant':              '姿态模型',
+    'face.detection_model_path':       '人脸检测模型',
+    'face.recognition_model_path':     '人脸识别模型',
+    'action.model_path':               '动作识别模型',
+    'coap.esp_ip':                     'ESP32 IP 地址',
+    'coap.wifi_ssid':                  'WiFi 名称',
+    'video.save_frame_interval':       '保存帧间隔',
+    'system.target_fps':               '目标帧率',
+  },
+
+  makeRow: function(fullKey, label, val) {
+    var self = this;
+    var key = fullKey.split('.').pop();
+    var labelHtml = '<span class="cfg-label">'+label+' <code>'+self.esc(key)+'</code></span>';
+    var controlHtml = '';
+
+    if (typeof val === 'boolean') {
+      controlHtml = '<label class="tgl"><input type="checkbox" data-key="'+self.esc(fullKey)+'" data-type="bool" '+(val?'checked':'')+' onchange="ConfigPanel.onChange(this)"><span class="slider"></span></label>';
+    } else if (typeof val === 'number' && val >= 0 && val <= 1 && (key.indexOf('threshold')>=0||key.indexOf('confidence')>=0||key.indexOf('alpha')>=0||key.indexOf('iou')>=0)) {
+      controlHtml = '<input type="range" min="0" max="1" step="0.01" value="'+val+'" data-key="'+self.esc(fullKey)+'" data-type="float" oninput="ConfigPanel.onRange(this)"><span class="range-val">'+Number(val).toFixed(2)+'</span>';
+    } else if (typeof val === 'number') {
+      controlHtml = '<input type="number" value="'+val+'" data-key="'+self.esc(fullKey)+'" data-type="'+(Number.isInteger(val)?'int':'float')+'" onchange="ConfigPanel.onChange(this)">';
+    } else if (typeof val === 'string') {
+      if (key.indexOf('model_path')>=0 || key.indexOf('_variant')>=0) {
+        controlHtml = '<select class="cfg-model-select" data-key="'+self.esc(fullKey)+'" data-type="string" onchange="ConfigPanel.onChange(this)"><option value="'+self.esc(String(val))+'">'+self.esc(String(val))+'</option></select>';
+      } else {
+        controlHtml = '<input type="text" value="'+self.esc(String(val))+'" data-key="'+self.esc(fullKey)+'" data-type="string" onchange="ConfigPanel.onChange(this)">';
+      }
+    } else {
+      controlHtml = '<input type="text" value="'+self.esc(String(val))+'" data-key="'+self.esc(fullKey)+'" data-type="string" onchange="ConfigPanel.onChange(this)">';
+    }
+    return '<div class="cfg-row" id="cfg-row-'+self.esc(fullKey).replace(/\./g,'-')+'">'+labelHtml+'<div class="cfg-control" style="display:flex;align-items:center;gap:8px">'+controlHtml+'</div></div>';
+  },
+
+  render: function() {
+    if (!fullCfg || Object.keys(fullCfg).length === 0) {
+      D['cfg-ct'].innerHTML = '<p style="color:#555;padding:40px;text-align:center">等待配置加载…<br><small>请先连接 WebSocket</small></p>';
+      return;
+    }
+    fullCfg._rendered = true;
+    var html = '';
+    var self = this;
+
+    html += '<div style="display:flex;align-items:center;gap:16px;margin-bottom:20px;padding:16px 20px;background:#fff;border-radius:10px;border:1px solid #F0EAE2;font-size:12px;color:#333">';
+    html += '<span style="font-weight:600;color:#111">操作流程:</span>';
+    html += '<span style="display:flex;align-items:center;gap:6px"><b style="color:#5B8C7A;font-size:14px">1</b>修改参数</span>';
+    html += '<span style="color:#E5DDD2">→</span>';
+    html += '<span style="display:flex;align-items:center;gap:6px"><b style="color:#5B8C7A;font-size:14px">2</b>保存配置</span>';
+    html += '<span style="color:#E5DDD2">→</span>';
+    html += '<span style="display:flex;align-items:center;gap:6px"><b style="color:#C49A6C;font-size:14px">3</b>启动管线</span>';
+    html += '</div>';
+
+    html += '<div class="cfg-section" style="border-left:3px solid #5B8C7A">';
+    html += '<h4>快速设置</h4>';
+
+    var foundQuick = false;
+    var quickOrder = Object.keys(this.QUICK_KEYS);
+    for (var qi = 0; qi < quickOrder.length; qi++) {
+      var qk = quickOrder[qi];
+      var parts = qk.split('.');
+      var sec = parts[0], k = parts.slice(1).join('.');
+      if (fullCfg[sec] && fullCfg[sec].hasOwnProperty(k)) {
+        html += this.makeRow(qk, this.QUICK_KEYS[qk], fullCfg[sec][k]);
+        foundQuick = true;
+      }
+    }
+    if (!foundQuick) {
+      html += '<p style="color:#555;font-size:11px;padding:8px 0">未找到快速设置项，请连接后重试</p>';
+    }
+    html += '</div>';
+
+
+    html += '<div id="cfg-advanced" style="display:block">';
+    Object.keys(fullCfg).forEach(function(section){
+      var entries = fullCfg[section];
+      if (!entries || typeof entries !== 'object') return;
+      html += '<div class="cfg-section"><h4>'+self.esc(section)+'</h4>';
+      Object.keys(entries).forEach(function(key){
+        var fullKey = section+'.'+key;
+        if (self.QUICK_KEYS[fullKey]) return;
+        html += self.makeRow(fullKey, '<code>'+self.esc(key)+'</code>', entries[key]);
+      });
+      html += '</div>';
+    });
+    html += '</div>';
+
+    D['cfg-ct'].innerHTML = html;
+    D['cfg-actions'].style.display = 'flex';
+    this.dirty = {};
+    if (D['cfg-status']) D['cfg-status'].textContent = '';
+    this.fetchModels();
+  },
+
+  toggleAdvanced: function() {
+    this.showAdvanced = !this.showAdvanced;
+    this.render();
+  },
+
+  esc: function(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); },
+
+  onChange: function(el) {
+    var key = el.dataset.key;
+    if (!key) return;
+    this.dirty[key] = true;
+    var row = document.getElementById('cfg-row-'+key.replace(/\./g,'-'));
+    if (row) row.classList.add('cfg-dirty');
+    if (D['cfg-status']) D['cfg-status'].textContent = Object.keys(this.dirty).length+' 项待保存';
+  },
+
+  onRange: function(el) {
+    var disp = el.nextElementSibling;
+    if (disp) disp.textContent = parseFloat(el.value).toFixed(2);
+    this.onChange(el);
+  },
+
+  fetchModels: function() {
+    var self = this;
+    if (this.modelsCache) { self._populateSelects(); return; }
+    fetch('/api/models')
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        self.modelsCache = data.models || [];
+        self._populateSelects();
+      })
+      .catch(function(){});
+  },
+
+  _populateSelects: function() {
+    if (!this.modelsCache || !this.modelsCache.length) return;
+    var esc = this.esc;
+    var opts = this.modelsCache.map(function(m){
+      return '<option value="'+esc(m.path)+'">'+esc(m.name)+' ('+esc(m.type)+')</option>';
+    }).join('');
+    document.querySelectorAll('select.cfg-model-select').forEach(function(sel){
+      var cur = sel.value;
+      sel.innerHTML = '<option value="">-- 请选择 --</option>' + opts;
+      if (cur) sel.value = cur;
+    });
+  },
+
+  save: function() {
+    var self = this;
+    var keys = Object.keys(this.dirty);
+    if (!keys.length) {
+      if (D['cfg-status']) D['cfg-status'].textContent = '无变更';
+      return Promise.resolve();
+    }
+    if (D['cfg-status']) D['cfg-status'].textContent = '正在保存 '+keys.length+' 项变更...';
+
+    function sendOne(i) {
+      if (i >= keys.length) {
+        if (D['cfg-status']) D['cfg-status'].textContent = '已保存!';
+        self.dirty = {};
+        document.querySelectorAll('.cfg-dirty').forEach(function(r){ r.classList.remove('cfg-dirty'); });
+        return Promise.resolve();
+      }
+      var key = keys[i];
+      var el = document.querySelector('[data-key="'+key.replace(/"/g,'\\"')+'"]');
+      if (!el) return sendOne(i+1);
+      var rawVal = (el.type === 'checkbox') ? el.checked : el.value;
+      var val;
+      if (typeof rawVal === 'boolean') { val = rawVal; }
+      else if (el.dataset.type === 'int') { val = parseInt(rawVal, 10) || 0; }
+      else if (el.dataset.type === 'float') { val = parseFloat(rawVal) || 0.0; }
+      else { val = rawVal; }
+      if (WS.ws && WS.ws.readyState === WebSocket.OPEN) {
+        WS.ws.send(JSON.stringify({cmd:'set_config', id:'cfg-'+Date.now(), key:key, value:val}));
+      }
+      setTimeout(function(){ sendOne(i+1); }, 80);
+    }
+    return sendOne(0);
+  }
+};
+
+/* ═══════════════════════ WebSocket ═══════════════════════ */
+var WS = {
+  ws: null,
+
+  connect: function() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var url = proto + '//' + location.host + '/ws';
+    log('正在连接 '+url+'...', 'b');
+    try {
+      this.ws = new WebSocket(url);
+      this.ws.binaryType = 'arraybuffer';
+      this.ws.onopen = this._onOpen.bind(this);
+      this.ws.onmessage = this._onMessage.bind(this);
+      this.ws.onclose = this._onClose.bind(this);
+      this.ws.onerror = function(){ log('WebSocket 错误', 'e'); };
+    } catch(e) {
+      log('WebSocket 连接失败: '+e.message, 'e');
+      setTimeout(function(){ WS.connect(); }, 3000);
+    }
+  },
+
+  _onOpen: function() {
+    setConnected(true);
+    log('WebSocket 已连接', 'g');
+    this.send('get_status');
+    this.send('get_config');
+  },
+
+  _onClose: function() {
+    setConnected(false);
+    setState('idle');
+    log('WebSocket 已断开，3秒后重连...', 'w');
+    setTimeout(function(){ WS.connect(); }, 3000);
+  },
+
+  _onMessage: function(ev) {
+    if (ev.data instanceof ArrayBuffer) {
+      var buf = new Uint8Array(ev.data);
+      if (buf.length >= 4 && buf[0] === 0x4A && buf[1] === 0x50) {
+        var jpeg = new Blob([buf.slice(4)], {type: 'image/jpeg'});
+        var url = URL.createObjectURL(jpeg);
+        var old = D.vid.src;
+        D.vid.src = url;
+        D.vid.style.display = 'block';
+        D.ph.style.display = 'none';
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+      }
+      return;
+    }
+
+    var msg;
+    try { msg = JSON.parse(ev.data); }
+    catch(e) { log('JSON 解析错误: '+e.message, 'e'); return; }
+
+    switch (msg.type) {
+    case 'hello':
+      log('服务器: '+msg.platform+' v'+msg.version, 'b');
+      break;
+
+    case 'f':
+      lastFrame = msg;
+      svFps.textContent = msg.f || '--';
+      svFrame.textContent = msg.n || 0;
+      svTracks.textContent = msg.t ? msg.t.length : 0;
+      svDets.textContent = msg.d ? msg.d.length : 0;
+      svAction.textContent = msg.a ? msg.a[0] : '--';
+      if (connStart) {
+        var up = Math.floor((Date.now()-connStart)/1000);
+        svUptime.textContent = (up>=60?Math.floor(up/60)+'分':'')+(up%60)+'秒';
+      }
+
+      if (msg.j) {
+        D.vid.src = 'data:image/jpeg;base64,'+msg.j;
+        D.vid.style.display = 'block';
+        D.ph.style.display = 'none';
+      }
+
+      if (currentTab === 'cam') renderOvl(msg);
+      if (currentTab === 'map') {
+        if (mapMode === '3d' && threeReady) update3DMap(msg);
+        else render2DMap(msg);
+      }
+      break;
+
+    case 'response':
+      if (msg.data) {
+        var keys = Object.keys(msg.data);
+        var isFull = false;
+        for (var k = 0; k < keys.length; k++) {
+          if (msg.data[keys[k]] && typeof msg.data[keys[k]] === 'object') { isFull = true; break; }
+        }
+        if (isFull) {
+          fullCfg = msg.data;
+          fullCfg._rendered = false;
+          log('配置已加载 ('+JSON.stringify(msg.data).length+' 字节)', 'b');
+          ConfigPanel.render(); /* always render when config arrives */
+        }
+      }
+      break;
+
+    case 'event':
+      if (msg.event === 'pipeline_status' && msg.data) {
+        setState(msg.data.state);
+        if (msg.data.frame_count) svFrame.textContent = msg.data.frame_count;
+      }
+      break;
+    }
+  },
+
+  send: function(cmd, data) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { log('WebSocket 未连接', 'w'); return; }
+    var m = {cmd: cmd, id: cmd+'-'+Date.now()};
+    if (data) Object.assign(m, data);
+    this.ws.send(JSON.stringify(m));
+  }
+};
+
+/* ── 初始化 ── */
+D.vid.onerror = function(){ D.vid.style.display='none'; D.ph.style.display=''; };
+D.vid.onload  = function(){
+  D.ph.style.display = 'none';
+  alignOverlay();
+  if (lastFrame) renderOvl(lastFrame);
+};
+D.b1.onclick = function(){ WS.send('start_pipeline'); };
+D.b2.onclick = function(){ WS.send('stop_pipeline'); };
+D.b3.onclick = function(){ WS.send('restart_pipeline'); };
+D.b4.onclick = function(){ WS.send('reset_world_origin'); };
+D['cfg-save'].onclick = function(){ ConfigPanel.save(); };
+D['cfg-start'].onclick = function(){ ConfigPanel.save().then(function(){ WS.send('start_pipeline'); }); };
+
+window.addEventListener('resize', function(){
+  if (currentTab === 'cam') alignOverlay();
+  if (currentTab === 'map') resizeMap();
+});
+
+WS.connect();
+log('界面初始化完成', 'b');
+
+var _threePoll = 0;
+function _tryInit3D() {
+  _threePoll++;
+  if (window.__threeReady && typeof THREE !== 'undefined') {
+    init3DMap();
+    log('3D 地图已激活', 'g');
+  } else if (_threePoll < 30) {
+    setTimeout(_tryInit3D, 100);
+  } else {
+    log('Three.js 不可用，使用 2D 地图', 'w');
+  }
+}
+_tryInit3D();
+
+})();
+</script>
+</body>
+</html>

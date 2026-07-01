@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 /* ── Track capacity ── */
-#define TRACKING_MAX_TRACKS             256
-#define TRACKING_MAX_TRAJECTORY         300
+#define TRACKING_MAX_TRACKS             64
+#define TRACKING_MAX_TRAJECTORY         120
 
 /* ── Confirmation ──
  * REDUCED from 5 to 3: 5 consecutive hits at 3.5 FPS = 1.4s delay before
@@ -40,9 +40,12 @@ extern "C" {
 /* ── Appearance feature matching ── */
 #define TRACKING_APPEARANCE_DIM         12     /* pose-keypoint-derived compact descriptor */
 #define TRACKING_APPEARANCE_MAX_GALLERY 50     /* max stored features per track */
-#define TRACKING_APPEARANCE_WEIGHT      0.35f  /* weight of appearance vs IoU in combined cost */
-#define TRACKING_APPEARANCE_MAX_DIST    0.50f  /* cosine distance gate for appearance matching */
-#define TRACKING_APPEARANCE_MIN_KPTS    5      /* minimum valid keypoints to compute appearance */
+#define TRACKING_APPEARANCE_WEIGHT      0.0f   /* DISABLED: no consistent ReID feature extractor.
+                                                  Detection features (4D geometric) and track features
+                                                  (12D pose ratios) are in incompatible spaces.
+                                                  Use IoU-only matching per ByteTrack standard. */
+#define TRACKING_APPEARANCE_MAX_DIST    0.50f  /* cosine distance gate (unused when weight=0) */
+#define TRACKING_APPEARANCE_MIN_KPTS    5      /* minimum valid keypoints (unused when weight=0) */
 
 /* ── Cascade matching ── */
 #define TRACKING_CASCADE_MAX_AGE        30     /* max frames since last update for cascade levels */
@@ -60,7 +63,7 @@ extern "C" {
 #define TRACKING_MAX_DET_TO_TRACK_RATIO 2.0f   /* if dets >> tracks, likely new people → run secondary */
 
 /* ── Hungarian algorithm ── */
-#define HUNGARIAN_MAX_DIM               256    /* max dimension of cost matrix */
+#define HUNGARIAN_MAX_DIM               128    /* max dimension of cost matrix */
 
 /* ── Hungarian workspace (pre-allocated, eliminates per-frame malloc/free) ── */
 typedef struct {
@@ -203,11 +206,14 @@ typedef struct {
 ObjectTracker* object_tracker_create(int max_lost, float min_iou, float max_distance, int max_traj_len);
 void object_tracker_destroy(ObjectTracker* tracker);
 
-/* ── Core update (main entry point) ── */
-TrackingResult object_tracker_update(ObjectTracker* tracker,
-                                      const Detection* detections, int num_detections,
-                                      const SpatialPosition* positions, int num_positions,
-                                      int frame_num);
+/* ── Core update (main entry point) ──
+ * out_result must be pre-allocated (caller-owned, heap preferred — caller
+ * reuses the same buffer across frames to avoid per-frame malloc/free). */
+void object_tracker_update(ObjectTracker* tracker,
+                           const Detection* detections, int num_detections,
+                           const SpatialPosition* positions, int num_positions,
+                           int frame_num,
+                           TrackingResult* out_result);
 
 /* ── Post-update: associate poses with tracked objects (call externally) ── */
 void object_tracker_associate_poses(ObjectTracker* tracker,

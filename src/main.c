@@ -1,261 +1,329 @@
+/*
+ * main.c — LingQi TanTong CLI
+ *
+ * CLI UI is built on terminal_ui.h semantic primitives:
+ *   - Automatic TTY/CI/pipe detection (NO_COLOR, CI env, isatty)
+ *   - 3 output modes: HUMAN (color+Unicode), PLAIN (ASCII), MACHINE (JSON Lines)
+ *   - Checklist spinner for model loading / pipeline init
+ *   - Status line for realtime mode
+ *   - Progress bar for offline video processing
+ */
 #include "system_controller.h"
+#include "pipeline_state.h"
+#include "web_server.h"
 #include "logger.h"
+#include "terminal_ui.h"
 #include "k1_platform.h"
+#include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
 
-static volatile sig_atomic_t g_running_flag = 1;
+static volatile sig_atomic_t g_run = 1;
 static SystemController* g_sc = NULL;
+static WebServer*        g_ws = NULL;    /* Web UI server (--web) */
 
-/*
- * Signal handler with two-stage shutdown.
- *
- * First  signal (Ctrl+C):  set g_running_flag=0 for graceful shutdown.
- *                          Main loop checks sc->running at top of each frame
- *                          and will exit cleanly after current inference completes.
- * Second signal:           _exit(1) immediately — no cleanup, no flushing.
- *                          Use when ORT inference is stuck for 4+ seconds.
- *
- * All functions used are async-signal-safe: write(), _exit().
- */
-static void signal_handler(int sig) {
+/* ── Progress callback (offline video mode) ───────────────────────
+ * Wraps the old per-frame callback into tui_progress.
+ * Created lazily on first frame, destroyed on completion. */
+static TuiProgress* g_prog = NULL;
+
+static void progress_cb(int frame, int total, float fps, float proc_ms,
+                         const char* state, int dets) {
+    if (!g_prog && total > 0) {
+        g_prog = tui_progress_start("Processing video", total);
+    }
+    if (g_prog) {
+        /* Tick the delta from last frame.  tui_progress_tick clamps internally. */
+        static int last_frame = 0;
+        int delta = frame - last_frame;
+        if (delta > 0) tui_progress_tick(g_prog, delta);
+        last_frame = frame;
+    }
+    (void)fps; (void)proc_ms; (void)state; (void)dets;
+}
+
+/* ── Hardware info display ── */
+static void show_hardware(void) {
+    K1Platform* p = k1_platform_init();
+    if (!p) return;
+
+    tui_section("Hardware");
+    tui_keyval("Platform", "%s", k1_platform_is_k1() ? "K1 (SpacemiT)" : "Generic");
+    tui_keyval("CPU Cores", "%d (Cluster0:4 AI + Cluster1:4 I/O)", k1_platform_cpu_count());
+    tui_keyval("RVV 1.0", "%s", k1_platform_has_cap(K1_CAP_RVV_1_0) ? "YES" : "NO");
+    tui_keyval("SpacemiT EP", "%s", k1_platform_has_cap(K1_CAP_SPACEMIT_EP) ? "INT8 NPU" : "CPU only");
+    tui_keyval("VPU (H.265)", "%s", k1_platform_has_cap(K1_CAP_VPU) ? "YES" : "NO");
+    tui_keyval("JPU (JPEG)", "%s", k1_platform_has_cap(K1_CAP_JPU) ? "YES" : "NO");
+    tui_keyval("TCM", "%d KB shared", k1_platform_get_tcm_size());
+    tui_blank();
+}
+
+/* ── Signal handler ── */
+static void on_signal(int sig) {
     (void)sig;
-    static volatile sig_atomic_t count = 0;
-    count++;
-
-    if (count == 1) {
-        const char msg[] = "\nShutting down... (Ctrl+C again to force quit)\n";
-        (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        g_running_flag = 0;
+    static volatile sig_atomic_t n = 0;
+    n++;
+    if (n == 1) {
+        write(STDERR_FILENO, "\nShutting down... (Ctrl+C again to force quit)\n", 50);
+        g_run = 0;
         if (g_sc) {
             g_sc->running = 0;
+            /* In GUI mode, also transition state machine to stop */
+            psm_transition(&g_sc->state_machine, PIPELINE_STATE_STOPPING,
+                           "SIGINT received");
         }
     } else {
         _exit(1);
     }
 }
 
-static void print_usage(const char* program_name) {
-    printf("LingQi TanTong - SpacemiT K1 Muse Pi Pro\n\n");
-    printf("Usage: %s [options]\n\n", program_name);
+static LogLevel parse_lv(const char* s) {
+    if (!s) return LOG_LV_INFO;
+    if (strcasecmp(s, "trace") == 0) return LOG_LV_TRACE;
+    if (strcasecmp(s, "debug") == 0) return LOG_LV_DEBUG;
+    if (strcasecmp(s, "info")  == 0) return LOG_LV_INFO;
+    if (strcasecmp(s, "warn")  == 0) return LOG_LV_WARN;
+    if (strcasecmp(s, "error") == 0) return LOG_LV_ERROR;
+    return LOG_LV_INFO;
+}
+
+/* ── Usage ── */
+static void usage(const char* p) {
+    printf("LingQi TanTong -- Edge AI Inference Pipeline\n\n");
+    printf("Usage: %s [OPTIONS]\n\n", p);
+    printf("Without arguments, starts in GUI mode with embedded Web UI.\n");
+    printf("Open http://localhost:8080 in a browser to control the pipeline.\n\n");
+    printf("Modes:\n");
+    printf("  --realtime           K1 dual-cluster realtime pipeline (CLI mode)\n");
+    printf("  --video PATH         Offline video file processing (CLI mode)\n\n");
     printf("Options:\n");
-    printf("  --video_path <path>         Input video file (offline mode)\n");
-    printf("  --output_path <path>        Output directory (default: output)\n");
-    printf("  --max-frames <N>            Max frames to process (0=unlimited, works for all modes)\n");
-    printf("  --save_frame_interval <N>   Save frame every N frames (default: 10)\n");
-    printf("  --config <path>             Configuration YAML file\n");
-    printf("  --realtime                  Real-time pipeline mode (Muse Pi Pro)\n");
-    printf("  --camera <path>             Camera device (default: /dev/video0)\n");
-    printf("  --display                   Enable framebuffer display (/dev/fb0)\n");
-    printf("  --display-device <path>     Framebuffer device (default: /dev/fb0)\n");
-    printf("  --rtsp <url>                RTSP streaming (e.g. rtsp://0.0.0.0:8554/live)\n");
-    printf("  --udp-stream <addr>         UDP MPEG-TS streaming (e.g. udp://192.168.1.100:1234)\n");
-    printf("  --rtmp <url>                RTMP streaming\n");
-    printf("  --save-video                Save output to MP4 video file\n");
-    printf("  --frame-timeout <S>         Auto-exit after S seconds of no frames (default: 10)\n");
-    printf("  --coap                      Enable CoAP/UDP receiver (ESP32 WiFi)\n");
-    printf("  --coap-ip <ip>              ESP32 IP address (default: 192.168.4.1)\n");
-    printf("  --coap-port <port>          CoAP/UDP port (default: 5683)\n");
-    printf("  --wifi-ssid <ssid>          WiFi SSID to connect (default: ESP32-Camera-AP)\n");
-    printf("  --wifi-password <pw>        WiFi password (default: 12345678)\n");
-    printf("  --help                      Show this help\n");
-    printf("\nExamples:\n");
-    printf("  # CoAP/UDP WiFi receiver (ESP32 camera):\n");
-    printf("  %s --realtime --coap --display\n", program_name);
-    printf("  %s --realtime --coap --rtsp rtsp://0.0.0.0:8554/live --display\n", program_name);
-    printf("  # Offline video processing:\n");
-    printf("  %s --video_path test.mp4 --save_frame_interval 1\n", program_name);
-    printf("  %s --video_path test.mp4 --max-frames 100\n", program_name);
+    printf("  --web [PORT]         Web UI port (default: 8080, implied in GUI mode)\n");
+    printf("  --config PATH        YAML config (default: configs/default.yaml)\n");
+    printf("  --output PATH        Output directory (default: output)\n");
+    printf("  --max-frames N       Frame limit (0 = unlimited)\n");
+    printf("  --save-interval N    Save frame every N frames\n");
+    printf("  --pose-model NAME    yolov8n-pose | yolo11n-pose\n");
+    printf("  --camera DEV         Camera device (default: /dev/video1)\n");
+    printf("  --log-level LVL      trace | debug | info | warn | error\n");
+    printf("  --json               Machine-readable JSON Lines output\n");
+    printf("  --quiet              Minimal output (equivalent to NO_COLOR=1)\n\n");
+    printf("CoAP/UDP (ESP32 WiFi):\n");
+    printf("  --coap               Enable CoAP/UDP receiver\n");
+    printf("  --coap-ip IP         ESP32 IP (default: 192.168.4.1)\n");
+    printf("  --coap-port PORT     CoAP port (default: 5683)\n");
+    printf("  --wifi-ssid SSID     WiFi SSID to connect\n");
+    printf("  --wifi-password PW   WiFi password\n");
+    printf("  --save-video         Save output to MP4 video file\n");
+    printf("Examples:\n");
+    printf("  %s                               (GUI mode — browser control)\n", p);
+    printf("  %s --web 9000                    (GUI mode on custom port)\n", p);
+    printf("  %s --realtime --coap             (CLI mode)\n", p);
+    printf("  %s --video test.mp4 --max-frames 100  (CLI mode)\n", p);
 }
 
 int main(int argc, char* argv[]) {
-    const char* video_path = "test.mp4";
-    const char* output_path = "output/results";
-    const char* config_path = "configs/default.yaml";
-    const char* camera_dev = "/dev/video0";
-    int save_frame_interval = 0;  /* 0 = use config value */
-    bool realtime_mode = false;
-
-    /* Display / streaming options (override config) */
-    bool cli_display_enabled = false;
-    const char* cli_display_device = NULL;
-    bool cli_stream_enabled = false;
-    const char* cli_stream_url = NULL;
-    bool cli_save_video = false;
-    int cli_max_frames = 0;
-    int cli_frame_timeout = 0;
-
-    /* CoAP receiver CLI overrides */
-    bool cli_coap_enabled = false;
-    const char* cli_coap_ip = NULL;
-    int  cli_coap_port = 0;
-    const char* cli_wifi_ssid = NULL;
-    const char* cli_wifi_password = NULL;
+    const char* video    = NULL;
+    const char* output   = "output";
+    const char* config   = "configs/default.yaml";
+    const char* camera   = "/dev/video1";
+    const char* lv_str   = "info";
+    int max_f = 0, save_i = 0;
+    bool rt = false, coap = false;
+    const char* coap_ip  = NULL;
+    int coap_port = 0;
+    const char* wifi_ss = NULL, *wifi_pw = NULL, *pm = NULL;
+    bool save_video = false;
+    bool json_mode = false;
+    bool quiet_mode = false;
+    int  web_port  = 0;        /* --web [PORT]  */
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        } else if (strcmp(argv[i], "--realtime") == 0) {
-            realtime_mode = true;
-        } else if (strcmp(argv[i], "--video_path") == 0 && i + 1 < argc) {
-            video_path = argv[++i];
-        } else if (strcmp(argv[i], "--output_path") == 0 && i + 1 < argc) {
-            output_path = argv[++i];
-        } else if (strcmp(argv[i], "--max_frames") == 0 && i + 1 < argc) {
-            cli_max_frames = atoi(argv[++i]);  /* also accept underscore variant */
-        } else if (strcmp(argv[i], "--save_frame_interval") == 0 && i + 1 < argc) {
-            save_frame_interval = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-            config_path = argv[++i];
-        } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
-            camera_dev = argv[++i];
-        } else if (strcmp(argv[i], "--display") == 0) {
-            cli_display_enabled = true;
-        } else if (strcmp(argv[i], "--display-device") == 0 && i + 1 < argc) {
-            cli_display_device = argv[++i];
-        } else if (strcmp(argv[i], "--rtsp") == 0 && i + 1 < argc) {
-            cli_stream_enabled = true;
-            cli_stream_url = argv[++i];
-        } else if (strcmp(argv[i], "--udp-stream") == 0 && i + 1 < argc) {
-            cli_stream_enabled = true;
-            cli_stream_url = argv[++i];
-        } else if (strcmp(argv[i], "--rtmp") == 0 && i + 1 < argc) {
-            cli_stream_enabled = true;
-            cli_stream_url = argv[++i];
-        } else if (strcmp(argv[i], "--save-video") == 0) {
-            cli_save_video = true;
-        } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
-            cli_max_frames = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--frame-timeout") == 0 && i + 1 < argc) {
-            cli_frame_timeout = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--coap") == 0) {
-            cli_coap_enabled = true;
-        } else if (strcmp(argv[i], "--coap-ip") == 0 && i + 1 < argc) {
-            cli_coap_ip = argv[++i];
-        } else if (strcmp(argv[i], "--coap-port") == 0 && i + 1 < argc) {
-            cli_coap_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--wifi-ssid") == 0 && i + 1 < argc) {
-            cli_wifi_ssid = argv[++i];
-        } else if (strcmp(argv[i], "--wifi-password") == 0 && i + 1 < argc) {
-            cli_wifi_password = argv[++i];
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
+        else if (!strcmp(argv[i], "--realtime")) rt = true;
+        else if (!strcmp(argv[i], "--video") && i+1<argc) video = argv[++i];
+        else if (!strcmp(argv[i], "--output") && i+1<argc) output = argv[++i];
+        else if (!strcmp(argv[i], "--config") && i+1<argc) config = argv[++i];
+        else if (!strcmp(argv[i], "--camera") && i+1<argc) camera = argv[++i];
+        else if (!strcmp(argv[i], "--max-frames") && i+1<argc) max_f = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--save-interval") && i+1<argc) save_i = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--log-level") && i+1<argc) lv_str = argv[++i];
+        else if (!strcmp(argv[i], "--pose-model") && i+1<argc) pm = argv[++i];
+        else if (!strcmp(argv[i], "--coap")) coap = true;
+        else if (!strcmp(argv[i], "--coap-ip") && i+1<argc) coap_ip = argv[++i];
+        else if (!strcmp(argv[i], "--coap-port") && i+1<argc) coap_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--wifi-ssid") && i+1<argc) wifi_ss = argv[++i];
+        else if (!strcmp(argv[i], "--wifi-password") && i+1<argc) wifi_pw = argv[++i];
+        else if (!strcmp(argv[i], "--save-video")) save_video = true;
+        else if (!strcmp(argv[i], "--json"))  json_mode = true;
+        else if (!strcmp(argv[i], "--quiet")) quiet_mode = true;
+        else if (!strcmp(argv[i], "--web")) {
+            web_port = 8080;  /* default */
+            if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
+                web_port = atoi(argv[++i]);
+        }
+        else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
+    }
+
+    /* ── Init terminal UI (auto-detect mode, respect --json / --quiet) ── */
+    if (json_mode) {
+        tui_init(TUI_MACHINE);
+    } else if (quiet_mode) {
+        tui_init(TUI_PLAIN);
+    } else {
+        tui_init(TUI_AUTO);
+    }
+
+    mkdir("logs", 0755);
+    log_init("logs/system.log", parse_lv(lv_str));
+    log_set_format(LOG_FMT_JSON);
+    log_install_signal_handlers();
+
+    /* ── Banner ── */
+    tui_banner("LingQi TanTong", "Edge AI Pipeline — SpacemiT K1 Muse Pi Pro");
+
+    /* ── Hardware ── */
+    show_hardware();
+
+    /* ── Configuration ── */
+    tui_section("Configuration");
+    bool gui_mode = (!rt && !video);  /* default: GUI mode with web UI */
+    if (gui_mode) {
+        tui_ok("Mode: GUI (Web UI)");
+        if (web_port <= 0) web_port = 8080;
+        tui_keyval("Web UI port", "%d", web_port);
+    } else if (rt) {
+        tui_ok("Mode: REALTIME (CLI)");
+        tui_keyval("Camera", "%s", camera);
+    } else {
+        tui_ok("Mode: OFFLINE (CLI)");
+        tui_keyval("Input", "%s", video);
+        tui_keyval("Max frames", "%d", max_f);
+    }
+    tui_keyval("Config", "%s", config);
+    tui_keyval("Output", "%s", output);
+    tui_keyval("Log level", "%s", lv_str);
+    tui_keyval("Pose model", "%s", pm ? pm : "yolov8n-pose");
+    if (save_video) tui_keyval("Save video", "YES (%s/<session>/annotated.mp4)", output);
+    tui_blank();
+
+    /* ── Create system controller ── */
+    g_sc = system_controller_create(config, pm);
+    if (!g_sc) {
+        tui_fail("Failed to create system controller");
+        log_shutdown();
+        tui_shutdown();
+        return 1;
+    }
+
+    if (max_f > 0) g_sc->max_frames = max_f;
+    if (coap) g_sc->coap_enabled = true;
+    if (coap_ip) { strncpy(g_sc->coap_esp_ip, coap_ip, sizeof(g_sc->coap_esp_ip)-1); g_sc->coap_enabled = true; }
+    if (coap_port > 0) g_sc->coap_esp_port = coap_port;
+    if (wifi_ss) strncpy(g_sc->coap_wifi_ssid, wifi_ss, sizeof(g_sc->coap_wifi_ssid)-1);
+    if (wifi_pw) strncpy(g_sc->coap_wifi_password, wifi_pw, sizeof(g_sc->coap_wifi_password)-1);
+    if (save_video) g_sc->save_video = true;
+    if (camera && camera[0]) {
+        strncpy(g_sc->camera_device, camera, sizeof(g_sc->camera_device) - 1);
+    }
+
+    /* ── Start embedded web UI server ──
+     * In GUI mode, always start. In CLI mode, only with --web flag. */
+    if (gui_mode || web_port > 0) {
+        g_ws = web_server_create_default(web_port > 0 ? web_port : 8080);
+        if (g_ws) {
+            if (gui_mode) {
+                tui_ok("Web UI: http://localhost:%d (GUI mode — open in browser)", web_port);
+            } else {
+                tui_ok("Web UI: http://localhost:%d", web_port);
+            }
+            /* Attach SystemController for WS command handling (bidirectional) */
+            web_server_set_controller(g_ws, g_sc);
+            g_sc->web_server = g_ws;
+        } else {
+            if (gui_mode) {
+                tui_fail("Web UI: failed to start on port %d", web_port > 0 ? web_port : 8080);
+                log_shutdown();
+                tui_shutdown();
+                return 1;
+            }
+            tui_warn("Web UI: failed to start on port %d", web_port);
         }
     }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    g_sc->progress_cb = progress_cb;
 
-    /* Ensure logs/ directory exists (ignore failure — logger falls back to stderr) */
-    mkdir("logs", 0755);
-    logger_init("logs/system.log", LOG_LEVEL_INFO);
+    int64_t t0 = utils_get_time_ms();
+    SystemStatus st; memset(&st, 0, sizeof(st));
 
-    log_info("============================================================");
-    log_info("LingQi TanTong - SpacemiT K1 Muse Pi Pro");
-    log_info("============================================================");
+    if (gui_mode) {
+        /* ── GUI mode: web server running, wait for user commands ── */
+        tui_intro("gui");
+        tui_info("Pipeline is IDLE — use the Web UI to start.");
+        tui_info("Press Ctrl+C to exit.");
+        tui_blank();
 
-    if (realtime_mode) {
-        log_info("Mode: REALTIME");
-        log_info("Camera: %s", camera_dev);
+        /* Idle wait loop — SIGINT sets g_run = 0 */
+        while (g_run) {
+            /* If pipeline was started and stopped, keep waiting */
+            pause();
+        }
+
+        /* If pipeline is running, stop it gracefully */
+        if (psm_is_running(&g_sc->state_machine)) {
+            tui_muted("Stopping pipeline...");
+            system_controller_stop_async(g_sc);
+        }
+
+        /* Final status from the state machine */
+        st.frame_count = g_sc->frame_count;
+    } else if (rt) {
+        g_sc->running = 1;
+        tui_intro("realtime");
+        st = system_controller_process_realtime_k1(g_sc);
     } else {
-        log_info("Mode: OFFLINE");
-        log_info("Video: %s", video_path);
-        log_info("Output: %s", output_path);
-        log_info("Max frames: %d", cli_max_frames);
-        log_info("Save interval: %d", save_frame_interval);
-    }
-    log_info("Config: %s", config_path ? config_path : "defaults");
-    log_info("============================================================");
-
-    SystemController* sc = system_controller_create(config_path);
-    if (!sc) {
-        log_critical("Failed to create system controller");
-        logger_close();
-        return 1;
-    }
-    g_sc = sc;
-
-    /* ── CLI overrides for display / streaming / frame limits ── */
-    if (cli_display_enabled) {
-        sc->display_enabled = true;
-        log_info("CLI override: display enabled");
-    }
-    if (cli_display_device) {
-        strncpy(sc->display_device, cli_display_device, sizeof(sc->display_device) - 1);
-        sc->display_enabled = true;
-        log_info("CLI override: display device = %s", cli_display_device);
-    }
-    if (cli_stream_enabled && cli_stream_url) {
-        sc->stream_enabled = true;
-        strncpy(sc->stream_url, cli_stream_url, sizeof(sc->stream_url) - 1);
-        log_info("CLI override: stream = %s", cli_stream_url);
-    }
-    if (cli_save_video) {
-        sc->save_video_enabled = true;
-        log_info("CLI override: save video enabled");
-    }
-    if (cli_max_frames > 0) {
-        sc->max_frames = cli_max_frames;
-        log_info("CLI override: max_frames = %d", cli_max_frames);
-    }
-    if (cli_frame_timeout > 0) {
-        sc->frame_timeout_s = cli_frame_timeout;
-        log_info("CLI override: frame_timeout = %ds", cli_frame_timeout);
-    }
-    if (cli_coap_enabled) {
-        sc->coap_enabled = true;
-        log_info("CLI override: CoAP receiver enabled");
-    }
-    if (cli_coap_ip) {
-        strncpy(sc->coap_esp_ip, cli_coap_ip, sizeof(sc->coap_esp_ip) - 1);
-        sc->coap_enabled = true;
-        log_info("CLI override: CoAP IP = %s", cli_coap_ip);
-    }
-    if (cli_coap_port > 0) {
-        sc->coap_esp_port = cli_coap_port;
-        log_info("CLI override: CoAP port = %d", cli_coap_port);
-    }
-    if (cli_wifi_ssid) {
-        strncpy(sc->coap_wifi_ssid, cli_wifi_ssid, sizeof(sc->coap_wifi_ssid) - 1);
-        log_info("CLI override: WiFi SSID = %s", cli_wifi_ssid);
-    }
-    if (cli_wifi_password) {
-        strncpy(sc->coap_wifi_password, cli_wifi_password, sizeof(sc->coap_wifi_password) - 1);
-        log_info("CLI override: WiFi password set");
+        tui_intro("offline");
+        st = system_controller_process_video(g_sc, video, output, max_f, save_i);
     }
 
-    if (realtime_mode) {
-        sc->running = 1;
-        log_info("K1 dual-cluster pipeline mode activated");
-        SystemStatus status = system_controller_process_realtime_k1(sc);
-        log_info("============================================================");
-        log_info("K1 Pipeline Session Complete");
-        log_info("============================================================");
-        log_info("Frames processed: %d", status.frame_count);
-        log_info("Average FPS: %.1f", status.fps);
-        log_info("Average proc time: %.1fms", status.processing_time_ms);
-        log_info("Message: %s", status.message);
-        log_info("============================================================");
-    } else {
-        SystemStatus status = system_controller_process_video(
-            sc, video_path, output_path, cli_max_frames, false, save_frame_interval);
-
-        log_info("============================================================");
-        log_info("Offline Processing Complete");
-        log_info("============================================================");
-        log_info("Frames processed: %d", status.frame_count);
-        log_info("Average FPS: %.1f", status.fps);
-        log_info("Average proc time: %.1fms", status.processing_time_ms);
-        log_info("Message: %s", status.message);
-        log_info("============================================================");
+    /* ── Clean up progress bar (offline mode) ── */
+    if (g_prog) {
+        tui_progress_done(g_prog);
+        g_prog = NULL;
     }
 
-    system_controller_destroy(sc);
-    logger_close();
+    /* ── Session outro ── */
+    int64_t elapsed_ms = utils_get_time_ms() - t0;
+    double elapsed_s = (double)elapsed_ms / 1000.0;
+    tui_outro(st.frame_count, st.fps, st.processing_time_ms,
+              st.total_tracks, st.error_count,
+              gui_mode ? "gui" : (rt ? "realtime" : "offline"), elapsed_s);
+    tui_keyval("Log", "logs/system.log");
+    tui_blank();
 
-    return 0;
+    /* ── Stop web server ── */
+    if (g_ws) {
+        tui_muted("Stopping Web UI server...");
+        web_server_destroy_default(g_ws);
+        g_ws = NULL;
+    }
+
+    /* Reset signal handlers before destroy — prevent SEGV from stale g_sc pointer */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+
+    system_controller_destroy(g_sc);
+    g_sc = NULL;
+    log_shutdown();
+    tui_shutdown();
+    return st.error_count > 0 ? 1 : 0;
 }

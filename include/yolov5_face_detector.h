@@ -20,12 +20,13 @@ typedef struct {
     int input_height;
     float confidence_threshold;
     float nms_threshold;
+    bool use_ep;                 /* enable SpacemiT EP (needs IO Binding for safe output reads) */
     /* Cached after first inference — avoids per-frame tensor shape probing */
     int  output_format_cached;   /* 0=unset, 1=4D, 2=5D */
 } YOLOv5FaceDetector;
 
 YOLOv5FaceDetector* yolov5_face_detector_create(const char* model_path, int input_w, int input_h,
-                                                  float conf_thresh, float nms_thresh);
+                                                  float conf_thresh, float nms_thresh, bool use_ep);
 void yolov5_face_detector_destroy(YOLOv5FaceDetector* det);
 
 bool yolov5_face_detector_load_model(YOLOv5FaceDetector* det, const char* model_path);

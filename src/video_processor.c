@@ -140,6 +140,8 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
         log_error("V4L2: open(%s) failed: %s", device_path, strerror(errno));
         return -1;
     }
+    /* Set fd early so v4l2_close_stream can clean up partial init on error */
+    vp->v4l2_fd = fd;
 
     struct v4l2_capability cap;
     memset(&cap, 0, sizeof(cap));
@@ -197,9 +199,49 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
         vfmt.fmt.pix.field       = V4L2_FIELD_ANY;
     }
     if (ioctl(fd, VIDIOC_S_FMT, &vfmt) != 0) {
-        log_error("V4L2: VIDIOC_S_FMT failed: %s", strerror(errno));
-        close(fd);
-        return -1;
+        /* Some K1 CCIC1 drivers return EPERM for unsupported format+resolution
+         * combos.  Enumerate supported formats and retry with the first available
+         * one before giving up. */
+        log_warning("V4L2: VIDIOC_S_FMT(0x%x %dx%d) failed: %s — enumerating formats...",
+                    want_fmt, width, height, strerror(errno));
+
+        bool found_fallback = false;
+        struct v4l2_fmtdesc fmtd;
+        memset(&fmtd, 0, sizeof(fmtd));
+        fmtd.type = buf_type;
+        for (fmtd.index = 0; ioctl(fd, VIDIOC_ENUM_FMT, &fmtd) == 0; fmtd.index++) {
+            /* Prefer MJPEG > YUYV > anything else */
+            if (fmtd.pixelformat == V4L2_PIX_FMT_MJPEG ||
+                fmtd.pixelformat == V4L2_PIX_FMT_YUYV ||
+                fmtd.pixelformat == V4L2_PIX_FMT_RGB24) {
+                want_fmt = fmtd.pixelformat;
+                memset(&vfmt, 0, sizeof(vfmt));
+                vfmt.type = buf_type;
+                if (is_mplane) {
+                    vfmt.fmt.pix_mp.width       = (uint32_t)width;
+                    vfmt.fmt.pix_mp.height      = (uint32_t)height;
+                    vfmt.fmt.pix_mp.pixelformat = want_fmt;
+                    vfmt.fmt.pix_mp.field       = V4L2_FIELD_ANY;
+                    vfmt.fmt.pix_mp.num_planes  = 1;
+                } else {
+                    vfmt.fmt.pix.width       = (uint32_t)width;
+                    vfmt.fmt.pix.height      = (uint32_t)height;
+                    vfmt.fmt.pix.pixelformat = want_fmt;
+                    vfmt.fmt.pix.field       = V4L2_FIELD_ANY;
+                }
+                if (ioctl(fd, VIDIOC_S_FMT, &vfmt) == 0) {
+                    log_info("V4L2: format fallback to 0x%x (%.4s) succeeded",
+                             want_fmt, (char*)&want_fmt);
+                    found_fallback = true;
+                    break;
+                }
+            }
+        }
+        if (!found_fallback) {
+            log_error("V4L2: VIDIOC_S_FMT failed and no supported format found");
+            close(fd);
+            return -1;
+        }
     }
     {
         uint32_t got = is_mplane ? vfmt.fmt.pix_mp.pixelformat : vfmt.fmt.pix.pixelformat;
@@ -258,7 +300,7 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
         }
         if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
             log_error("V4L2: VIDIOC_QUERYBUF[%u] failed: %s", i, strerror(errno));
-            close(fd);
+            v4l2_close_stream(vp);
             return -1;
         }
         size_t buf_len   = is_mplane ? plane.length   : buf.length;
@@ -266,27 +308,26 @@ static int v4l2_open_stream(VideoProcessor* vp, const char* device_path,
         void* ptr = mmap(NULL, buf_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf_off);
         if (ptr == MAP_FAILED) {
             log_error("V4L2: mmap[%u] failed: %s", i, strerror(errno));
-            close(fd);
+            v4l2_close_stream(vp);
             return -1;
         }
         vp->v4l2_buffers[i]      = (uint8_t*)ptr;
         vp->v4l2_buffer_sizes[i] = buf_len;
+        vp->v4l2_buffer_count    = (int)(i + 1);  /* track incrementally for cleanup */
         if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
             log_error("V4L2: VIDIOC_QBUF[%u] failed: %s", i, strerror(errno));
-            close(fd);
+            v4l2_close_stream(vp);
             return -1;
         }
     }
-    vp->v4l2_buffer_count = (int)req.count;
 
     enum v4l2_buf_type stype = buf_type;
     if (ioctl(fd, VIDIOC_STREAMON, &stype) != 0) {
         log_error("V4L2: VIDIOC_STREAMON failed: %s", strerror(errno));
-        close(fd);
+        v4l2_close_stream(vp);
         return -1;
     }
 
-    vp->v4l2_fd = fd;
     vp->v4l2_streaming = true;
     vp->source_type = VP_SOURCE_CAMERA;
     return 0;
@@ -423,6 +464,16 @@ void video_processor_destroy(VideoProcessor* vp) {
  */
 static int ffprobe_video_info(const char* path, int* width, int* height,
                                float* fps, int* total_frames) {
+    /* BUGFIX: sanitize path — reject shell metacharacters before passing to popen.
+     * Only allow alphanumeric, /, ., -, _, and spaces (common in file paths). */
+    for (const char* c = path; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '/' || *c == '.' ||
+              *c == '-' || *c == '_' || *c == ' ' || *c == ':')) {
+            log_error("ffprobe: path contains unsafe characters: %s", path);
+            return -1;
+        }
+    }
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
         "ffprobe -v error -select_streams v:0 "

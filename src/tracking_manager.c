@@ -112,7 +112,10 @@ static void kalman_predict(KalmanBoxTracker* kf) {
     memcpy(kf->state, new_state, sizeof(new_state));
 
     float new_cov[7][7];
-    utils_matrix_multiply_abt(kf->transition, kf->covariance, new_cov);
+    /* FIXED P0-1: was utils_matrix_multiply_abt() which computed F*P*P^T (wrong).
+     * Correct Kalman covariance propagation is P' = F*P*F^T.
+     * See Kalman (1960), Bar-Shalom et al. (2001) §5.2. */
+    utils_matrix_multiply_fpfT(kf->transition, kf->covariance, new_cov);
     for (int i = 0; i < 7; i++) {
         for (int j = 0; j < 7; j++) {
             kf->covariance[i][j] = new_cov[i][j] + kf->process_noise[i][j];
@@ -138,12 +141,22 @@ static void kalman_update(KalmanBoxTracker* kf, const BoundingBox* bbox) {
         }
     }
 
-    /* Innovation covariance: S = H*P*H' + R */
+    /* Innovation covariance: S = H*P*H^T + R.
+     * Previous code computed only H*P (structurally correct because
+     * H=[I₄|0₄ₓ₃], but semantically wrong and fragile if H changes. */
     float s_mat[4][4] = {{0}};
+    float hp[4][7] = {{0}};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                hp[i][j] += kf->measurement[i][k] * kf->covariance[k][j];
+            }
+        }
+    }
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             for (int k = 0; k < 7; k++) {
-                s_mat[i][j] += kf->measurement[i][k] * kf->covariance[k][j];
+                s_mat[i][j] += hp[i][k] * kf->measurement[j][k];  /* H*P*H^T */
             }
         }
     }
@@ -204,6 +217,19 @@ static void kalman_update(KalmanBoxTracker* kf, const BoundingBox* bbox) {
     }
     memcpy(kf->covariance, new_cov, sizeof(new_cov));
 
+    /* BUGFIX: symmetrize covariance to prevent numerical drift.
+     * The standard (I-KH)P form can lose symmetry and positive
+     * semi-definiteness over many iterations in single precision
+     * (Bucy & Joseph 1968).  Periodic symmetrization is the
+     * minimal fix; Joseph stabilized form would be ideal. */
+    for (int i = 0; i < 7; i++) {
+        for (int j = i + 1; j < 7; j++) {
+            float avg = 0.5f * (kf->covariance[i][j] + kf->covariance[j][i]);
+            kf->covariance[i][j] = avg;
+            kf->covariance[j][i] = avg;
+        }
+    }
+
     kf->time_since_update = 0;
     kf->hit_streak++;
 }
@@ -242,7 +268,14 @@ static float hungarian_solve(const float* cost_matrix, int rows, int cols,
     /* Pad to square */
     int n = rows > cols ? rows : cols;
     if (n < 1) { *final_cost = 0.0f; return 0.0f; }
-    if (n > HUNGARIAN_MAX_DIM) n = HUNGARIAN_MAX_DIM;
+    if (n > HUNGARIAN_MAX_DIM) {
+        static int trunc_warn_count = 0;
+        if (trunc_warn_count++ < 3 || trunc_warn_count % 100 == 0) {
+            log_warn("Hungarian: cost matrix truncated from %d to %d (MAX=%d) — associations lost",
+                     (rows > cols ? rows : cols), HUNGARIAN_MAX_DIM, HUNGARIAN_MAX_DIM);
+        }
+        n = HUNGARIAN_MAX_DIM;
+    }
 
     /* ── Use pre-allocated workspace if valid, fall back to dynamic ── */
     float* a;
@@ -392,7 +425,10 @@ bool appearance_feature_from_pose(const PoseEstimation* pose, const BoundingBox*
     /* Minimum keypoint requirement: at least TRACKING_APPEARANCE_MIN_KPTS valid */
     float min_conf = 0.30f;
     int valid_kpts = 0;
-    float kx[17], ky[17], kc[17];
+    float kx[17] = {0}, ky[17] = {0}, kc[17] = {0};
+    /* Guard: if num_keypoints < 17, indices [num_keypoints..16] remain zero
+     * (confidence=0 → skipped by all downstream kc[] checks).  Without the
+     * zero-init, stack garbage could pass the confidence threshold. */
     for (int i = 0; i < 17 && i < pose->num_keypoints; i++) {
         kc[i] = pose->keypoints[i].confidence;
         if (kc[i] >= min_conf &&
@@ -1012,10 +1048,17 @@ static void cascade_matching(ObjectTracker* tracker,
                 float iou = bbox_iou(&pred_bboxes[local_idx], &detections[det_idx].bbox);
                 float iou_cost = 1.0f - iou;
 
+                /* When appearance_weight=0 (ByteTrack standard), skip
+                 * feature computation entirely — features are in
+                 * incompatible spaces (4D geom vs 12D pose).
+                 * app_cost defaults to 0.5 which is always ≤ max_dist (0.65),
+                 * so the rejection gate only depends on IoU. */
                 float app_cost = 0.5f;
-                if (appearance_feature_is_valid(&entry->latest_appearance) &&
-                    det_features && appearance_feature_is_valid(&det_features[det_idx])) {
-                    app_cost = appearance_feature_distance(&entry->latest_appearance, &det_features[det_idx]);
+                if (tracker->appearance_weight > 0.0f) {
+                    if (appearance_feature_is_valid(&entry->latest_appearance) &&
+                        det_features && appearance_feature_is_valid(&det_features[det_idx])) {
+                        app_cost = appearance_feature_distance(&entry->latest_appearance, &det_features[det_idx]);
+                    }
                 }
 
                 /* Use stricter thresholds for cascade: younger tracks are more reliable */
@@ -1087,6 +1130,8 @@ static void cascade_matching(ObjectTracker* tracker,
 
 static int reid_check(ObjectTracker* tracker,
                        const AppearanceFeature* det_feature) {
+    /* Skip when appearance matching disabled (ByteTrack standard) */
+    if (tracker->appearance_weight <= 0.0f) return -1;
     if (!det_feature || !appearance_feature_is_valid(det_feature)) return -1;
     if (tracker->reid_pool_count == 0) return -1;
 
@@ -1109,14 +1154,13 @@ static int reid_check(ObjectTracker* tracker,
  * Main Tracking Update (ByteTrack-style with cascade + appearance + occlusion)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-TrackingResult object_tracker_update(ObjectTracker* tracker,
-                                      const Detection* detections, int num_detections,
-                                      const SpatialPosition* positions, int num_positions,
-                                      int frame_num) {
-    TrackingResult result;
-    tracking_result_init(&result);
-
-    if (!tracker) return result;
+void object_tracker_update(ObjectTracker* tracker,
+                           const Detection* detections, int num_detections,
+                           const SpatialPosition* positions, int num_positions,
+                           int frame_num,
+                           TrackingResult* out_result) {
+    if (!tracker || !out_result) return;
+    tracking_result_init(out_result);
 
     /* ── Step 0: Re-ID pool aging ──
      * Remove entries older than reid_pool_max_age.  Since we don't store
@@ -1157,7 +1201,7 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
         } else {
             remove_track(tracker, i);
             i--;
-            result.lost_tracks++;
+            out_result->lost_tracks++;
         }
     }
 
@@ -1336,19 +1380,29 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
             create_track(tracker, &detections[d], pos, frame_num,
                         det_features[d].is_valid ? &det_features[d] : NULL, false);
         }
-        result.new_tracks++;
+        out_result->new_tracks++;
     }
 
     /* ── Step 8: Remove tracks lost for too long ──
-     * Occluded tracks get extended lifetime. */
+     * Confirmed tracks: max_lost (30) or max_occluded (45) for partial body.
+     * Unconfirmed tracks: removed after 3 lost frames — prevents buffer bloat
+     *   from spurious/noise detections piling up during low-confidence periods
+     *   (was previously using max_lost=30 for ALL tracks, causing the
+     *   "Tracked objects buffer full (max 256)" overflow). */
     for (int i = tracker->num_tracks - 1; i >= 0; i--) {
         TrackEntry* entry = &tracker->tracks[i];
-        int effective_max_lost = entry->is_partial_body ?
-            tracker->max_occluded : tracker->max_lost;
+        int effective_max_lost;
+        if (!entry->confirmed) {
+            effective_max_lost = 3;   /* unconfirmed: aggressive eviction */
+        } else if (entry->is_partial_body) {
+            effective_max_lost = tracker->max_occluded;
+        } else {
+            effective_max_lost = tracker->max_lost;
+        }
 
         if (entry->lost_count > effective_max_lost) {
             remove_track(tracker, i);
-            result.lost_tracks++;
+            out_result->lost_tracks++;
         }
     }
 
@@ -1364,8 +1418,8 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
     for (int i = 0; i < tracker->num_tracks; i++) {
         TrackEntry* entry = &tracker->tracks[i];
         if (entry->confirmed && entry->lost_count <= 3) {
-            if (result.num_tracked < MAX_TRACKED_OBJECTS) {
-                result.tracked_objects[result.num_tracked++] = entry->object;
+            if (out_result->num_tracked < MAX_TRACKED_OBJECTS) {
+                out_result->tracked_objects[out_result->num_tracked++] = entry->object;
             }
         }
     }
@@ -1380,13 +1434,13 @@ TrackingResult object_tracker_update(ObjectTracker* tracker,
         }
         if (num_high > confirmed_count * TRACKING_MAX_DET_TO_TRACK_RATIO) {
             /* Signal that new people may have entered */
-            result.id_switches = -1;  /* special flag: request full detection next frame */
+            out_result->id_switches = -1;  /* special flag: request full detection next frame */
         } else {
-            result.id_switches = tracker->total_id_switches;
+            out_result->id_switches = tracker->total_id_switches;
         }
     }
 
-    return result;
+    return;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

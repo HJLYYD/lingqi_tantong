@@ -2,6 +2,7 @@
 #define IMU_HANDLER_H
 
 #include "core_types.h"
+#include "k1_odometry.h"
 #include <pthread.h>
 #include <stdio.h>
 
@@ -37,9 +38,10 @@ typedef struct {
     MadgwickFilter  cam_filter;       /* ESP32 远端 IMU (原始数据) */
 
     /* ── Phase 2: Wahba 重力对齐 ── */
-    FrameAlignmentCtx align_ctx;
-    bool   alignment_done;
-    float  align_qw, align_qx, align_qy, align_qz;
+    pthread_mutex_t    align_mutex;      /* protects align_ctx from concurrent feed_k1_imu / feed_external_raw */
+    FrameAlignmentCtx  align_ctx;
+    bool               alignment_done;
+    float              align_qw, align_qx, align_qy, align_qz;
 
     /* ── Phase 2: 融合输出 ── */
     DualImuPose dual_pose;
@@ -47,6 +49,9 @@ typedef struct {
 
     /* ── K1 本地 IMU 引用 ── */
     void*  k1_imu;                    /* K1Imu* — 前向声明 */
+
+    /* ── Phase A: K1 里程计 (INS + ZUPT) ── */
+    K1Odometry* odometry;             /* K1 INS 捷联解算里程计 */
 
     /* ── IMU 数据记录到 CSV ── */
     FILE*  k1_csv;                    /* K1 本地 IMU 采样 CSV */
@@ -84,6 +89,13 @@ void imu_handler_set_k1_imu(IMUHandler* h, void* k1_imu);
 /* ── IMU 数据记录到 CSV ── */
 void imu_handler_start_recording(IMUHandler* h, const char* output_dir, const char* session_id);
 void imu_handler_stop_recording(IMUHandler* h);
+
+/* ── Phase A: K1 里程计接口 ── */
+K1Odometry* imu_handler_get_odometry(IMUHandler* h);
+void imu_handler_set_odometry_params(IMUHandler* h,
+                                      float zupt_accel_thresh, float zupt_gyro_thresh,
+                                      float sigma_a, float sigma_w, float glrt_thresh,
+                                      int init_samples);
 
 #ifdef __cplusplus
 }

@@ -75,7 +75,12 @@ void madgwick_update(MadgwickFilter* mf, float gx, float gy, float gz,
     /* 梯度归一化 */
     float grad_norm = sqrtf(j0*j0 + j1*j1 + j2*j2 + j3*j3);
     if (grad_norm > 0.0f) {
-        float step = mf->beta * dt / grad_norm;
+        /* BUGFIX: Remove extra dt — Madgwick formula (2010) Eq.(21):
+         * q_new = q + (½ q⊗ω − β·∇f/‖∇f‖) · Δt
+         * The gradient correction β·∇f/‖∇f‖ is multiplied by Δt ONCE
+         * at lines 89-92.  The old code multiplied by dt², making the
+         * correction 100× too weak at 100Hz (effective beta=0.0008). */
+        float step = mf->beta / grad_norm;
         j0 *= step; j1 *= step; j2 *= step; j3 *= step;
     }
 
@@ -184,14 +189,22 @@ static bool try_align_frames(IMUHandler* h) {
  *  IMUHandler 核心
  * ═══════════════════════════════════════════════════════════ */
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnan-infinity-disabled"
-#endif
-static bool is_valid_float(float v) { return !isnan(v) && !isinf(v); }
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
+/*
+ * CRITICAL: With -ffast-math, isnan()/isinf() are UB on Clang — the compiler
+ * optimizes them to always return false.  Use IEEE 754 bit-level inspection
+ * via memcpy to uint32_t, which the compiler cannot constant-fold away.
+ */
+static inline bool is_valid_float(float v) {
+    uint32_t raw;
+    memcpy(&raw, &v, sizeof(raw));
+    /* Check for NaN: exponent all-1s, mantissa non-zero */
+    if ((raw & 0x7F800000u) == 0x7F800000u && (raw & 0x007FFFFFu) != 0) return false;
+    /* Check for Inf: exponent all-1s, mantissa zero */
+    if (raw == 0x7F800000u || raw == 0xFF800000u) return false;
+    /* Check for subnormals (exponent all-0s, mantissa non-zero) */
+    if ((raw & 0x7F800000u) == 0 && (raw & 0x007FFFFFu) != 0) return false;
+    return true;
+}
 
 IMUHandler* imu_handler_create(int window_size, float gyro_noise_std, float accel_noise_std) {
     IMUHandler* h = (IMUHandler*)calloc(1, sizeof(IMUHandler));
@@ -202,6 +215,7 @@ IMUHandler* imu_handler_create(int window_size, float gyro_noise_std, float acce
     h->accel_noise_std = accel_noise_std;
     pthread_mutex_init(&h->pose_mutex, NULL);
     pthread_mutex_init(&h->dual_mutex, NULL);
+    pthread_mutex_init(&h->align_mutex, NULL);  /* protects align_ctx */
 
     /* 初始化两个 Madgwick 滤波器 */
     madgwick_init(&h->k1_filter,  0.08f, 100.0f);
@@ -214,18 +228,26 @@ IMUHandler* imu_handler_create(int window_size, float gyro_noise_std, float acce
     h->alignment_done = false;
     h->k1_imu = NULL;
 
+    /* 初始化 K1 里程计 (INS + ZUPT) */
+    h->odometry = k1_odometry_create();
+
     return h;
 }
 
 void imu_handler_destroy(IMUHandler* h) {
     if (!h) return;
     imu_handler_stop_recording(h);
+    if (h->odometry) {
+        k1_odometry_destroy(h->odometry);
+        h->odometry = NULL;
+    }
     if (h->k1_imu) {
         k1_imu_destroy((K1Imu*)h->k1_imu);
         h->k1_imu = NULL;
     }
     pthread_mutex_destroy(&h->pose_mutex);
     pthread_mutex_destroy(&h->dual_mutex);
+    pthread_mutex_destroy(&h->align_mutex);
     free(h);
 }
 
@@ -319,26 +341,42 @@ void imu_handler_start_recording(IMUHandler* h, const char* output_dir, const ch
     if (!h || !output_dir || !session_id) return;
 
     char dir[MAX_PATH_LEN * 2];
-    snprintf(dir, sizeof(dir), "%s/imu", output_dir);
+    snprintf(dir, sizeof(dir), "%s/%s/imu", output_dir, session_id);
     mkdir(dir, 0755);
 
-    /* K1 local IMU: timestamp, accel_x/y/z, gyro_x/y/z, qw/qx/qy/qz */
-    char path[MAX_PATH_LEN * 3];
-    snprintf(path, sizeof(path), "%s/%s_imu_k1.csv", dir, session_id);
-    h->k1_csv = fopen(path, "w");
-    if (h->k1_csv) {
-        fprintf(h->k1_csv, "timestamp_s,accel_x_mps2,accel_y_mps2,accel_z_mps2,"
-                "gyro_x_radps,gyro_y_radps,gyro_z_radps,qw,qx,qy,qz\n");
-        log_info("[IMU] K1 IMU recording: %s", path);
+    /* ── K1 local IMU CSV: only open if K1 IMU is actually available ──
+     * When GY85 init fails (common on boards without the sensor),
+     * h->k1_imu is NULL and no data will ever arrive.  Opening an
+     * empty CSV with just a header wastes I/O and confuses the user. */
+    if (h->k1_imu) {
+        char path[MAX_PATH_LEN * 3];
+        snprintf(path, sizeof(path), "%s/k1_local.csv", dir);
+        h->k1_csv = fopen(path, "w");
+        if (h->k1_csv) {
+            fprintf(h->k1_csv, "timestamp_s,accel_x_mps2,accel_y_mps2,accel_z_mps2,"
+                    "gyro_x_radps,gyro_y_radps,gyro_z_radps,qw,qx,qy,qz\n");
+            log_info("[IMU] K1 local IMU recording: %s", path);
+        }
+    } else {
+        log_info("[IMU] K1 local IMU unavailable — skipping CSV (no sensor)");
+        h->k1_csv = NULL;
     }
 
     /* ESP32 remote IMU: same format */
-    snprintf(path, sizeof(path), "%s/%s_imu_esp32.csv", dir, session_id);
-    h->esp32_csv = fopen(path, "w");
-    if (h->esp32_csv) {
-        fprintf(h->esp32_csv, "timestamp_s,accel_x_mps2,accel_y_mps2,accel_z_mps2,"
-                "gyro_x_radps,gyro_y_radps,gyro_z_radps,qw,qx,qy,qz\n");
-        log_info("[IMU] ESP32 IMU recording: %s", path);
+    {
+        char path[MAX_PATH_LEN * 3];
+        snprintf(path, sizeof(path), "%s/esp32_remote.csv", dir);
+        h->esp32_csv = fopen(path, "w");
+        if (h->esp32_csv) {
+            fprintf(h->esp32_csv, "timestamp_s,accel_x_mps2,accel_y_mps2,accel_z_mps2,"
+                    "gyro_x_radps,gyro_y_radps,gyro_z_radps,qw,qx,qy,qz\n");
+            log_info("[IMU] ESP32 remote IMU recording: %s", path);
+        }
+    }
+
+    /* Start K1 odometry trajectory recording */
+    if (h->odometry) {
+        k1_odometry_start_recording(h->odometry, output_dir, session_id);
     }
 }
 
@@ -346,6 +384,7 @@ void imu_handler_stop_recording(IMUHandler* h) {
     if (!h) return;
     if (h->k1_csv) { fclose(h->k1_csv); h->k1_csv = NULL; log_info("[IMU] K1 IMU recording closed"); }
     if (h->esp32_csv) { fclose(h->esp32_csv); h->esp32_csv = NULL; log_info("[IMU] ESP32 IMU recording closed"); }
+    if (h->odometry) { k1_odometry_stop_recording(h->odometry); }
 }
 
 void imu_handler_feed_k1_imu(IMUHandler* h, const IMUData* data) {
@@ -367,7 +406,8 @@ void imu_handler_feed_k1_imu(IMUHandler* h, const IMUData* data) {
     madgwick_update(&h->k1_filter, data->gyro_x, data->gyro_y, data->gyro_z,
                     data->accel_x, data->accel_y, data->accel_z, dt);
 
-    /* 对齐收集: 收集 K1 静止样本 */
+    /* 对齐收集: 收集 K1 静止样本 (加锁: 与 feed_external_raw 并发) */
+    pthread_mutex_lock(&h->align_mutex);
     if (!h->alignment_done && h->align_ctx.samples_collected < h->align_ctx.window_size) {
         int n = h->align_ctx.samples_collected;
         h->align_ctx.k1_accels[0][n] = data->accel_x;
@@ -381,6 +421,7 @@ void imu_handler_feed_k1_imu(IMUHandler* h, const IMUData* data) {
         && h->align_ctx.cam_idx >= h->align_ctx.window_size) {
         try_align_frames(h);
     }
+    pthread_mutex_unlock(&h->align_mutex);
 
     /* 更新融合输出 */
     if (h->alignment_done) {
@@ -400,6 +441,11 @@ void imu_handler_feed_k1_imu(IMUHandler* h, const IMUData* data) {
                 data->accel_x, data->accel_y, data->accel_z,
                 data->gyro_x, data->gyro_y, data->gyro_z,
                 qw, qx, qy, qz);
+    }
+
+    /* ── Phase A: K1 里程计更新 (INS 捷联解算 + ZUPT) ── */
+    if (h->odometry) {
+        k1_odometry_update(h->odometry, data);
     }
 }
 
@@ -427,7 +473,8 @@ void imu_handler_feed_external_raw(IMUHandler* h, const float accel[3], const fl
     madgwick_update(&h->cam_filter, gyro[0], gyro[1], gyro[2],
                     accel[0], accel[1], accel[2], dt);
 
-    /* 对齐收集: 收集相机静止样本 */
+    /* 对齐收集: 收集相机静止样本 (加锁: 与 feed_k1_imu 并发) */
+    pthread_mutex_lock(&h->align_mutex);
     if (!h->alignment_done && h->align_ctx.cam_idx < h->align_ctx.window_size) {
         int n = h->align_ctx.cam_idx;
         h->align_ctx.cam_accels[0][n] = accel[0];
@@ -441,6 +488,7 @@ void imu_handler_feed_external_raw(IMUHandler* h, const float accel[3], const fl
         && h->align_ctx.cam_idx >= h->align_ctx.window_size) {
         try_align_frames(h);
     }
+    pthread_mutex_unlock(&h->align_mutex);
 
     /* 更新融合输出 */
     if (h->alignment_done) {
@@ -479,4 +527,21 @@ bool imu_handler_get_dual_pose(IMUHandler* h, DualImuPose* out) {
 
 bool imu_handler_is_alignment_done(const IMUHandler* h) {
     return h && h->alignment_done;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Phase A: K1 里程计接口
+ * ═══════════════════════════════════════════════════════════ */
+
+K1Odometry* imu_handler_get_odometry(IMUHandler* h) {
+    return h ? h->odometry : NULL;
+}
+
+void imu_handler_set_odometry_params(IMUHandler* h,
+                                      float zupt_accel_thresh, float zupt_gyro_thresh,
+                                      float sigma_a, float sigma_w, float glrt_thresh,
+                                      int init_samples) {
+    if (!h || !h->odometry) return;
+    k1_odometry_set_params(h->odometry, zupt_accel_thresh, zupt_gyro_thresh,
+                            sigma_a, sigma_w, glrt_thresh, init_samples);
 }

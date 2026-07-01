@@ -70,7 +70,7 @@ typedef struct {
 } RawFaceDetection;
 
 YOLOv5FaceDetector* yolov5_face_detector_create(const char* model_path, int input_w, int input_h,
-                                                  float conf_thresh, float nms_thresh) {
+                                                  float conf_thresh, float nms_thresh, bool use_ep) {
     YOLOv5FaceDetector* det = (YOLOv5FaceDetector*)calloc(1, sizeof(YOLOv5FaceDetector));
     if (!det) return NULL;
 
@@ -78,6 +78,7 @@ YOLOv5FaceDetector* yolov5_face_detector_create(const char* model_path, int inpu
     det->input_height = input_h > 0 ? input_h : 320;
     det->confidence_threshold = conf_thresh;
     det->nms_threshold = nms_thresh;
+    det->use_ep = use_ep;
     det->session = NULL;
 
     if (!model_path || !yolov5_face_detector_load_model(det, model_path)) {
@@ -114,7 +115,22 @@ bool yolov5_face_detector_load_model(YOLOv5FaceDetector* det, const char* model_
         return false;
     }
 
-    det->session = ort_create_session(model_path, 4, true);
+    /* ── SpacemiT EP + IO Binding for face detection ──
+     *
+     * The quantized "cut" model (yolov5n-face_320_cut.q.onnx) has 5D output
+     * tensors.  SpacemiT EP allocates these in TCM which is NOT CPU-accessible.
+     * GetTensorMutableData returns a TCM pointer → SIGSEGV on read.
+     *
+     * Solution: IO Binding with CPU-preferred output allocation.
+     *   - Input  tensor: bound to TCM (EP fast path)
+     *   - Output tensors: bound to CPU memory (safe reads)
+     *
+     * When HAS_SPACEMIT_EP is defined and det->use_ep=true, we create a
+     * CPU-memory OrtIoBinding and bind outputs to pre-allocated CPU buffers.
+     * When EP is unavailable or use_ep=false, standard CPU EP session is used.
+     *
+     * Set via config: inference.face_detect_use_ep (default: false, safe) */
+    det->session = ort_create_session(model_path, 4, det->use_ep);
     if (!det->session) {
         log_error("YOLOv5Face: ONNX session creation failed for %s", model_path);
         return false;
@@ -165,11 +181,15 @@ bool yolov5_face_detector_load_model(YOLOv5FaceDetector* det, const char* model_
 /*
  * Decode a single 5D anchor proposal into model-input pixel coordinates.
  * Returns the decoded confidence (sigmoid(obj) * sigmoid(cls)).
+ *
+ * stride: actual stride value (8, 16, or 32) derived from model_input / feat_h.
+ *          No longer assumes 640×640 — works for any input size (320, 640, etc.).
+ * anchor_idx: 0..2 selects which of the 3 anchors at this stride level to use.
  */
 static float decode_5d_proposal(const float* feat,   /* [16] raw logits */
                                  int grid_x, int grid_y,
-                                 int stride_idx,      /* 0..2 → P3/P4/P5 */
-                                 int anchor_idx,      /* 0..2 */
+                                 int stride,           /* actual stride: 8, 16, or 32 */
+                                 int anchor_idx,       /* 0..2 */
                                  BoundingBox* out_bbox,
                                  float out_kpts[YOLOV5_FACE_NUM_KEYPOINTS][2]) {
     /* ── Objectness and classification ──
@@ -190,7 +210,12 @@ static float decode_5d_proposal(const float* feat,   /* [16] raw logits */
     float sw = utils_sigmoid(tw);
     float sh = utils_sigmoid(th);
 
-    int stride = (stride_idx == 0) ? 8 : ((stride_idx == 1) ? 16 : 32);
+    /* Select anchors based on actual stride value (not hardcoded idx) */
+    int stride_idx;
+    if (stride <= 8)       stride_idx = 0;
+    else if (stride <= 16) stride_idx = 1;
+    else                   stride_idx = 2;
+
     const float* anchor = YOLOV5_FACE_ANCHORS[stride_idx][anchor_idx];
     float anchor_w = anchor[0];
     float anchor_h = anchor[1];
@@ -232,14 +257,23 @@ static float decode_5d_proposal(const float* feat,   /* [16] raw logits */
  *
  * 5D tensor layout (ONNX row-major):
  *   data[a * H * W * F + h * W * F + w * F + feat_idx]
+ *
+ * CRITICAL FIX: model_input_size is the actual model input dimension (e.g. 320
+ * or 640).  Stride is computed as model_input_size / feat_h — no more
+ * hardcoded 640×640 assumption.  Works for 320×320, 640×640, etc.
+ *
+ * CRITICAL FIX: element type is checked before casting to float*.  Quantized
+ * "cut" models (.q.onnx) may output INT8 data from SpacemiT EP; accessing
+ * INT8 as float* overflows the buffer 4× → segfault.  Non-float outputs are
+ * skipped with a clear log message.
  */
 static int decode_5d_format(const uint8_t* image_data, int width, int height,
                              OrtValue** output_vals, size_t num_outputs,
                              const OrtApi* ort, float scale, int pad_x, int pad_y,
                              int crop_x, int crop_y, float conf_thresh,
-                             RawFaceDetection* raw_faces, int max_faces) {
+                             RawFaceDetection* raw_faces, int max_faces,
+                             int model_input_size) {
     int num_raw = 0;
-    int model_h = -1;  /* derived from first output */
 
     (void)image_data;  /* kept for API consistency with standard decode path */
 
@@ -251,10 +285,57 @@ static int decode_5d_format(const uint8_t* image_data, int width, int height,
         if (ort->GetTensorTypeAndShape(out_val, &si)) continue;
 
         size_t num_dims = 0;
-        { OrtStatus* _s = ort->GetDimensionsCount(si, &num_dims); if (_s) ort->ReleaseStatus(_s); }
+        {
+            OrtStatus* _s = ort->GetDimensionsCount(si, &num_dims);
+            if (_s) { ort->ReleaseStatus(_s); ort->ReleaseTensorTypeAndShapeInfo(si); continue; }
+        }
         int64_t dims[5] = {0};
-        { OrtStatus* _s = ort->GetDimensions(si, dims, num_dims); if (_s) ort->ReleaseStatus(_s); }
+        {
+            OrtStatus* _s = ort->GetDimensions(si, dims, num_dims < 5 ? num_dims : 5);
+            if (_s) { ort->ReleaseStatus(_s); ort->ReleaseTensorTypeAndShapeInfo(si); continue; }
+        }
+
+        /* ── SAFETY: Check element type before casting to float* ──
+         * "Cut" quantized models may output INT8 (DequantizeLinear removed).
+         * Accessing INT8 data as float* reads 4× past the buffer → SIGSEGV.
+         *
+         * BUGFIX: Previously allowed UNDEFINED to pass through (treating
+         * API failure as "safe").  Now: only FLOAT is trusted.  UNDEFINED
+         * (API failure) and all other types are skipped with diagnostics. */
+        ONNXTensorElementDataType elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+        bool elem_type_ok = false;
+        {
+            OrtStatus* _s = ort->GetTensorElementType(si, &elem_type);
+            if (_s) {
+                ort->ReleaseStatus(_s);
+                /* API failed — we cannot trust the data type */
+                elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+            } else {
+                elem_type_ok = true;
+            }
+        }
         ort->ReleaseTensorTypeAndShapeInfo(si);
+
+        /* Only FLOAT is safe to read as float*.
+         * UNDEFINED means the API call failed → we don't know the type → skip.
+         * INT8/UINT8/other means the buffer is 1-2 bytes/element instead of 4
+         * → reading as float* overflows the buffer → skip. */
+        if (!elem_type_ok || elem_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            static int elem_type_warned = 0;
+            if (elem_type_warned++ == 0) {
+                const char* type_name = "unknown";
+                if (!elem_type_ok) type_name = "API_ERROR";
+                else if (elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) type_name = "INT8";
+                else if (elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8) type_name = "UINT8";
+                else if (elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) type_name = "FLOAT";
+                log_error("YOLOv5Face: 5D output[%zu] element type=%d (%s), NOT safe as float*. "
+                          "Model may be a 'cut' quantized model without DequantizeLinear. "
+                          "Re-export with xquant --keep-dequantize or use a non-cut model. "
+                          "Skipping this output.",
+                          oi, (int)elem_type, type_name);
+            }
+            continue;
+        }
 
         /* Only handle 5D format */
         if (num_dims != 5) continue;
@@ -277,17 +358,20 @@ static int decode_5d_format(const uint8_t* image_data, int width, int height,
             continue;
         }
 
-        /* Determine stride from spatial dims */
-        if (model_h < 0) model_h = feat_h;  /* use first output's H as reference */
+        /* ── FIXED: Derive stride from actual model input size ──
+         * Previous code hardcoded feat_h thresholds for 640×640:
+         *   feat_h≥70→stride=8, feat_h≥35→stride=16, else→stride=32
+         * This FAILS for 320×320 models where feat_h=40 means stride=320/40=8,
+         * not 16.  Now computed directly: stride = model_input_size / feat_h. */
+        int stride = model_input_size / feat_h;
 
-        /* Model input_size / spatial_H = stride.
-         * Input is square (e.g. 640×640), so H division gives stride.
-         * For non-square: stride = scale_factor between input and feature map.
-         * Typically: H=80→stride=8, H=40→stride=16, H=20→stride=32 */
-        int stride_idx;
-        if (feat_h >= 70) stride_idx = 0;      /* stride=8 */
-        else if (feat_h >= 35) stride_idx = 1; /* stride=16 */
-        else stride_idx = 2;                    /* stride=32 */
+        /* Validate stride is one of the known YOLOv5 values */
+        if (stride != 8 && stride != 16 && stride != 32 && stride != 4 && stride != 64) {
+            log_warning("YOLOv5Face: 5D output[%zu] feat_h=%d model_input=%d → stride=%d "
+                        "(unexpected — expected 4/8/16/32/64).  Skipping.",
+                        oi, feat_h, model_input_size, stride);
+            continue;
+        }
 
         float* out_data = NULL;
         OrtStatus* st = ort->GetTensorMutableData(out_val, (void**)&out_data);
@@ -298,10 +382,29 @@ static int decode_5d_format(const uint8_t* image_data, int width, int height,
         size_t F = (size_t)feat_c;
         size_t stride_HWF = H * W * F;
 
+        /* ── Bounds-check: verify tensor holds enough elements ── */
+        {
+            OrtTensorTypeAndShapeInfo* si2 = NULL;
+            if (!ort->GetTensorTypeAndShape(out_val, &si2)) {
+                size_t elem_count = 0;
+                OrtStatus* _s = ort->GetTensorShapeElementCount(si2, &elem_count);
+                if (!_s && elem_count < (size_t)num_anchors * stride_HWF) {
+                    log_error("YOLOv5Face: 5D output[%zu] element count %zu < expected %zu. Skipping.",
+                              oi, elem_count, (size_t)num_anchors * stride_HWF);
+                    ort->ReleaseTensorTypeAndShapeInfo(si2);
+                    if (_s) ort->ReleaseStatus(_s);
+                    continue;
+                }
+                if (_s) ort->ReleaseStatus(_s);
+                ort->ReleaseTensorTypeAndShapeInfo(si2);
+            }
+        }
+
         static int frame_5d_log = 0;
         if (frame_5d_log++ == 0) {
-            log_info("YOLOv5Face: 5D format detected! output[%zu]: [1,%d,%d,%d,%d] stride_idx=%d",
-                     oi, num_anchors, feat_h, feat_w, feat_c, stride_idx);
+            log_info("YOLOv5Face: 5D format detected! output[%zu]: [1,%d,%d,%d,%d] "
+                     "stride=%d (model_input=%d)",
+                     oi, num_anchors, feat_h, feat_w, feat_c, stride, model_input_size);
         }
 
         for (int a = 0; a < num_anchors; a++) {
@@ -309,25 +412,45 @@ static int decode_5d_format(const uint8_t* image_data, int width, int height,
                 for (int gx = 0; gx < feat_w; gx++) {
                     if (num_raw >= max_faces) goto decode_5d_done;
 
-                    const float* feat = out_data + (size_t)a * stride_HWF
-                                                + (size_t)gy * W * F
-                                                + (size_t)gx * F;
+                    /* ── CRITICAL: Copy feature data to stack BEFORE processing ──
+                     * SpacemiT EP allocates 5D "cut" model output tensors in TCM
+                     * (NPU memory).  TCM on K1 does NOT support RISC-V RVV vector
+                     * loads (vle32.v) — only scalar flw/lw/sw.  GCC -O3 with
+                     * -mrvv-vector-bits=zvl auto-vectorizes consecutive float reads:
+                     * the NHWC layout has 16 consecutive features per grid cell =
+                     * ideal vectorization target → bus error → SIGSEGV.
+                     *
+                     * volatile forces the compiler to emit individual scalar flw
+                     * instructions (no vectorization, no load combining).  Each
+                     * float is loaded from TCM into a GPR, then stored to the
+                     * stack array in L1 cache, where subsequent processing
+                     * (including auto-vectorized sigmoid/exp) works safely.
+                     *
+                     * Long-term fix: IO Binding with CPU-preferred output allocation
+                     * (docs/inference-improvement-plan.md §1.4). */
+                    float feat_copy[FACE_FEAT_PER_ANCHOR];
+                    {
+                        const volatile float* vfeat =
+                            (const volatile float*)(out_data + (size_t)a * stride_HWF
+                                                             + (size_t)gy * W * F
+                                                             + (size_t)gx * F);
+                        for (int fi = 0; fi < FACE_FEAT_PER_ANCHOR; fi++) {
+                            feat_copy[fi] = vfeat[fi];
+                        }
+                    }
 
                     BoundingBox model_bbox;
                     float out_kpts[YOLOV5_FACE_NUM_KEYPOINTS][2];
-                    float confidence = decode_5d_proposal(feat, gx, gy, stride_idx, a,
+                    float confidence = decode_5d_proposal(feat_copy, gx, gy, stride, a,
                                                           &model_bbox, out_kpts);
 
                     if (confidence < conf_thresh) continue;
 
-                    /* Clip to model input range */
-                    int model_size = (stride_idx == 0) ? feat_h * 8 :
-                                     (stride_idx == 1) ? feat_h * 16 : feat_h * 32;
-
-                    model_bbox.x_min = UTILS_CLAMP(model_bbox.x_min, 0.0f, (float)(model_size - 1));
-                    model_bbox.y_min = UTILS_CLAMP(model_bbox.y_min, 0.0f, (float)(model_size - 1));
-                    model_bbox.x_max = UTILS_CLAMP(model_bbox.x_max, 0.0f, (float)(model_size - 1));
-                    model_bbox.y_max = UTILS_CLAMP(model_bbox.y_max, 0.0f, (float)(model_size - 1));
+                    /* Clip to model input range (use actual model_input_size) */
+                    model_bbox.x_min = UTILS_CLAMP(model_bbox.x_min, 0.0f, (float)(model_input_size - 1));
+                    model_bbox.y_min = UTILS_CLAMP(model_bbox.y_min, 0.0f, (float)(model_input_size - 1));
+                    model_bbox.x_max = UTILS_CLAMP(model_bbox.x_max, 0.0f, (float)(model_input_size - 1));
+                    model_bbox.y_max = UTILS_CLAMP(model_bbox.y_max, 0.0f, (float)(model_input_size - 1));
 
                     /* Map back through letterbox + crop to original image coords */
                     float x1, y1, x2, y2;
@@ -349,8 +472,8 @@ static int decode_5d_format(const uint8_t* image_data, int width, int height,
                     face->confidence = confidence;
 
                     for (int k = 0; k < YOLOV5_FACE_NUM_KEYPOINTS; k++) {
-                        float kx = UTILS_CLAMP(out_kpts[k][0], 0.0f, (float)(model_size - 1));
-                        float ky = UTILS_CLAMP(out_kpts[k][1], 0.0f, (float)(model_size - 1));
+                        float kx = UTILS_CLAMP(out_kpts[k][0], 0.0f, (float)(model_input_size - 1));
+                        float ky = UTILS_CLAMP(out_kpts[k][1], 0.0f, (float)(model_input_size - 1));
                         kx = (kx - pad_x) / scale + (float)crop_x;
                         ky = (ky - pad_y) / scale + (float)crop_y;
                         face->keypoints[k][0] = UTILS_CLAMP(kx, 0.0f, (float)(width - 1));
@@ -381,20 +504,22 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
         return 0;
     }
 
-    float* input_tensor = (float*)malloc(input_size);
-    if (!input_tensor) return 0;
-
     float scale = 1.0f;
     int pad_x = 0, pad_y = 0;
     int crop_x = 0, crop_y = 0;
-    yolo_preprocess(image_data, width, height, input_tensor,
-                            input_w, input_h, &scale, &pad_x, &pad_y, &crop_x, &crop_y);
 
-    if (!ort_ctx_prepare_input(det->ctx, input_tensor, input_size)) {
-        free(input_tensor);
+    /* ── FIXED: Use pooled preprocess to avoid per-frame malloc/free ── */
+    if (yolo_preprocess_pooled(det->ctx, image_data, width, height,
+                                input_w, input_h,
+                                &scale, &pad_x, &pad_y, &crop_x, &crop_y) != 0) {
+        log_error("YOLOv5Face: pooled preprocess failed for %dx%d → %dx%d",
+                  width, height, input_w, input_h);
         return 0;
     }
-    free(input_tensor);
+    if (!ort_ctx_input_ready(det->ctx, input_size)) {
+        log_error("YOLOv5Face: ort_ctx_input_ready failed");
+        return 0;
+    }
 
     size_t num_outputs = 0;
     OrtStatus* st_oc = ort->SessionGetOutputCount(det->session, &num_outputs);
@@ -450,7 +575,8 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
                                     output_vals, num_outputs, ort,
                                     scale, pad_x, pad_y, crop_x, crop_y,
                                     det->confidence_threshold,
-                                    raw_faces, YOLOV5_FACE_MAX_FACES);
+                                    raw_faces, YOLOV5_FACE_MAX_FACES,
+                                    det->input_height);  /* model input size (square) */
     } else {
         /* ── Standard 4D format path ── */
         for (size_t oi = 0; oi < num_outputs; oi++) {
@@ -476,7 +602,6 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
             ort->ReleaseTensorTypeAndShapeInfo(si);
 
             int nch = (num_dims_4d >= 2) ? (int)fdims[1] : 0;
-            /* Skip outputs with too few channels (e.g. xquant partial: reg=64, cls=1, kpt=10) */
             if (nch < 16) continue;
 
             const int FACE_ELEM_PER_PROP = 16;
@@ -485,15 +610,10 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
 
             for (int pi = 0; pi < num_proposals && num_raw < YOLOV5_FACE_MAX_FACES; pi++) {
                 const float* row = out_data + pi * FACE_ELEM_PER_PROP;
-
-                /* Standard format (deepcam-cn official order):
-                 * [0..3]=bbox(cx,cy,w,h) [4]=obj [5..14]=landmarks(5×2) [15]=cls
-                 * NOTE: standard ONNX export has Detect layer baked in —
-                 * values are already sigmoid'd. */
                 float cx = row[0], cy = row[1];
                 float wb = row[2], hb = row[3];
-                float obj_conf = row[4];  /* already sigmoid'd */
-                float cls_conf = row[15]; /* CLASS IS AT INDEX 15, NOT 5! */
+                float obj_conf = row[4];
+                float cls_conf = row[15];
                 float conf_val = obj_conf * cls_conf;
 
                 if (conf_val < det->confidence_threshold) continue;
@@ -517,7 +637,7 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
                 face->confidence = conf_val;
 
                 for (int k = 0; k < YOLOV5_FACE_NUM_KEYPOINTS; k++) {
-                    float kx = (row[5 + k * 2 + 0] - pad_x) / scale + (float)crop_x;  /* landmarks start at 5 */
+                    float kx = (row[5 + k * 2 + 0] - pad_x) / scale + (float)crop_x;
                     float ky = (row[5 + k * 2 + 1] - pad_y) / scale + (float)crop_y;
                     face->keypoints[k][0] = UTILS_CLAMP(kx, 0.0f, (float)width - 1);
                     face->keypoints[k][1] = UTILS_CLAMP(ky, 0.0f, (float)height - 1);
@@ -532,9 +652,11 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
 
     if (num_raw <= 0) return 0;
 
+    /* BUGFIX: use offsetof instead of sizeof(BoundingBox) — if struct layout
+     * changes, sizeof(first_field) silently breaks confidence extraction. */
     num_raw = yolo_nms_suppress(raw_faces, num_raw, sizeof(RawFaceDetection),
                              0.0f, det->nms_threshold, YOLOV5_FACE_MAX_FACES,
-                             NULL, (int)sizeof(BoundingBox));
+                             NULL, (int)offsetof(RawFaceDetection, confidence));
     int num_faces = UTILS_MIN(num_raw, max_faces);
 
     for (int i = 0; i < num_faces; i++) {

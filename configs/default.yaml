@@ -47,6 +47,7 @@ video:
   video_path: ""
   output_path: "output/result.mp4"
   save_frame_interval: 1
+  capture_min_interval_ms: 0      # 0=disabled; set to ~200 for consistent 5 FPS decimation
 
 coap:
   enabled: true
@@ -57,6 +58,7 @@ coap:
   frame_timeout_s: 10
 
 k1_imu:
+  enabled: false          # GY85 (ADXL345+ITG3205) not populated on most Muse Pi Pro boards
   i2c_bus: 4
   sample_rate_hz: 100
   calibration_samples: 200
@@ -68,6 +70,36 @@ madgwick:
 dual_imu:
   alignment_window: 200
   alignment_timeout_s: 10.0
+
+# ── Phase A: K1 Odometry (INS + ZUPT) ──
+odometry:
+  enabled: true
+  init_duration_s: 2.0           # 重力对齐静止时间 (s)
+  zupt_accel_thresh: 0.15        # 简单阈值: 加速度偏离 g 的阈值 (m/s²)
+  zupt_gyro_thresh: 0.15         # 简单阈值: 陀螺仪模长阈值 (rad/s), 0.15 对 MEMS 合理
+  zupt_window_size: 5            # GLRT 滑动窗口大小
+  sigma_accel: 0.01              # 加速度计噪声标准差 (m/s²)
+  sigma_gyro: 0.015              # 陀螺仪噪声标准差 (rad/s)
+  glrt_threshold: 500.0           # GLRT statistic threshold (was 300000, then 500)
+  export_csv: true               # 导出 K1 轨迹 CSV
+
+# ── Phase B: World Coordinate System ──
+world_coord:
+  enabled: true
+  max_persons: 64
+  person_timeout_s: 60.0          # 人消失后保留世界坐标的时长
+  skeleton_fixed_ratio: true      # 用固定人体比例估算骨架 3D
+  export_csv: true
+  # ── 自适应世界锚点 (参考 SEVIS-3D Schmidt-EKF) ──
+  anchor_motion_threshold: 0.30   # 运动检测阈值 (m): 低于此值锁定锚点不动
+  anchor_moving_alpha: 0.15       # 移动时的慢速动量 (低=更平滑但响应慢)
+
+# ── Phase C+D: AR Render / Distance Labels ──
+ar_render:
+  skeleton_3d_mode: true          # true=世界坐标投影骨架, false=YOLO 2D
+  distance_labels: true           # 显示 K1 相对距离标签
+  show_k1_compass: true           # 显示 K1 指南针 (yaw 指示器)
+  show_k1_speed: true             # 显示 K1 速度条 (km/h)
 
 detection:
   # SECONDARY person detector — DISABLED in unified mode.
@@ -81,30 +113,38 @@ detection:
   iou_threshold: 0.40
   input_size: [640, 640]
   classes: 80
-  keypoint_min_count: 3           # lowered from 6: 320x320 model produces weak keypoints
-  keypoint_min_confidence: 0.08   # lowered from 0.30: INT8-quantized keypoints rarely exceed 0.15
-  keypoint_validity_threshold: 0.25 # lowered from 0.50: compensate for low-conf keypoints
+  # ── Tuned for 320×320 INT8-quantized model ──
+  # quantized keypoints rarely exceed 0.15 confidence.
+  keypoint_min_count: 2            # allow 2 visible keypoints (was 3)
+  keypoint_min_confidence: 0.05    # ultra-low for INT8 model (was 0.08)
+  keypoint_validity_threshold: 0.12 # relaxed anatomical check (was 0.25)
   # ── Cascade optimization (single-model mode) ──
-  # With only one model, the cascade simply throttles face detection
-  # when tracks are stable. No secondary detector to schedule.
   cascade_enabled: false
   cascade_validation_interval: 15
   cascade_secondary_interval: 5
   cascade_tracking_resolution: [320, 320]
-  fallback_confidence: 0.20
-  fallback_area_ratio_min: 0.008
+  fallback_confidence: 0.08        # lowered from 0.20 for weak DFL peaks
+  fallback_area_ratio_min: 0.004   # lowered from 0.008 to catch distant people
 
 pose:
-  # PERSON detector + pose estimator (YOLOv8n-pose from official BRDK CV demo, xquant-split INT8).
+  # PERSON detector + pose estimator — selectable model variant.
+  #
+  # Supported variants and their model files:
+  #   yolov8n-pose  → models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx
+  #   yolo11n-pose  → models/Action Prediction/Skeleton Recognition/yolo11n-pose.q.onnx
+  #
   # YOLOv8n-pose: 3.3M params, 9.2 GFLOPs, AP 48.0 on COCO-Pose.
-  # Output format: {reg(64ch), cls(1ch), kpt(51ch)} × 3 FPN strides.
+  # YOLO11n-pose: better architecture (C3k2 blocks, anchor-free), higher mAP.
+  # Both are INT8-quantized for SpacemiT EP acceleration.
+  #
   # DFL peakiness used as confidence (cls head broken by INT8 quantization).
   # 480×480: 44% fewer pixels than 640, ~40% faster inference.
   backend: ai_accel
-  model_path: "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx"
-  confidence_threshold: 0.06   # lowered: catch more detections
+  # "yolov8n-pose" or "yolo11n-pose"
+  model_variant: "yolov8n-pose"
+  confidence_threshold: 0.04      # ultra-low for 320x320 INT8 model (was 0.06)
   iou_threshold: 0.40
-  input_size: [480, 480]       # model's actual input is 640x640 (overridden at load)
+  input_size: [480, 480]          # model's actual input is 320x320 (overridden at load)
   num_keypoints: 17
   skeleton_type: coco
 
@@ -122,23 +162,24 @@ face:
   similarity_threshold: 0.55
   input_size: [320, 320]
   embedding_dim: 128   # ArcFace MobileFaceNet-cuted outputs [1,128]; must match FEATURE_VECTOR_DIM
+  use_ep: false        # Enable SpacemiT EP (IO Binding required for safe TCM output reads)
   liveness_detection: false
 
 action:
   enabled: true
   backend: ai_accel
-  model_path: "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx"
-  num_frames: 30
-  num_keypoints: 14
-  num_persons: 1
-  num_classes: 7    # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
+  model_path: "models/Action Prediction/Skeleton-based Action Prediction/stgcn_int8.onnx"
+  # num_frames/num_keypoints/num_persons are auto-detected from model input shape
+  # at load time.  These values are fallback defaults only.
+  # The INT8 ST-GCN model expects NTU-RGB+D standard: 300 frames, 25 keypoints, 2 persons.
+  num_frames: 300        # fallback — auto-detected from model
+  num_keypoints: 25      # fallback — auto-detected from model (NTU-RGB+D 25 joints)
+  num_persons: 2         # fallback — auto-detected from model
+  num_classes: 7          # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
   confidence_threshold: 0.50
-  # ST-GCN runs on CPU EP (FP32) — ~400ms per forward pass on K1.
-  # inference_interval=50 means ST-GCN runs every 50th pose-estimation frame.
-  # At ~4 FPS: 50 frames ≈ 12.5s between action predictions. This is acceptable
-  # for most real-world scenarios (actions unfold over seconds, not milliseconds).
-  # Tradeoff: higher interval = lower CPU load, lower interval = faster reaction.
-  inference_interval: 50   # further reduced CPU contention; was 25, was 10 before that
+  # ST-GCN now uses INT8-quantized model → SpacemiT EP acceleration (~3× faster vs CPU FP32).
+  # inference_interval=15: run every 15 pose frames ≈ every 1.5s at 10 FPS.
+  inference_interval: 15
 
 tracking:
   max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
@@ -148,21 +189,21 @@ tracking:
   max_track_history: 300
   kalman_process_noise: 0.05
   kalman_measurement_noise: 0.10
-  # ── Enhanced confirmation (lowered for faster response) ──
-  confirmation_frames: 3          # reduced from 5: 3 hits ≈ 0.85s to confirm
-  min_keypoints_for_confirm: 3    # lowered from 4: faster confirm for partial-body
-  min_keypoints_strong: 6         # lowered from 8: INT8 keypoints rarely reach 8
-  spatial_jump_max_m: 3.0         # reject implausible position jumps (>3m/frame)
-  # ── Cascade matching (NEW) ──
-  cascade_max_age: 30             # max frames since update for cascade levels
-  cascade_min_hits: 3             # min hits before track enters cascade
-  appearance_weight: 0.35          # weight of appearance vs IoU in cost matrix
-  appearance_max_dist: 0.50        # cosine distance gate for appearance matching
-  iou_threshold_low: 0.15          # second-stage IoU for occlusion recovery
-  # ── Occlusion handling (NEW) ──
-  upper_body_min_keypoints: 4      # min upper-body keypoints for partial detection
-  side_body_min_keypoints: 3       # min one-side keypoints for lateral view
-  occlusion_score_threshold: 0.40  # below this ratio → considered occluded
+  # ── Enhanced confirmation (tuned for 320×320 INT8 model) ──
+  confirmation_frames: 2           # reduced: 2 hits to confirm
+  min_keypoints_for_confirm: 2     # lowered for partial-body at 320×320
+  min_keypoints_strong: 3          # lowered: INT8 model rarely exceeds 3 strong kpts
+  spatial_jump_max_m: 5.0          # relaxed: allow larger jumps for 320×320 noise
+  # ── Cascade matching ──
+  cascade_max_age: 30
+  cascade_min_hits: 2              # lowered from 3
+  appearance_weight: 0.25           # reduced: rely more on IoU than appearance
+  appearance_max_dist: 0.65         # relaxed cosine distance gate
+  iou_threshold_low: 0.10           # lowered second-stage IoU for occlusion
+  # ── Occlusion handling ──
+  upper_body_min_keypoints: 3       # lowered: partial-body at 320×320
+  side_body_min_keypoints: 2        # lowered: one-side keypoints at 320×320
+  occlusion_score_threshold: 0.30   # lowered occlusion threshold
   # ── Re-identification (NEW) ──
   reid_pool_max_age: 60           # frames to keep deleted track in re-id pool
   # ── Multi-person detection (NEW) ──
@@ -179,8 +220,8 @@ tracking:
 spatial:
   fx: 960.0
   fy: 960.0
-  cx: 960.0
-  cy: 540.0
+  cx: 320.0                      # 640×480 图像中心 (原 960.0 是 1920×1080 的)
+  cy: 240.0                      # 640×480 图像中心 (原 540.0 是 1920×1080 的)
   avg_human_height: 1.70
   min_depth: 0.3
   max_depth: 120.0
@@ -276,6 +317,38 @@ ai_acceleration:
   preload_models: true
   warmup_runs: 3
 
+# ── Frame Differencing: Adaptive Frame Skip ──
+# Skips YOLO inference on near-identical frames by computing a fast
+# subsampled MAD (Mean Absolute Difference) against the last processed
+# reference frame.  This is the single most impactful optimization for
+# real-world video: static scenes save ~150ms/frame on K1.
+#
+# Algorithm:
+#   1. Divide frame into grid_w × grid_h cells
+#   2. In each cell, sample every subsample-th pixel
+#   3. Compute per-channel MAD for each cell
+#   4. Cell is "changed" if MAD > cell_threshold
+#   5. Frame needs processing if changed_ratio > change_threshold
+#
+# Activity classification:
+#   STATIC      (< 5% cells changed):  skip up to max_static_skip frames
+#   LOW_MOTION  (5-15% cells changed): skip up to max_low_motion_skip frames
+#   ACTIVE      (> 15% cells changed): process every frame
+#
+# Cost: ~0.2ms per comparison (640×480, stride=4, 8×8 grid)
+# Savings: ~150ms per skipped frame → up to 10× effective throughput
+frame_diff:
+  enabled: true                   # master switch
+  grid_w: 8                       # horizontal grid cells
+  grid_h: 8                       # vertical grid cells
+  subsample: 4                    # pixel stride within each cell (4=every 4th pixel)
+  cell_threshold: 8.0             # MAD per channel to mark cell "changed" (0-255)
+  change_threshold: 0.15          # fraction of changed cells to trigger full inference
+  adaptive_enabled: true          # enable adaptive skip limits
+  max_static_skip: 20             # max consecutive skips in static scenes
+  max_low_motion_skip: 5          # max consecutive skips in low-motion scenes
+  force_process_every: 30         # force full inference every N frames (drift guard)
+
 performance:
   rvv_enabled: true
   rvv_vlen: 256
@@ -312,14 +385,9 @@ k1_hardware:
   vpu:
     enabled: true
     mpp_device: "/dev/mpp_service"
-    hardware_jpeg_decode: true
     hardware_h264_encode: true
     max_encode_resolution: [1920, 1080]
     encoder_bitrate_kbps: 4000
-  jpu:
-    enabled: true
-    jpu_device: "/dev/jpu"
-    prefer_hardware: true
   gpu:
     enabled: true
     drm_device: "/dev/dri/renderD128"
