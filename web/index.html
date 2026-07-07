@@ -158,12 +158,16 @@ body {
   position: relative; width: 100%; height: 100%;
   overflow: hidden;
 }
-#vid {
-  display: none;
+#vid, #vid-back {
+  position: absolute; top: 0; left: 0;
   width: 100%; height: 100%;
   object-fit: contain;
+  image-rendering: high-quality;
+  -ms-interpolation-mode: bicubic;
 }
-#ovl { position: absolute; top: 0; left: 0; pointer-events: none; }
+#vid  { display: none; }
+#vid-back { display: none; }
+#ovl { position: absolute; top: 0; left: 0; pointer-events: none; image-rendering: crisp-edges; }
 #ph {
   position: absolute; top: 50%; left: 50%;
   transform: translate(-50%,-50%); text-align: center;
@@ -302,6 +306,7 @@ select { cursor: pointer; }
       <div id="vid-wrap">
         <div id="ph"><p>等待管线帧...</p><small>启动管线开始采集</small></div>
         <img id="vid" alt="相机画面">
+        <img id="vid-back" alt="">
         <canvas id="ovl"></canvas>
       </div>
     </div>
@@ -341,7 +346,7 @@ window.__threeReady = true;
 var D = {};
 ['st','dot','ws-txt','b1','b2','b3','b4',
  'sv-fps','sv-frame','sv-tracks','sv-dets','sv-action','sv-uptime',
- 'diag','log','vid','ovl','ph','mc','map-info','map-fallback-msg',
+ 'diag','log','vid','vid-back','ovl','ph','mc','map-info','map-fallback-msg',
  'map-count','cfg-ct','cfg-actions','cfg-save','cfg-start','cfg-status',
  'mc-wrap'].forEach(function(id){
   var el = document.getElementById(id);
@@ -413,30 +418,49 @@ document.querySelectorAll('.tab').forEach(function(t){
 /* ═══════════════════════ 2D 叠加层 ═══════════════════════ */
 var CAM_W = 640, CAM_H = 480;
 
+var _videoFb = 'vid'; /* which img is currently visible: 'vid' or 'vid-back' */
+
 function alignOverlay() {
-  var img = D.vid, ovl = D.ovl, wrap = document.getElementById('vid-wrap');
+  var img = D[_videoFb], ovl = D.ovl, wrap = document.getElementById('vid-wrap');
   if (!img.naturalWidth || !img.naturalHeight) return;
   if (img.style.display === 'none') return;
 
-  /* Use image natural size as canvas logical coordinate space.
-   * Detection bbox coordinates must match this space.
-   * Server sends bboxes in camera-native resolution (640x480),
-   * scaled by naturalWidth/cameraWidth ratio in push_frame_to_web. */
   var cw = wrap.clientWidth, ch = wrap.clientHeight;
   var iw = img.naturalWidth, ih = img.naturalHeight;
   if (cw < 2 || ch < 2) return;
 
   var scale = Math.min(cw / iw, ch / ih);
-  var dispW = iw * scale, dispH = ih * scale;
-  var offX = (cw - dispW) / 2, offY = (ch - dispH) / 2;
+  /* Round to integer pixels — sub-pixel positions cause GPU blur */
+  var dispW = Math.round(iw * scale);
+  var dispH = Math.round(ih * scale);
+  var offX = Math.round((cw - dispW) / 2);
+  var offY = Math.round((ch - dispH) / 2);
 
   ovl.style.left   = offX + 'px';
   ovl.style.top    = offY + 'px';
   ovl.style.width  = dispW + 'px';
   ovl.style.height = dispH + 'px';
-  /* Canvas logical pixels = image natural pixels */
   ovl.width  = iw;
   ovl.height = ih;
+}
+
+/* Double-buffer: load JPEG into hidden back-buffer, then swap */
+function _swapVideoFrame(url, revoke) {
+  var backId = (_videoFb === 'vid') ? 'vid-back' : 'vid';
+  var backImg = D[backId];
+
+  backImg.onload = function() {
+    /* Hide current front, show back */
+    D[_videoFb].style.display = 'none';
+    backImg.style.display = 'block';
+    _videoFb = backId;
+    D.ph.style.display = 'none';
+    if (revoke && url.startsWith('blob:')) URL.revokeObjectURL(url);
+    /* Re-align overlay to new frame's dimensions */
+    alignOverlay();
+    if (lastFrame && currentTab === 'cam') renderOvl(lastFrame);
+  };
+  backImg.src = url;
 }
 
 function renderOvl(m) {
@@ -446,36 +470,41 @@ function renderOvl(m) {
   if (W < 1 || H < 1) { W = CAM_W; H = CAM_H; c.width = W; c.height = H; }
   var ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H);
+  /* Sharper text rendering */
+  ctx.textBaseline = 'top';
 
   var dets = m.d || [];
   for (var i = 0; i < dets.length; i++) {
     var d = dets[i];
-    ctx.strokeStyle = 'rgba(255,220,40,0.85)'; ctx.lineWidth = 2;
-    ctx.strokeRect(d[0], d[1], d[2]-d[0], d[3]-d[1]);
-    ctx.fillStyle = 'rgba(255,220,40,0.95)';
-    ctx.font = 'bold 14px ' + getComputedStyle(document.body).fontFamily;
-    ctx.fillText(Math.round(d[4]*100)+'%', d[0]+2, d[1] > 18 ? d[1]-4 : d[1]+18);
+    /* +0.5 offset snaps 1px stroke to pixel grid for maximum sharpness */
+    ctx.strokeStyle = '#FFD428'; ctx.lineWidth = 2;
+    ctx.strokeRect(d[0]+0.5, d[1]+0.5, d[2]-d[0], d[3]-d[1]);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 13px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(Math.round(d[4]*100)+'%', d[0]+3, d[1] > 18 ? d[1]-17 : d[1]+3);
+    ctx.fillStyle = '#FFD428'; ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(Math.round(d[4]*100)+'%', d[0]+2, d[1] > 18 ? d[1]-18 : d[1]+2);
   }
 
   var poses = m.p || [];
   for (var pi = 0; pi < poses.length; pi++) {
     var p = poses[pi], k = p.k || [];
     if (p.b) {
-      ctx.strokeStyle = 'rgba(0,220,120,0.5)'; ctx.setLineDash([5,5]); ctx.lineWidth = 1.5;
-      ctx.strokeRect(p.b[0], p.b[1], p.b[2]-p.b[0], p.b[3]-p.b[1]); ctx.setLineDash([]);
+      ctx.strokeStyle = '#00DC78'; ctx.setLineDash([5,5]); ctx.lineWidth = 1.5;
+      ctx.strokeRect(p.b[0]+0.5, p.b[1]+0.5, p.b[2]-p.b[0], p.b[3]-p.b[1]); ctx.setLineDash([]);
     }
-    ctx.strokeStyle = 'rgba(0,240,130,0.6)'; ctx.lineWidth = 2.5;
+    /* Skeleton lines — 2px solid for crispness */
+    ctx.strokeStyle = '#00F082'; ctx.lineWidth = 2;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     for (var si = 0; si < SK.length; si++) {
       var a = SK[si][0], b = SK[si][1];
       if (!k[a] || !k[b]) continue;
       ctx.beginPath(); ctx.moveTo(k[a][0], k[a][1]); ctx.lineTo(k[b][0], k[b][1]); ctx.stroke();
     }
+    /* Keypoints — double-draw for contrast: dark outline + bright fill */
     for (var ki = 0; ki < k.length; ki++) {
       if (!k[ki]) continue;
-      ctx.fillStyle = KC[ki] || '#0f0';
-      ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 4, 0, Math.PI*2); ctx.fill();
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 4, 0, Math.PI*2); ctx.stroke();
+      ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 4.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = KC[ki] || '#0f0'; ctx.beginPath(); ctx.arc(k[ki][0], k[ki][1], 3.5, 0, Math.PI*2); ctx.fill();
     }
   }
 
@@ -483,19 +512,21 @@ function renderOvl(m) {
   for (var ti = 0; ti < trks.length; ti++) {
     var t = trks[ti];
     if (!t.b) continue;
-    ctx.strokeStyle = 'rgba(64,160,255,0.75)'; ctx.setLineDash([6,4]); ctx.lineWidth = 2.5;
-    ctx.strokeRect(t.b[0], t.b[1], t.b[2]-t.b[0], t.b[3]-t.b[1]); ctx.setLineDash([]);
-    ctx.fillStyle = '#4090ff';
-    ctx.font = 'bold 13px ' + getComputedStyle(document.body).fontFamily;
+    ctx.strokeStyle = '#4090FF'; ctx.setLineDash([6,4]); ctx.lineWidth = 2;
+    ctx.strokeRect(t.b[0]+0.5, t.b[1]+0.5, t.b[2]-t.b[0], t.b[3]-t.b[1]); ctx.setLineDash([]);
     var lbl = '#'+t.i;
     if (t.p) lbl += ' '+t.p[0].toFixed(1)+','+t.p[2].toFixed(1)+'m';
-    ctx.fillText(lbl, t.b[0]+2, t.b[1] > 18 ? t.b[1]-4 : t.b[1]+18);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 13px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(lbl, t.b[0]+3, t.b[1] > 18 ? t.b[1]-17 : t.b[1]+3);
+    ctx.fillStyle = '#4090FF'; ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(lbl, t.b[0]+2, t.b[1] > 18 ? t.b[1]-18 : t.b[1]+2);
   }
 
-  var barH = 30;
-  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, barH);
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
-  ctx.fillText('帧 '+m.n+'  帧率 '+m.f+'  追踪 '+trks.length+'  检测 '+dets.length+(m.a?'  动作 '+m.a[0]:''), 10, 21);
+  /* Info bar at top */
+  var barH = 28;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(0, 0, W, barH);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 11px ' + getComputedStyle(document.body).fontFamily;
+  ctx.fillText('帧 '+m.n+'  帧率 '+m.f+'  追踪 '+trks.length+'  检测 '+dets.length+(m.a?'  动作 '+m.a[0]:''), 10, 8);
 }
 
 /* ═══════════════════════ 2D 地图（回退） ═══════════════════════ */
@@ -572,9 +603,115 @@ function render2DMap(m) {
 /* ═══════════════════════ Three.js 3D 地图 ═══════════════════════ */
 var threeScene, threeCamera, threeRenderer, threeControls;
 var threeObjects = {};
-var threePersonMeshes = {};   /* track_id -> Group (body+head+shadow+label) */
+var threePersonMeshes = {};   /* track_id -> Group (full humanoid) */
 var threePersonTrails = {};   /* track_id -> {points, line} */
 var threeAnimId = null;
+var threeClock = new (typeof THREE !== 'undefined' && THREE.Clock ? THREE.Clock : function(){return{getElapsedTime:function(){return Date.now()/1000}}})();
+
+/* ── Shared geometries (reused for all person meshes, saves GPU memory) ── */
+var _geomCache = null;
+function _getSharedGeoms() {
+  if (_geomCache) return _geomCache;
+  _geomCache = {
+    head:     new THREE.SphereGeometry(0.11, 20, 18),
+    neck:     new THREE.CylinderGeometry(0.045, 0.05, 0.1, 12),
+    torso:    new THREE.CylinderGeometry(0.16, 0.18, 0.55, 16),
+    hip:      new THREE.CylinderGeometry(0.165, 0.155, 0.22, 14),
+    upperArmL:new THREE.CylinderGeometry(0.055, 0.05, 0.32, 12),
+    upperArmR:new THREE.CylinderGeometry(0.055, 0.05, 0.32, 12),
+    forearmL: new THREE.CylinderGeometry(0.045, 0.04, 0.28, 12),
+    forearmR: new THREE.CylinderGeometry(0.045, 0.04, 0.28, 12),
+    hand:     new THREE.SphereGeometry(0.04, 10, 8),
+    upperLegL:new THREE.CylinderGeometry(0.07, 0.065, 0.38, 12),
+    upperLegR:new THREE.CylinderGeometry(0.07, 0.065, 0.38, 12),
+    lowerLegL:new THREE.CylinderGeometry(0.06, 0.05, 0.36, 12),
+    lowerLegR:new THREE.CylinderGeometry(0.06, 0.05, 0.36, 12),
+    foot:     new THREE.BoxGeometry(0.09, 0.06, 0.16, 8, 4, 6),
+    shadow:   new THREE.CircleGeometry(0.2, 12)
+  };
+  return _geomCache;
+}
+
+/* ── Build a full humanoid mesh group ── */
+function createHumanoidMesh(hexColor) {
+  var G = _getSharedGeoms();
+  var group = new THREE.Group();
+  group.name = 'humanoid';
+
+  /* 材质: 肤色 = 暖米色; 衣物强调色 = hexColor */
+  var skinColor = 0xF5E0C8;
+  var clothColor = hexColor;
+  var darkCloth = new THREE.Color(hexColor).multiplyScalar(0.55).getHex();
+  var shoeColor = 0x3A3028;
+
+  var matSkin    = new THREE.MeshStandardMaterial({color: skinColor, roughness: 0.72, metalness: 0.02});
+  var matCloth   = new THREE.MeshStandardMaterial({color: clothColor, roughness: 0.55, metalness: 0.08});
+  var matDark    = new THREE.MeshStandardMaterial({color: darkCloth, roughness: 0.65, metalness: 0.05});
+  var matShoe    = new THREE.MeshStandardMaterial({color: shoeColor, roughness: 0.85, metalness: 0.0});
+  var matShadow  = new THREE.MeshBasicMaterial({color: 0x000000, transparent: true, opacity: 0.22, depthWrite: false});
+
+  /* ── Body parts ── */
+  function addPart(geom, mat, x, y, z, rx, ry, rz) {
+    var m = new THREE.Mesh(geom, mat);
+    m.position.set(x||0, y||0, z||0);
+    if (rx) m.rotation.x = rx; if (ry) m.rotation.y = ry; if (rz) m.rotation.z = rz;
+    group.add(m);
+    return m;
+  }
+
+  /* Shadow */
+  var sh = new THREE.Mesh(G.shadow, matShadow);
+  sh.rotation.x = -Math.PI/2; sh.position.y = 0.005; sh.renderOrder = 1;
+  sh.material.depthTest = true; sh.material.depthWrite = false;
+  group.add(sh);
+
+  /* Left leg */
+  addPart(G.upperLegL, matDark, -0.08, 0.80, 0);
+  addPart(G.lowerLegL, matDark, -0.08, 0.44, 0);
+  addPart(G.foot, matShoe, -0.08, 0.11, 0.05);
+
+  /* Right leg */
+  addPart(G.upperLegR, matDark, 0.08, 0.80, 0);
+  addPart(G.lowerLegR, matDark, 0.08, 0.44, 0);
+  addPart(G.foot, matShoe, 0.08, 0.11, 0.05);
+
+  /* Hip / pelvis */
+  addPart(G.hip, matDark, 0, 1.02, 0);
+
+  /* Torso (clothed) */
+  addPart(G.torso, matCloth, 0, 1.38, 0);
+
+  /* Left arm (slightly away from body) */
+  addPart(G.upperArmL, matCloth, -0.24, 1.60, 0, 0, 0, 0.15);
+  addPart(G.forearmL, matDark, -0.32, 1.32, 0, 0, 0, 0.15);
+  addPart(G.hand, matSkin, -0.38, 1.06, 0);
+
+  /* Right arm */
+  addPart(G.upperArmR, matCloth, 0.24, 1.60, 0, 0, 0, -0.15);
+  addPart(G.forearmR, matDark, 0.32, 1.32, 0, 0, 0, -0.15);
+  addPart(G.hand, matSkin, 0.38, 1.06, 0);
+
+  /* Neck */
+  addPart(G.neck, matSkin, 0, 1.72, 0);
+
+  /* Head */
+  addPart(G.head, matSkin, 0, 1.82, 0);
+
+  /* Eye dots (tiny spheres on head) */
+  var eyeMat = new THREE.MeshBasicMaterial({color: 0x111111});
+  var eyeGeo = new THREE.SphereGeometry(0.018, 6, 6);
+  var le = new THREE.Mesh(eyeGeo, eyeMat); le.position.set(-0.035, 1.86, 0.10); group.add(le);
+  var re = new THREE.Mesh(eyeGeo, eyeMat); re.position.set( 0.035, 1.86, 0.10); group.add(re);
+
+  group.userData = {
+    skinMat: matSkin,
+    clothMat: matCloth,
+    darkMat: matDark,
+    shadowMat: matShadow,
+    _breathBase: 1.38  /* torso base Y for breathing anim */
+  };
+  return group;
+}
 
 /* Create a canvas-texture sprite label for 3D person markers */
 function makePersonLabel(trackId, dist, colorHex) {
@@ -599,10 +736,11 @@ function makePersonLabel(trackId, dist, colorHex) {
   ctx.fillText(dist.toFixed(1)+'m', x+80, y+30);
   var tex = new THREE.CanvasTexture(c);
   tex.minFilter = THREE.LinearFilter;
-  var mat = new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false});
+  var mat = new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false, depthWrite: false});
   var sprite = new THREE.Sprite(mat);
   sprite.scale.set(2.0, 0.5, 1);
-  sprite.position.y = 1.4;
+  sprite.position.y = 2.15;
+  sprite.renderOrder = 999;
   return sprite;
 }
 
@@ -631,19 +769,47 @@ function init3DMap() {
     threeCamera.position.set(8, 10, 12);
     threeCamera.lookAt(0, 0, 0);
 
-    threeRenderer = new THREE.WebGLRenderer({antialias: true, canvas: D.mc});
+    threeRenderer = new THREE.WebGLRenderer({antialias: true, canvas: D.mc, alpha: false, preserveDrawingBuffer: false});
     threeRenderer.setSize(W, H);
     threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    threeRenderer.shadowMap.enabled = false;
+    threeRenderer.shadowMap.enabled = true;
+    threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    threeRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    threeRenderer.toneMappingExposure = 1.1;
+    threeRenderer.outputColorSpace = THREE.SRGBColorSpace;
 
-    threeScene.add(new THREE.AmbientLight('#FFF5EB', 1.2));
-    threeScene.add(new THREE.HemisphereLight('#FFEEDD', '#C4B5A5', 0.6));
+    /* ── Lighting ── */
+    threeScene.add(new THREE.AmbientLight('#FFF5EB', 1.0));
+    threeScene.add(new THREE.HemisphereLight('#FFEEDD', '#C4B5A5', 0.5));
 
+    /* Key light (simulates overhead sun) — casts shadows */
+    var sunLight = new THREE.DirectionalLight('#FFF8F0', 2.8);
+    sunLight.position.set(6, 14, 4);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.width = 1024;
+    sunLight.shadow.mapSize.height = 1024;
+    sunLight.shadow.camera.near = 0.5;
+    sunLight.shadow.camera.far = 60;
+    sunLight.shadow.camera.left = -12;
+    sunLight.shadow.camera.right = 12;
+    sunLight.shadow.camera.top = 12;
+    sunLight.shadow.camera.bottom = -12;
+    sunLight.shadow.bias = -0.0004;
+    sunLight.shadow.normalBias = 0.02;
+    threeScene.add(sunLight);
+
+    /* Fill light (cooler, softer, opposite side) */
+    var fillLight = new THREE.DirectionalLight('#C8D8FF', 0.35);
+    fillLight.position.set(-3, 2, -2);
+    threeScene.add(fillLight);
+
+    /* ── Ground (receives shadows) ── */
     var ground = new THREE.Mesh(
       new THREE.PlaneGeometry(20, 20),
-      new THREE.MeshLambertMaterial({color: '#E8E0D5', side: THREE.DoubleSide})
+      new THREE.MeshStandardMaterial({color: '#E8E0D5', side: THREE.DoubleSide, roughness: 0.85, metalness: 0.02})
     );
     ground.rotation.x = -Math.PI/2;
+    ground.receiveShadow = true;
     threeScene.add(ground);
 
     threeScene.add(new THREE.GridHelper(20, 10, '#D5CCC0', '#D5CCC0'));
@@ -651,6 +817,7 @@ function init3DMap() {
     var k1Mat = new THREE.MeshStandardMaterial({color: '#5B8C7A', emissive: '#3D6A5A', emissiveIntensity: 0.4});
     var k1Marker = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), k1Mat);
     k1Marker.position.y = 0.15;
+    k1Marker.castShadow = true; k1Marker.receiveShadow = true;
     threeScene.add(k1Marker);
     threeObjects['k1'] = k1Marker;
 
@@ -660,6 +827,7 @@ function init3DMap() {
     );
     cone.position.set(0, 0.5, 0.3);
     cone.rotation.x = -Math.PI/2;
+    cone.castShadow = true; cone.receiveShadow = true;
     threeScene.add(cone);
 
     if (typeof OrbitControls !== 'undefined') {
@@ -709,36 +877,26 @@ function update3DMap(m) {
     var t = trks[i];
     if (!t.p) continue;
     activeCount++;
-    var pos = new THREE.Vector3(t.p[0], 0.85, -t.p[2]);
+    var pos = new THREE.Vector3(t.p[0], 0, -t.p[2]);
     var color = parseInt(PC[t.i % PC.length].replace('#',''), 16);
 
     var mesh = threePersonMeshes[t.i];
     var dist = Math.sqrt(t.p[0]*t.p[0] + t.p[2]*t.p[2]);
     if (!mesh) {
-      var group = new THREE.Group();
-      var body = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.15, 0.18, 0.9, 12),
-        new THREE.MeshLambertMaterial({color: color})
-      );
-      body.position.y = 0.45;
-      group.add(body);
-      var head = new THREE.Mesh(
-        new THREE.SphereGeometry(0.12, 8, 8),
-        new THREE.MeshLambertMaterial({color: color})
-      );
-      head.position.y = 1.0;
-      group.add(head);
-      var shadow = new THREE.Mesh(
-        new THREE.CircleGeometry(0.18, 8),
-        new THREE.MeshBasicMaterial({color: 0x000000, transparent: true, opacity: 0.15})
-      );
-      shadow.rotation.x = -Math.PI/2; shadow.position.y = 0.01;
-      group.add(shadow);
+      var group = createHumanoidMesh(color);
+      /* Enable shadow casting on all solid meshes */
+      group.traverse(function(ch) {
+        if (ch.isMesh && ch.material && !ch.material.isSpriteMaterial && ch.material.opacity === undefined) {
+          ch.castShadow = true;
+          ch.receiveShadow = true;
+        }
+      });
       /* Label sprite with ID + distance */
       var label = makePersonLabel(t.i, dist, PC[t.i % PC.length]);
       group.add(label);
-      group.userData = {label: label};
+      group.userData.label = label;
       group.position.copy(pos);
+      group.position.y = 0; /* humanoid feet at ground level */
       threeScene.add(group);
       threePersonMeshes[t.i] = group;
     } else {
@@ -777,12 +935,13 @@ function update3DMap(m) {
 
     var trailData = threePersonTrails[t.i];
     if (!trailData) { trailData = {points: []}; threePersonTrails[t.i] = trailData; }
-    trailData.points.push(pos.clone());
+    /* trail Y offset = 0.03 prevents Z-fighting with ground plane */
+    trailData.points.push(new THREE.Vector3(pos.x, 0.03, pos.z));
     if (trailData.points.length > 60) trailData.points.shift();
     if (trailData.points.length > 1) {
       if (!trailData.line) {
         var trailGeo = new THREE.BufferGeometry().setFromPoints(trailData.points);
-        trailData.line = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.5}));
+        trailData.line = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.7, depthWrite: false}));
         threeScene.add(trailData.line);
       } else {
         /* Update existing geometry — much cheaper than recreating */
@@ -806,7 +965,20 @@ function update3DMap(m) {
     if (!seen[+id]) {
       var mesh = threePersonMeshes[+id];
       threeScene.remove(mesh);
-      mesh.traverse(function(child){ if (child.geometry) child.geometry.dispose(); if (child.material) child.material.dispose(); });
+      /* Dispose only user-owned materials (not shared cache geometries) */
+      mesh.traverse(function(child){
+        if (child.material && child.material.isSpriteMaterial) {
+          if (child.material.map) { child.material.map.dispose(); }
+          child.material.dispose();
+        }
+        /* Eye geometries are per-mesh; dispose those */
+        if (child.geometry && child.geometry.type === 'SphereGeometry' && child.geometry.parameters && child.geometry.parameters.radius < 0.03) {
+          child.geometry.dispose();
+        }
+        if (child.material && child.material.isMeshBasicMaterial && child.material.color && child.material.color.getHex() === 0x111111) {
+          child.material.dispose();
+        }
+      });
       delete threePersonMeshes[+id];
       var td = threePersonTrails[+id];
       if (td && td.line) { threeScene.remove(td.line); td.line.geometry.dispose(); td.line.material.dispose(); }
@@ -820,9 +992,31 @@ function update3DMap(m) {
 
 function start3DRenderLoop() {
   if (threeAnimId) cancelAnimationFrame(threeAnimId);
-  function loop() {
+  var lastTime = performance.now() / 1000;
+  function loop(nowMs) {
     if (currentTab !== 'map' || !threeReady || !threeRenderer) { threeAnimId = null; return; }
+    var t = nowMs ? nowMs / 1000 : performance.now() / 1000;
+    var dt = Math.min(t - lastTime, 0.1); lastTime = t;
+
     if (threeControls) threeControls.update();
+
+    /* ── Subtle breathing animation on all person meshes ── */
+    Object.keys(threePersonMeshes).forEach(function(id) {
+      var mesh = threePersonMeshes[+id];
+      if (!mesh || !mesh.userData) return;
+      var ud = mesh.userData;
+      if (!ud._breathBase) ud._breathBase = 1.38;
+      /* Find the torso child (CylinderGeometry positioned near y=1.38) */
+      mesh.children.forEach(function(ch) {
+        if (ch.isMesh && ch.geometry && ch.geometry.type === 'CylinderGeometry'
+            && ch.position.y > 1.2 && ch.position.y < 1.6) {
+          var breath = Math.sin(t * 2.5) * 0.012;
+          ch.position.y = ud._breathBase + breath;
+          ch.scale.y = 1 + breath * 0.6;
+        }
+      });
+    });
+
     threeRenderer.render(threeScene, threeCamera);
     threeAnimId = requestAnimationFrame(loop);
   }
@@ -1067,12 +1261,7 @@ var WS = {
       var buf = new Uint8Array(ev.data);
       if (buf.length >= 4 && buf[0] === 0x4A && buf[1] === 0x50) {
         var jpeg = new Blob([buf.slice(4)], {type: 'image/jpeg'});
-        var url = URL.createObjectURL(jpeg);
-        var old = D.vid.src;
-        D.vid.src = url;
-        D.vid.style.display = 'block';
-        D.ph.style.display = 'none';
-        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+        _swapVideoFrame(URL.createObjectURL(jpeg), true);
       }
       return;
     }
@@ -1099,9 +1288,7 @@ var WS = {
       }
 
       if (msg.j) {
-        D.vid.src = 'data:image/jpeg;base64,'+msg.j;
-        D.vid.style.display = 'block';
-        D.ph.style.display = 'none';
+        _swapVideoFrame('data:image/jpeg;base64,'+msg.j, false);
       }
 
       if (currentTab === 'cam') renderOvl(msg);
@@ -1146,11 +1333,7 @@ var WS = {
 
 /* ── 初始化 ── */
 D.vid.onerror = function(){ D.vid.style.display='none'; D.ph.style.display=''; };
-D.vid.onload  = function(){
-  D.ph.style.display = 'none';
-  alignOverlay();
-  if (lastFrame) renderOvl(lastFrame);
-};
+D['vid-back'].onerror = function(){ D['vid-back'].style.display='none'; };
 D.b1.onclick = function(){ WS.send('start_pipeline'); };
 D.b2.onclick = function(){ WS.send('stop_pipeline'); };
 D.b3.onclick = function(){ WS.send('restart_pipeline'); };

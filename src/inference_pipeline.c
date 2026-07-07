@@ -29,9 +29,13 @@
 #define MAX_PERSON_ASPECT_RATIO     1.80f   /* tightened from 2.0: arms-out pose at most ~1.5-1.8 */
 #define MIN_PERSON_HEIGHT_RATIO     0.04f   /* raised from 0.03: distant person still >4% of frame height */
 #define MAX_PERSON_HEIGHT_RATIO     0.95f   /* allows close-up person up to 95% of frame height */
-#define PERSON_NMS_IOU_THRESHOLD    0.30f   /* lowered from 0.40: more aggressive intra-model NMS.
-                                               ByteTrack best practice: detector NMS should be tighter
-                                               than tracker IOU to avoid passing duplicate boxes. */
+#define PERSON_NMS_IOU_THRESHOLD    0.45f   /* raised from 0.30: aggressive intra-model NMS.
+                                               INT8 quantized models can produce duplicate boxes for
+                                               the same person at different anchor scales.  At 0.45,
+                                               only genuinely distinct persons survive.  This is
+                                               tighter than the tracker IoU (0.30) per ByteTrack
+                                               best practice: "detector NMS should be tighter than
+                                               tracker association IoU". */
 #define MAX_FILTERED_DETECTIONS     20      /* lowered from 25: real scenes rarely exceed 15 people */
 /* ── Cascade state machine constants ── */
 #define CASCADE_VALIDATION_INTERVAL_DEFAULT  15    /* frames between full-res re-validation */

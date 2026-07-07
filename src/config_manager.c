@@ -62,7 +62,11 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_string(cm, "pose.backend", "ai_accel");
     config_set_string(cm, "pose.model_path", "models/Action Prediction/Skeleton Recognition/yolov8n-pose.q.onnx");
     config_set_float(cm, "pose.confidence_threshold", 0.10f);  /* DFL peakiness for quantized pose model */
-    config_set_float(cm, "pose.iou_threshold", 0.40f);
+    config_set_float(cm, "pose.iou_threshold", 0.55f);  /* OKS-NMS: raised from 0.40 to suppress duplicate detections.
+                                                           INT8 quantized models can produce two boxes for the same
+                                                           person at different anchor scales.  At OKS=0.55, only
+                                                           truly distinct poses survive — same-person duplicates
+                                                           with slightly different keypoint positions are merged. */
     config_set_int(cm, "pose.input_size.0", 640);
     config_set_int(cm, "pose.input_size.1", 640);
     config_set_int(cm, "pose.num_keypoints", 17);

@@ -2,6 +2,7 @@
 """CoAP 客户端：/stream 视频 + /imu 1Hz + MG996R 舵机 GUI 控制"""
 
 import json
+import os
 import socket
 import struct
 import sys
@@ -15,7 +16,12 @@ from typing import Optional
 COAP_HOST = "192.168.4.1"
 COAP_PORT = 5683
 BLOCK_SZX = 6
-STREAM_TIMEOUT = 6.0
+PACKET_TIMEOUT = 1.0
+KEEPALIVE_INTERVAL = 8.0
+IDLE_RESUBSCRIBE = 25.0
+FRAME_STALE = 4.0
+RECONNECT_DELAY = 0.5
+RECONNECT_BACKOFF_MAX = 5.0
 SERVO_TIMEOUT = 1.0
 IMU_INTERVAL = 1.0
 
@@ -27,8 +33,44 @@ SERVO_ANGLE_LEFT = 0
 SERVO_ANGLE_STOP = 90
 SERVO_ANGLE_RIGHT = 180
 
+SERVO_H = 0  # GPIO40 左右
+SERVO_V = 1  # GPIO41 上下
+
 ROOT_DIR = Path(__file__).resolve().parent
 FRAME_PATH = ROOT_DIR / "frame.jpg"
+FRAME_TMP_PATH = ROOT_DIR / "frame.tmp"
+
+
+def make_coap_socket(host: str, rcvbuf: int = 1024 * 1024) -> socket.socket:
+    """创建已 connect 的 CoAP UDP 套接字（Linux 上有利于 conntrack 放行回包）。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    except OSError:
+        pass
+    sock.connect((host, COAP_PORT))
+    return sock
+
+
+def probe_inbound(host: str, timeout: float = 2.0) -> tuple[bool, str]:
+    """探测 ESP32 回包能否到达本机（舵机只发不收，此项可区分入站 UDP 问题）。"""
+    try:
+        sock = make_coap_socket(host, rcvbuf=64 * 1024)
+        sock.settimeout(timeout)
+        sock.send(build_get("imu", 1, IMU_TOKEN))
+        data = sock.recv(1024)
+        sock.close()
+        _, _, payload = parse_packet(data)
+        if not payload:
+            return False, "收到 CoAP 包但无 payload"
+        json.loads(payload.decode())
+        return True, "IMU 回包正常"
+    except socket.timeout:
+        return False, f"{timeout:.0f}s 内未收到 /imu 回包（入站 UDP 可能被防火墙/路由丢弃）"
+    except OSError as e:
+        return False, f"网络错误: {e}"
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+        return False, f"回包解析失败: {e}"
 
 
 def block_size(szx: int) -> int:
@@ -121,90 +163,152 @@ def parse_block2(val: bytes):
     return n >> 4, bool(n & 0x08), n & 0x07
 
 
-def receive_jpeg_frames(sock: socket.socket, token: bytes):
-    blocks = {}
-    expected_etag = None
-    expected_total = None
-    expected_szx = BLOCK_SZX
-    next_block = 0
-    frame_count = 0
-    fps_t0 = time.monotonic()
+class JpegStreamAssembler:
+    """按 ETag + Block2 重组 JPEG，支持乱序块、丢弃超时半成品帧。"""
 
-    while True:
-        data, _ = sock.recvfrom(65536)
+    def __init__(self, token: bytes):
+        self.token = token
+        self.reset()
+
+    def reset(self) -> None:
+        self.blocks: dict[int, bytes] = {}
+        self.etag: Optional[int] = None
+        self.total: Optional[int] = None
+        self.szx = BLOCK_SZX
+        self.started_at = 0.0
+
+    def feed(self, data: bytes) -> Optional[bytes]:
+        if self.started_at and time.monotonic() - self.started_at > FRAME_STALE:
+            self.reset()
+
         pkt_token, opts, chunk = parse_packet(data)
-        if pkt_token != token or 23 not in opts:
-            continue
+        if pkt_token != self.token or 23 not in opts:
+            return None
 
         num, more, szx = parse_block2(opts[23])
+        etag = int.from_bytes(opts[4], "big") if 4 in opts else None
 
         if num == 0:
-            etag = int.from_bytes(opts[4], "big") if 4 in opts else 0
-            total = int.from_bytes(opts[28], "big") if 28 in opts else None
-            blocks = {0: chunk}
-            expected_etag = etag
-            expected_total = total
-            expected_szx = szx
-            next_block = 1
-        elif expected_etag is not None and num == next_block:
-            blocks[num] = chunk
-            next_block += 1
-            szx = expected_szx
+            self.blocks = {0: chunk}
+            self.etag = etag
+            self.total = int.from_bytes(opts[28], "big") if 28 in opts else None
+            self.szx = szx
+            self.started_at = time.monotonic()
+        elif self.etag is not None and etag in (None, self.etag):
+            self.blocks[num] = chunk
         else:
-            continue
+            return None
 
-        if more and len(chunk) != block_size(szx):
-            continue
+        blk_sz = block_size(self.szx)
+        if more and len(chunk) != blk_sz:
+            return None
 
-        if not more:
-            if expected_total:
-                if len(blocks) * block_size(szx) < expected_total and len(blocks) < (
-                    (expected_total + block_size(szx) - 1) // block_size(szx)
-                ):
+        if more:
+            return None
+
+        if self.total is not None:
+            need = (self.total + blk_sz - 1) // blk_sz
+            if len(self.blocks) < need:
+                return None
+            jpg = b"".join(self.blocks[i] for i in range(need))
+        else:
+            jpg = b"".join(self.blocks[i] for i in sorted(self.blocks))
+
+        if self.total is not None and len(jpg) != self.total:
+            self.reset()
+            return None
+        if len(jpg) < 2 or jpg[:2] != b"\xff\xd8":
+            self.reset()
+            return None
+
+        self.reset()
+        return jpg
+
+
+def stream_loop(host: str) -> None:
+    msg_id = 1
+    logged_timeout = False
+    backoff = RECONNECT_DELAY
+
+    while True:
+        sock = None
+        try:
+            sock = make_coap_socket(host)
+            actual_buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            if actual_buf < 512 * 1024:
+                print(
+                    f"[stream] 警告: UDP 接收缓冲仅 {actual_buf} 字节，"
+                    f"Linux 可执行 sudo sysctl -w net.core.rmem_max=8388608",
+                    file=sys.stderr,
+                )
+            sock.settimeout(PACKET_TIMEOUT)
+            assembler = JpegStreamAssembler(STREAM_TOKEN)
+            last_packet = time.monotonic()
+            last_keepalive = 0.0
+            logged_timeout = False
+            backoff = RECONNECT_DELAY
+
+            print(f"[stream] 已连接，订阅 /stream", file=sys.stderr)
+            sock.send(build_get("stream", msg_id, STREAM_TOKEN))
+            msg_id = (msg_id + 1) & 0xFFFF
+            last_packet = time.monotonic()
+
+            while True:
+                try:
+                    data = sock.recv(65536)
+                    last_packet = time.monotonic()
+                    logged_timeout = False
+                except socket.timeout:
+                    now = time.monotonic()
+                    idle = now - last_packet
+                    if idle >= IDLE_RESUBSCRIBE:
+                        if not logged_timeout:
+                            print(
+                                f"[stream] {idle:.0f}s 无数据，重新订阅 /stream",
+                                file=sys.stderr,
+                            )
+                        break
+                    if idle >= KEEPALIVE_INTERVAL and now - last_keepalive >= KEEPALIVE_INTERVAL:
+                        if not logged_timeout:
+                            print(
+                                f"[stream] {idle:.0f}s 无数据，发送 keepalive",
+                                file=sys.stderr,
+                            )
+                            logged_timeout = True
+                        sock.send(build_get("stream", msg_id, STREAM_TOKEN))
+                        msg_id = (msg_id + 1) & 0xFFFF
+                        last_keepalive = now
                     continue
-                jpg = bytearray(expected_total)
-                offset = 0
-                for i in sorted(blocks):
-                    part = blocks[i]
-                    jpg[offset : offset + len(part)] = part
-                    offset += len(part)
-                jpg = bytes(jpg[:offset])
-            else:
-                jpg = b"".join(blocks[i] for i in sorted(blocks))
 
-            if expected_total and len(jpg) != expected_total:
-                blocks = {}
-                continue
-            if len(jpg) < 2 or jpg[:2] != b"\xff\xd8":
-                blocks = {}
-                continue
+                jpg = assembler.feed(data)
+                if jpg:
+                    FRAME_TMP_PATH.write_bytes(jpg)
+                    os.replace(FRAME_TMP_PATH, FRAME_PATH)
+        except OSError as e:
+            print(f"[stream] 连接断开: {e}，{backoff:.1f}s 后重连", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, RECONNECT_BACKOFF_MAX)
+        finally:
+            if sock is not None:
+                sock.close()
 
-            frame_count += 1
-            now = time.monotonic()
-            if now - fps_t0 >= 2.0:
-                fps = frame_count / (now - fps_t0)
-                print(f"视频 FPS: {fps:.1f}  帧大小: {len(jpg)//1024}KB", file=sys.stderr)
-                frame_count = 0
-                fps_t0 = now
-
-            yield jpg
-            blocks = {}
-            expected_etag = None
-            expected_total = None
-            next_block = 0
+        time.sleep(0.3)
+        msg_id = (msg_id + 1) & 0xFFFF
 
 
 def imu_poll_loop(host: str) -> None:
+    backoff = RECONNECT_DELAY
     while True:
+        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(1.0)
+            sock = make_coap_socket(host, rcvbuf=64 * 1024)
+            sock.settimeout(3.0)
             msg_id = 1
+            backoff = RECONNECT_DELAY
             while True:
-                req = build_get("imu", msg_id, IMU_TOKEN)
-                sock.sendto(req, (host, COAP_PORT))
-                data, _ = sock.recvfrom(1024)
-                _, opts, payload = parse_packet(data)
+                sock.send(build_get("imu", msg_id, IMU_TOKEN))
+                data = sock.recv(1024)
+                _, _, payload = parse_packet(data)
                 if payload:
                     imu = json.loads(payload.decode())
                     print(
@@ -213,31 +317,20 @@ def imu_poll_loop(host: str) -> None:
                     )
                 msg_id = (msg_id + 1) & 0xFFFF
                 time.sleep(IMU_INTERVAL)
-        except Exception:
-            time.sleep(0.5)
-
-
-def stream_loop(host: str) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-    sock.settimeout(STREAM_TIMEOUT)
-    stream_msg_id = 1
-    sock.sendto(build_get("stream", stream_msg_id, STREAM_TOKEN), (host, COAP_PORT))
-
-    while True:
-        try:
-            for jpg in receive_jpeg_frames(sock, STREAM_TOKEN):
-                with open(FRAME_PATH, "wb") as f:
-                    f.write(jpg)
         except socket.timeout:
-            print("视频超时，重新订阅...", file=sys.stderr)
-            stream_msg_id = (stream_msg_id + 1) & 0xFFFF
-            sock.sendto(build_get("stream", stream_msg_id, STREAM_TOKEN), (host, COAP_PORT))
-        except Exception as e:
-            print(f"视频错误: {type(e).__name__}: {e}", file=sys.stderr)
-            time.sleep(0.3)
-            stream_msg_id = (stream_msg_id + 1) & 0xFFFF
-            sock.sendto(build_get("stream", stream_msg_id, STREAM_TOKEN), (host, COAP_PORT))
+            print(f"[imu] 超时未收到回包，{backoff:.1f}s 后重连", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, RECONNECT_BACKOFF_MAX)
+        except OSError as e:
+            print(f"[imu] 连接断开: {e}，{backoff:.1f}s 后重连", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, RECONNECT_BACKOFF_MAX)
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"[imu] 数据解析失败: {e}", file=sys.stderr)
+            time.sleep(1.0)
+        finally:
+            if sock is not None:
+                sock.close()
 
 
 class ServoClient:
@@ -252,9 +345,9 @@ class ServoClient:
     def close(self) -> None:
         self._sock.close()
 
-    def send_angle(self, angle: int) -> None:
+    def send_angle(self, angle: int, servo: int = SERVO_H) -> None:
         with self._lock:
-            payload = json.dumps({"angle": angle}).encode()
+            payload = json.dumps({"servo": servo, "angle": angle}).encode()
             req = build_put("servo", self._msg_id, SERVO_TOKEN, payload)
             self._msg_id = (self._msg_id + 1) & 0xFFFF
         try:
@@ -262,14 +355,24 @@ class ServoClient:
         except OSError as e:
             print(f"舵机发送失败: {e}", file=sys.stderr)
 
-    def stop(self) -> None:
-        self.send_angle(SERVO_ANGLE_STOP)
+    def stop(self, servo: int = SERVO_H) -> None:
+        self.send_angle(SERVO_ANGLE_STOP, servo)
+
+    def stop_all(self) -> None:
+        self.stop(SERVO_H)
+        self.stop(SERVO_V)
 
     def left(self) -> None:
-        self.send_angle(SERVO_ANGLE_LEFT)
+        self.send_angle(SERVO_ANGLE_LEFT, SERVO_H)
 
     def right(self) -> None:
-        self.send_angle(SERVO_ANGLE_RIGHT)
+        self.send_angle(SERVO_ANGLE_RIGHT, SERVO_H)
+
+    def up(self) -> None:
+        self.send_angle(SERVO_ANGLE_RIGHT, SERVO_V)
+
+    def down(self) -> None:
+        self.send_angle(SERVO_ANGLE_LEFT, SERVO_V)
 
 
 class ServoControlApp:
@@ -277,10 +380,9 @@ class ServoControlApp:
         self.root = root
         self.client = client
         self.host = host
-        self._left_pressed = False
-        self._right_pressed = False
+        self._pressed: set[str] = set()
 
-        root.title("OV3660 + IMU + 舵机控制")
+        root.title("OV3660 + IMU + 双舵机控制")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -292,8 +394,23 @@ class ServoControlApp:
         frame.pack()
 
         tk.Label(frame, text="按住旋转，松开停止", font=title_font).grid(
-            row=0, column=0, columnspan=2, pady=(0, 16)
+            row=0, column=0, columnspan=3, pady=(0, 16)
         )
+
+        self.up_btn = tk.Button(
+            frame,
+            text="上",
+            width=6,
+            height=2,
+            font=btn_font,
+            bg="#4ad97a",
+            fg="white",
+            activebackground="#35bd5e",
+            activeforeground="white",
+            relief=tk.RAISED,
+            bd=3,
+        )
+        self.up_btn.grid(row=1, column=1, pady=(0, 8))
 
         self.left_btn = tk.Button(
             frame,
@@ -308,7 +425,7 @@ class ServoControlApp:
             relief=tk.RAISED,
             bd=3,
         )
-        self.left_btn.grid(row=1, column=0, padx=(0, 12))
+        self.left_btn.grid(row=2, column=0, padx=(0, 12))
 
         self.right_btn = tk.Button(
             frame,
@@ -323,21 +440,41 @@ class ServoControlApp:
             relief=tk.RAISED,
             bd=3,
         )
-        self.right_btn.grid(row=1, column=1, padx=(12, 0))
+        self.right_btn.grid(row=2, column=2, padx=(12, 0))
+
+        self.down_btn = tk.Button(
+            frame,
+            text="下",
+            width=6,
+            height=2,
+            font=btn_font,
+            bg="#d9a44a",
+            fg="white",
+            activebackground="#bd8a35",
+            activeforeground="white",
+            relief=tk.RAISED,
+            bd=3,
+        )
+        self.down_btn.grid(row=3, column=1, pady=(8, 0))
 
         self.status_var = tk.StringVar(value="状态: 停止")
         tk.Label(frame, textvariable=self.status_var, font=status_font, fg="#444").grid(
-            row=2, column=0, columnspan=2, pady=(16, 0)
+            row=4, column=0, columnspan=3, pady=(16, 0)
         )
 
         tk.Label(
             frame,
-            text=f"CoAP: {self.host}:{COAP_PORT}/servo",
+            text=f"CoAP: {self.host}:{COAP_PORT}/servo  |  左右=GPIO40  上下=GPIO41",
             font=tkfont.Font(size=10),
             fg="#888",
-        ).grid(row=3, column=0, columnspan=2, pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=3, pady=(8, 0))
 
-        for btn, side in ((self.left_btn, "left"), (self.right_btn, "right")):
+        for btn, side in (
+            (self.up_btn, "up"),
+            (self.down_btn, "down"),
+            (self.left_btn, "left"),
+            (self.right_btn, "right"),
+        ):
             btn.bind("<ButtonPress-1>", lambda e, s=side: self.on_press(s))
             btn.bind("<ButtonRelease-1>", lambda e, s=side: self.on_release(s))
             btn.bind("<Leave>", lambda e, s=side: self.on_leave(s))
@@ -347,70 +484,116 @@ class ServoControlApp:
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
 
+    def _servo_for(self, side: str) -> int:
+        return SERVO_V if side in ("up", "down") else SERVO_H
+
+    def _status_for(self, side: str) -> str:
+        labels = {
+            "left": "状态: 左舵机逆时针",
+            "right": "状态: 右舵机顺时针",
+            "up": "状态: 上舵机顺时针",
+            "down": "状态: 下舵机逆时针",
+        }
+        return labels[side]
+
     def on_press(self, side: str) -> None:
+        self._pressed.clear()
+        self._pressed.add(side)
         if side == "left":
-            self._left_pressed = True
-            self._right_pressed = False
             self.client.left()
-            self.set_status("状态: 逆时针旋转")
-        else:
-            self._right_pressed = True
-            self._left_pressed = False
+        elif side == "right":
             self.client.right()
-            self.set_status("状态: 顺时针旋转")
+        elif side == "up":
+            self.client.up()
+        else:
+            self.client.down()
+        self.set_status(self._status_for(side))
 
     def on_release(self, side: str) -> None:
-        if side == "left" and self._left_pressed:
-            self._left_pressed = False
-            self.client.stop()
-            self.set_status("状态: 停止")
-        elif side == "right" and self._right_pressed:
-            self._right_pressed = False
-            self.client.stop()
-            self.set_status("状态: 停止")
+        if side in self._pressed:
+            self._pressed.discard(side)
+            self.client.stop(self._servo_for(side))
+            if not self._pressed:
+                self.set_status("状态: 停止")
 
     def on_leave(self, side: str) -> None:
-        if side == "left" and self._left_pressed:
-            self._left_pressed = False
-            self.client.stop()
-            self.set_status("状态: 停止")
-        elif side == "right" and self._right_pressed:
-            self._right_pressed = False
-            self.client.stop()
-            self.set_status("状态: 停止")
+        self.on_release(side)
 
     def on_global_release(self, _event=None) -> None:
-        if self._left_pressed or self._right_pressed:
-            self._left_pressed = False
-            self._right_pressed = False
-            self.client.stop()
+        if self._pressed:
+            for side in list(self._pressed):
+                self.client.stop(self._servo_for(side))
+            self._pressed.clear()
             self.set_status("状态: 停止")
 
     def on_close(self) -> None:
-        self.client.stop()
+        self.client.stop_all()
         self.client.close()
         self.root.destroy()
 
 
-def main() -> None:
+def _parse_main_args(argv: list[str]) -> tuple[str, bool]:
     host = COAP_HOST
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ("-h", "--help"):
-            print("用法: ov-imu-pwm.py [ESP32_IP]")
+    headless = False
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print("用法: ov-imu-pwm.py [选项] [ESP32_IP]")
             print("  无参数: 打开舵机控制窗口，同时订阅视频流与 IMU")
             print("  带 IP:  指定 ESP32 热点 IP (默认 192.168.4.1)")
             print()
+            print("选项:")
+            print("  --headless   无 GUI，仅后台拉流写 frame.jpg 并打印 IMU（供 test-web/server 调用）")
+            print()
             print(f"  视频帧保存至 {FRAME_PATH}")
             print(f"  IMU 数据以 {1/IMU_INTERVAL:.0f}Hz 打印到终端")
-            return
-        host = sys.argv[1]
+            sys.exit(0)
+        elif arg == "--headless":
+            headless = True
+        elif not arg.startswith("-"):
+            host = arg
+        i += 1
+    return host, headless
 
+
+def _start_stream_services(host: str) -> None:
     print(f"视频流: coap://{host}:{COAP_PORT}/stream")
     print(f"IMU 通道: coap://{host}:{COAP_PORT}/imu ({1/IMU_INTERVAL:.0f}Hz)")
-    print(f"舵机控制: coap://{host}:{COAP_PORT}/servo")
+    print(f"舵机控制: coap://{host}:{COAP_PORT}/servo (servo:0=GPIO40左右, servo:1=GPIO41上下)")
+
+    ok, detail = probe_inbound(host)
+    if ok:
+        print(f"入站探测: {detail}")
+    else:
+        print(f"入站探测失败: {detail}", file=sys.stderr)
+        print(
+            "舵机仍可控制（仅出站 UDP），但 IMU/视频需要 ESP32 回包。\n"
+            "Linux 排查: ping 192.168.4.1 | iw dev wlan0 set power_save off | "
+            "sudo ufw disable（测试）| sysctl net.core.rmem_max",
+            file=sys.stderr,
+        )
 
     threading.Thread(target=imu_poll_loop, args=(host,), daemon=True).start()
     threading.Thread(target=stream_loop, args=(host,), daemon=True).start()
+
+
+def run_headless(host: str) -> None:
+    _start_stream_services(host)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n[headless] 已退出")
+
+
+def main() -> None:
+    host, headless = _parse_main_args(sys.argv)
+    if headless:
+        run_headless(host)
+        return
+
+    _start_stream_services(host)
 
     root = tk.Tk()
     client = ServoClient(host=host)

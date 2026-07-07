@@ -39,8 +39,8 @@ extern "C" {
 #define WS_RING_SIZE           32          /* frame ring buffer capacity */
 #define WS_BROADCAST_INTERVAL_MS  200     /* timer period for frame broadcast */
 #define WS_STATUS_INTERVAL_MS  500         /* timer period for status broadcast */
-#define WS_MAX_FRAME_JSON_LEN  16384       /* max serialized frame JSON size */
-#define WS_MAX_JPEG_LEN        8192        /* max raw JPEG thumbnail size */
+#define WS_MAX_FRAME_JSON_LEN  131072      /* max serialized frame JSON (w/ 320×240 base64 thumb) */
+#define WS_MAX_JPEG_LEN        65536       /* max raw JPEG size (original camera MJPEG frame) */
 
 /* ── WebSocket frame ring buffer entry ── */
 typedef struct {

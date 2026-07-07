@@ -6,13 +6,11 @@
 #define COAP_PORT           5683
 #define COAP_MAX_PACKET     1400
 #define COAP_DEFAULT_SZX    6
+#define COAP_MAX_STREAM_CLIENTS  2
 
-#define STREAM_FRAME_GAP_MS     16
-#define STREAM_SEND_TIMEOUT_MS  250
-#define STREAM_BLOCKS_MIN       4
-#define STREAM_BLOCKS_MAX       12
-#define STREAM_BLOCK_GAP_MIN    0
-#define STREAM_BLOCK_GAP_MAX    2
+#define STREAM_FRAME_GAP_MS     28
+#define STREAM_BLOCK_GAP_MS     1
+#define STREAM_BLOCKS_PER_TICK  6
 
 #define COAP_TYPE_CON       0
 #define COAP_TYPE_NON       1
@@ -31,6 +29,7 @@
 #define COAP_OPT_BLOCK2        23
 #define COAP_OPT_SIZE2         28
 
+#define COAP_FMT_TEXT       0
 #define COAP_FMT_JSON       50
 #define COAP_FMT_OCTET      42
 #define COAP_FMT_JPEG       22
@@ -49,7 +48,7 @@ typedef struct {
 
 typedef void (*CoapFrameProvider)(uint8_t** out, size_t* out_len, bool refresh, bool with_imu);
 typedef void (*CoapImuProvider)(char* buf, size_t buf_size, size_t* out_len);
-typedef bool (*CoapServoHandler)(int angle, char* resp, size_t resp_size, size_t* resp_len);
+typedef bool (*CoapServoHandler)(int servo_id, int angle, char* resp, size_t resp_size, size_t* resp_len);
 
 class CoapServer {
 public:
@@ -61,8 +60,61 @@ public:
   void setImuProvider(CoapImuProvider fn)   { _imu_fn = fn; }
   void setServoHandler(CoapServoHandler fn) { _servo_fn = fn; }
 
-  bool isBusy() const { return _stream.busy; }
-  bool isStreamActive() const { return _stream.active; }
+  bool isBusy() const {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active && _streams[i].busy) return true;
+    }
+    return false;
+  }
+
+  bool isStreamActive() const {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active) return true;
+    }
+    return false;
+  }
+
+  int activeStreamCount() const {
+    int n = 0;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active) n++;
+    }
+    return n;
+  }
+
+  unsigned long streamLastReqMs() const {
+    unsigned long latest = 0;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active && _streams[i].last_req_ms > latest) {
+        latest = _streams[i].last_req_ms;
+      }
+    }
+    return latest;
+  }
+
+  void stopAllStreams() {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      _streams[i].active = false;
+      _streams[i].busy = false;
+      _resetStreamTx(&_streams[i]);
+    }
+  }
+
+  void pruneStaleStreams(unsigned long timeout_ms) {
+    unsigned long now = millis();
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (!_streams[i].active) continue;
+      if (_streams[i].last_req_ms == 0) continue;
+      unsigned long idle = (now >= _streams[i].last_req_ms)
+        ? (now - _streams[i].last_req_ms)
+        : (0xFFFFFFFFUL - _streams[i].last_req_ms + now + 1);
+      if (idle > timeout_ms) {
+        _streams[i].active = false;
+        _streams[i].busy = false;
+        _resetStreamTx(&_streams[i]);
+      }
+    }
+  }
 
   void loop() {
     int pkt_len = _udp.parsePacket();
@@ -101,8 +153,6 @@ public:
       _handleImu(remote, remote_port, &req);
     } else if (strcmp(req.uri, "stream") == 0) {
       _registerStream(remote, remote_port, &req);
-      _stream.tx.in_progress = false;
-      _stream.tx.last_frame_ms = 0;
     } else if (strcmp(req.uri, "frame") == 0 || strcmp(req.uri, "") == 0) {
       _handleFrame(remote, remote_port, &req);
     } else {
@@ -112,109 +162,53 @@ public:
     }
   }
 
-  // 自适应分块推送：缓存帧指针、批量发包、丢旧保新、动态调节 burst
+  // 双客户端推流：共享一帧 JPEG，各客户端独立分块进度；支持 keepalive 与重连
   void tickStream() {
-    if (!_stream.active || !_frame_fn || _stream.busy) return;
+    if (!_frame_fn) return;
 
     unsigned long now = millis();
-    bool frame_due = (now - _stream.tx.last_frame_ms >= STREAM_FRAME_GAP_MS);
+    bool any_active = false;
 
-    if (frame_due) {
-      _stream.busy = true;
-      _stream.tx.in_progress = false;
-
-      uint8_t* frame_data = nullptr;
-      size_t frame_len = 0;
-      _frame_fn(&frame_data, &frame_len, true, false);
-
-      if (!frame_data || frame_len == 0) {
-        _stream.busy = false;
-        return;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (!_streams[i].active) continue;
+      any_active = true;
+      if (_streams[i].tx.in_progress) {
+        _serviceClientBlocks(&_streams[i], now);
       }
+    }
+    if (!any_active) return;
 
-      _frame_etag++;
-      _stream.tx.frame_data = frame_data;
-      _stream.tx.frame_len = frame_len;
-      _stream.tx.next_block = 0;
-      _stream.tx.etag = _frame_etag;
-      _stream.tx.block_szx = COAP_DEFAULT_SZX;
-      _stream.tx.in_progress = true;
-      _stream.tx.frame_start_ms = now;
-      _stream.tx.last_block_ms = now;
-
-      size_t block_size = _blockSizeFromSzx(_stream.tx.block_szx);
-      uint32_t total_blocks = (frame_len + block_size - 1) / block_size;
-
-      int sent = 0;
-      while (sent < (int)_stream.pace.blocks_per_tick && _stream.tx.next_block < total_blocks) {
-        _sendBlock(_stream.ip, _stream.port, COAP_TYPE_NON,
-                   (_stream.msg_id + _stream.tx.next_block) & 0xFFFF,
-                   _stream.token, _stream.token_len,
-                   frame_data, frame_len,
-                   _stream.tx.next_block, _stream.tx.block_szx, _stream.tx.etag,
-                   COAP_FMT_JPEG, _stream.tx.next_block == 0);
-        _stream.tx.next_block++;
-        sent++;
+    bool any_in_progress = false;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active && _streams[i].tx.in_progress) {
+        any_in_progress = true;
+        break;
       }
+    }
+    if (any_in_progress) return;
 
-      if (_stream.tx.next_block >= total_blocks) {
-        _adaptStreamPace(now - _stream.tx.frame_start_ms, frame_len);
-        _stream.tx.in_progress = false;
-        _stream.tx.last_frame_ms = now;
-        _stream.msg_id = (_stream.msg_id + total_blocks) & 0xFFFF;
+    bool need_capture = false;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (!_streams[i].active) continue;
+      if (now - _streams[i].tx.last_frame_ms >= STREAM_FRAME_GAP_MS) {
+        need_capture = true;
+        break;
       }
-
-      _stream.busy = false;
-      return;
     }
+    if (!need_capture) return;
 
-    if (!_stream.tx.in_progress) return;
+    uint8_t* frame_data = nullptr;
+    size_t frame_len = 0;
+    _frame_fn(&frame_data, &frame_len, true, false);
+    if (!frame_data || frame_len == 0) return;
 
-    if (now - _stream.tx.frame_start_ms > STREAM_SEND_TIMEOUT_MS) {
-      _stream.tx.in_progress = false;
-      if (_stream.pace.blocks_per_tick > STREAM_BLOCKS_MIN) {
-        _stream.pace.blocks_per_tick -= 2;
-      }
-      return;
+    _frame_etag++;
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (!_streams[i].active) continue;
+      if (now - _streams[i].tx.last_frame_ms < STREAM_FRAME_GAP_MS) continue;
+      _startClientFrame(&_streams[i], frame_data, frame_len, _frame_etag, now);
+      _serviceClientBlocks(&_streams[i], now);
     }
-
-    if (now - _stream.tx.last_block_ms < _stream.pace.gap_ms) return;
-
-    _stream.busy = true;
-
-    const uint8_t* frame_data = _stream.tx.frame_data;
-    size_t frame_len = _stream.tx.frame_len;
-
-    if (!frame_data || frame_len == 0) {
-      _stream.tx.in_progress = false;
-      _stream.busy = false;
-      return;
-    }
-
-    size_t block_size = _blockSizeFromSzx(_stream.tx.block_szx);
-    uint32_t total_blocks = (frame_len + block_size - 1) / block_size;
-
-    int sent = 0;
-    while (sent < (int)_stream.pace.blocks_per_tick && _stream.tx.next_block < total_blocks) {
-      _sendBlock(_stream.ip, _stream.port, COAP_TYPE_NON,
-                 (_stream.msg_id + _stream.tx.next_block) & 0xFFFF,
-                 _stream.token, _stream.token_len,
-                 frame_data, frame_len,
-                 _stream.tx.next_block, _stream.tx.block_szx, _stream.tx.etag,
-                 COAP_FMT_JPEG, _stream.tx.next_block == 0);
-      _stream.tx.next_block++;
-      sent++;
-    }
-    _stream.tx.last_block_ms = now;
-
-    if (_stream.tx.next_block >= total_blocks) {
-      _adaptStreamPace(now - _stream.tx.frame_start_ms, frame_len);
-      _stream.tx.in_progress = false;
-      _stream.tx.last_frame_ms = now;
-      _stream.msg_id = (_stream.msg_id + total_blocks) & 0xFFFF;
-    }
-
-    _stream.busy = false;
   }
 
 private:
@@ -224,7 +218,18 @@ private:
   CoapServoHandler  _servo_fn = nullptr;
   uint32_t _frame_etag = 0;
 
-  struct {
+  struct StreamTx {
+    bool in_progress;
+    size_t frame_len;
+    uint32_t next_block;
+    uint32_t etag;
+    uint8_t block_szx;
+    unsigned long last_block_ms;
+    unsigned long last_frame_ms;
+    const uint8_t* frame_data;
+  };
+
+  struct StreamClient {
     bool active;
     bool busy;
     IPAddress ip;
@@ -232,38 +237,106 @@ private:
     uint8_t token[8];
     uint8_t token_len;
     uint16_t msg_id;
-    unsigned long last_push;
-    struct {
-      bool in_progress;
-      size_t frame_len;
-      uint32_t next_block;
-      uint32_t etag;
-      uint8_t block_szx;
-      unsigned long last_block_ms;
-      unsigned long last_frame_ms;
-      unsigned long frame_start_ms;
-      const uint8_t* frame_data;
-    } tx;
-    struct {
-      uint8_t blocks_per_tick;
-      uint8_t gap_ms;
-    } pace;
-  } _stream = {false, false, {}, 0, {}, 0, 0, 0,
-               {false, 0, 0, 0, COAP_DEFAULT_SZX, 0, 0, 0, nullptr},
-               {8, 0}};
+    unsigned long last_req_ms;
+    StreamTx tx;
+  };
 
-  void _adaptStreamPace(unsigned long send_ms, size_t frame_len) {
-    (void)frame_len;
-    if (send_ms < 25 && _stream.pace.blocks_per_tick < STREAM_BLOCKS_MAX) {
-      _stream.pace.blocks_per_tick++;
-    } else if (send_ms > 120 && _stream.pace.blocks_per_tick > STREAM_BLOCKS_MIN) {
-      _stream.pace.blocks_per_tick -= 2;
+  StreamClient _streams[COAP_MAX_STREAM_CLIENTS] = {};
+
+  static void _resetStreamTx(StreamClient* c) {
+    c->tx.in_progress = false;
+    c->tx.frame_len = 0;
+    c->tx.next_block = 0;
+    c->tx.etag = 0;
+    c->tx.block_szx = COAP_DEFAULT_SZX;
+    c->tx.last_block_ms = 0;
+    c->tx.last_frame_ms = 0;
+    c->tx.frame_data = nullptr;
+  }
+
+  int _findStreamByAddr(IPAddress ip, uint16_t port) const {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active && _streams[i].ip == ip && _streams[i].port == port) {
+        return i;
+      }
     }
-    if (send_ms < 15 && _stream.pace.gap_ms > STREAM_BLOCK_GAP_MIN) {
-      _stream.pace.gap_ms = 0;
-    } else if (send_ms > 100 && _stream.pace.gap_ms < STREAM_BLOCK_GAP_MAX) {
-      _stream.pace.gap_ms++;
+    return -1;
+  }
+
+  int _findStreamByIp(IPAddress ip) const {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].active && _streams[i].ip == ip) {
+        return i;
+      }
     }
+    return -1;
+  }
+
+  int _findFreeSlot() const {
+    for (int i = 0; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (!_streams[i].active) return i;
+    }
+    return -1;
+  }
+
+  int _evictOldestSlot() {
+    int oldest = 0;
+    for (int i = 1; i < COAP_MAX_STREAM_CLIENTS; i++) {
+      if (_streams[i].last_req_ms < _streams[oldest].last_req_ms) oldest = i;
+    }
+    _streams[oldest].active = false;
+    _streams[oldest].busy = false;
+    _resetStreamTx(&_streams[oldest]);
+    return oldest;
+  }
+
+  void _startClientFrame(StreamClient* c, const uint8_t* frame_data, size_t frame_len,
+                         uint32_t etag, unsigned long now) {
+    c->tx.frame_data = frame_data;
+    c->tx.frame_len = frame_len;
+    c->tx.next_block = 0;
+    c->tx.etag = etag;
+    c->tx.block_szx = COAP_DEFAULT_SZX;
+    c->tx.in_progress = true;
+    c->tx.last_block_ms = 0;
+  }
+
+  void _serviceClientBlocks(StreamClient* c, unsigned long now) {
+    if (!c->active || !c->tx.in_progress || c->busy) return;
+    if (now - c->tx.last_block_ms < STREAM_BLOCK_GAP_MS) return;
+
+    const uint8_t* frame_data = c->tx.frame_data;
+    size_t frame_len = c->tx.frame_len;
+    if (!frame_data || frame_len == 0) {
+      c->tx.in_progress = false;
+      return;
+    }
+
+    c->busy = true;
+
+    size_t block_size = _blockSizeFromSzx(c->tx.block_szx);
+    uint32_t total_blocks = (frame_len + block_size - 1) / block_size;
+
+    int sent = 0;
+    while (sent < STREAM_BLOCKS_PER_TICK && c->tx.next_block < total_blocks) {
+      _sendBlock(c->ip, c->port, COAP_TYPE_NON,
+                 (c->msg_id + c->tx.next_block) & 0xFFFF,
+                 c->token, c->token_len,
+                 frame_data, frame_len,
+                 c->tx.next_block, c->tx.block_szx, c->tx.etag,
+                 COAP_FMT_JPEG);
+      c->tx.next_block++;
+      sent++;
+    }
+    c->tx.last_block_ms = now;
+
+    if (c->tx.next_block >= total_blocks) {
+      c->tx.in_progress = false;
+      c->tx.last_frame_ms = now;
+      c->msg_id = (c->msg_id + total_blocks) & 0xFFFF;
+    }
+
+    c->busy = false;
   }
 
   static uint16_t _readUint16(const uint8_t* p) {
@@ -394,10 +467,11 @@ private:
     return true;
   }
 
-  static int _parseAngleFromPayload(const uint8_t* payload, size_t payload_len) {
-    if (!payload || payload_len == 0) return -1;
+  static bool _parseServoFromPayload(const uint8_t* payload, size_t payload_len,
+                                     int* servo_id_out, int* angle_out) {
+    if (!payload || payload_len == 0 || !servo_id_out || !angle_out) return false;
 
-    char buf[32];
+    char buf[64];
     size_t copy = payload_len;
     if (copy >= sizeof(buf)) copy = sizeof(buf) - 1;
     memcpy(buf, payload, copy);
@@ -407,19 +481,30 @@ private:
       buf[--copy] = '\0';
     }
 
-    const char* p = buf;
-    if (*p == '{') {
-      const char* key = strstr(p, "\"angle\"");
-      if (!key) return -1;
-      p = strchr(key + 7, ':');
-      if (!p) return -1;
+    *servo_id_out = 0;
+    *angle_out = -1;
+
+    const char* servo_key = strstr(buf, "\"servo\"");
+    if (servo_key) {
+      const char* p = strchr(servo_key + 7, ':');
+      if (!p) return false;
       p++;
+      while (*p == ' ' || *p == '\t') p++;
+      int servo_id = atoi(p);
+      if (servo_id < 0 || servo_id > 1) return false;
+      *servo_id_out = servo_id;
     }
 
+    const char* angle_key = strstr(buf, "\"angle\"");
+    if (!angle_key) return false;
+    const char* p = strchr(angle_key + 7, ':');
+    if (!p) return false;
+    p++;
     while (*p == ' ' || *p == '\t') p++;
     int angle = atoi(p);
-    if (angle < 0 || angle > 180) return -1;
-    return angle;
+    if (angle < 0 || angle > 180) return false;
+    *angle_out = angle;
+    return true;
   }
 
   int _buildResponse(uint8_t* out, int out_max,
@@ -428,8 +513,7 @@ private:
                      uint32_t etag, uint8_t content_format,
                      bool has_block2, uint32_t block_num, bool block_more, uint8_t block_szx,
                      size_t total_size,
-                     const uint8_t* payload, size_t payload_len,
-                     bool include_meta) {
+                     const uint8_t* payload, size_t payload_len) {
     if (out_max < 16) return 0;
 
     out[0] = (1 << 6) | ((type & 0x03) << 4) | (token_len & 0x0F);
@@ -442,19 +526,17 @@ private:
     int prev_opt = 0;
     int n;
 
-    if (include_meta && etag != 0) {
+    if (etag != 0) {
       n = _encodeUintOption(out + pos, prev_opt, COAP_OPT_ETAG, etag);
       if (n <= 0) return 0;
       pos += n;
       prev_opt = COAP_OPT_ETAG;
     }
 
-    if (include_meta) {
-      n = _encodeUintOption(out + pos, prev_opt, COAP_OPT_CONTENT_FMT, content_format);
-      if (n <= 0) return 0;
-      pos += n;
-      prev_opt = COAP_OPT_CONTENT_FMT;
-    }
+    n = _encodeUintOption(out + pos, prev_opt, COAP_OPT_CONTENT_FMT, content_format);
+    if (n <= 0) return 0;
+    pos += n;
+    prev_opt = COAP_OPT_CONTENT_FMT;
 
     if (has_block2) {
       n = _encodeBlock2(out + pos, prev_opt, block_num, block_more, block_szx);
@@ -463,7 +545,7 @@ private:
       prev_opt = COAP_OPT_BLOCK2;
     }
 
-    if (has_block2 && include_meta && total_size > 0) {
+    if (has_block2 && total_size > 0) {
       n = _encodeUintOption(out + pos, prev_opt, COAP_OPT_SIZE2, (uint32_t)total_size);
       if (n <= 0) return 0;
       pos += n;
@@ -486,7 +568,7 @@ private:
                   const uint8_t* token, uint8_t token_len,
                   const uint8_t* frame_data, size_t frame_len,
                   uint32_t block_num, uint8_t block_szx, uint32_t etag,
-                  uint8_t content_format, bool include_meta) {
+                  uint8_t content_format) {
     size_t block_size = _blockSizeFromSzx(block_szx);
     size_t offset = block_num * block_size;
     if (offset >= frame_len) return;
@@ -499,7 +581,7 @@ private:
     int len = _buildResponse(tx, sizeof(tx), type, COAP_CODE_CONTENT, msg_id,
                              token, token_len, etag, content_format,
                              true, block_num, more, block_szx, frame_len,
-                             frame_data + offset, send_len, include_meta);
+                             frame_data + offset, send_len);
     if (len <= 0) return;
 
     _udp.beginPacket(ip, port);
@@ -511,30 +593,64 @@ private:
                        const uint8_t* token, uint8_t token_len, uint16_t msg_id,
                        uint8_t rsp_type, uint8_t* frame_data, size_t frame_len,
                        uint8_t block_szx, uint32_t etag, uint8_t content_format) {
+    (void)rsp_type;
     size_t block_size = _blockSizeFromSzx(block_szx);
     uint32_t total_blocks = (frame_len + block_size - 1) / block_size;
 
     for (uint32_t b = 0; b < total_blocks; b++) {
-      uint8_t type = COAP_TYPE_NON;
-      _sendBlock(ip, port, type, (msg_id + b) & 0xFFFF,
+      _sendBlock(ip, port, COAP_TYPE_NON, (msg_id + b) & 0xFFFF,
                  token, token_len, frame_data, frame_len, b, block_szx, etag,
-                 content_format, b == 0);
+                 content_format);
     }
   }
 
   void _registerStream(IPAddress ip, uint16_t port, CoapRequest* req) {
-    _stream.active = true;
-    _stream.busy = false;
-    _stream.ip = ip;
-    _stream.port = port;
-    _stream.token_len = req->token_len;
-    memcpy(_stream.token, req->token, req->token_len);
-    _stream.msg_id = req->msg_id;
-    _stream.last_push = millis();
-    _stream.tx.in_progress = false;
-    _stream.tx.frame_data = nullptr;
-    _stream.tx.last_frame_ms = 0;
-    _stream.tx.last_block_ms = 0;
+    unsigned long now = millis();
+    const char* action = "new";
+    int idx = _findStreamByAddr(ip, port);
+
+    if (idx >= 0) {
+      action = "renew";
+    } else {
+      idx = _findStreamByIp(ip);
+      if (idx >= 0) {
+        action = "reconnect";
+        _resetStreamTx(&_streams[idx]);
+      } else {
+        idx = _findFreeSlot();
+        if (idx < 0) {
+          idx = _evictOldestSlot();
+          action = "takeover";
+        }
+        _resetStreamTx(&_streams[idx]);
+      }
+    }
+
+    StreamClient* c = &_streams[idx];
+    c->active = true;
+    c->busy = false;
+    c->ip = ip;
+    c->port = port;
+    c->token_len = req->token_len;
+    memcpy(c->token, req->token, req->token_len);
+    c->msg_id = req->msg_id;
+    c->last_req_ms = now;
+
+    if (strcmp(action, "renew") == 0) {
+      c->tx.in_progress = false;
+      c->tx.last_frame_ms = 0;
+      c->tx.last_block_ms = 0;
+    }
+
+    char ack[64];
+    int n = snprintf(ack, sizeof(ack),
+                     "{\"ok\":1,\"streams\":%d,\"max\":%d,\"action\":\"%s\"}",
+                     activeStreamCount(), COAP_MAX_STREAM_CLIENTS, action);
+    uint8_t rsp_type = (req->type == COAP_TYPE_CON) ? COAP_TYPE_ACK : COAP_TYPE_NON;
+    _sendResponse(ip, port, rsp_type, COAP_CODE_CONTENT,
+                  req->token, req->token_len, req->msg_id,
+                  (const uint8_t*)ack, (n > 0) ? (size_t)n : 0, COAP_FMT_JSON,
+                  false, 0, false, 0, 0, 0);
   }
 
   void _pushFrame(IPAddress ip, uint16_t port, CoapRequest* req,
@@ -593,7 +709,7 @@ private:
     int len = _buildResponse(tx, sizeof(tx), type, code, msg_id,
                              token, token_len, etag, content_format,
                              has_block2, block_num, more, block_szx, total_size,
-                             send_ptr, send_len, true);
+                             send_ptr, send_len);
     if (len <= 0) return;
 
     _udp.beginPacket(ip, port);
@@ -612,9 +728,10 @@ private:
       return;
     }
 
-    int angle = _parseAngleFromPayload(payload, payload_len);
-    if (angle < 0) {
-      const char* err = "{\"ok\":false,\"error\":\"angle must be 0-180\"}";
+    int servo_id = 0;
+    int angle = -1;
+    if (!_parseServoFromPayload(payload, payload_len, &servo_id, &angle)) {
+      const char* err = "{\"ok\":false,\"error\":\"servo must be 0-1, angle 0-180\"}";
       _sendResponse(ip, port, rsp_type, COAP_CODE_BAD,
                     req->token, req->token_len, req->msg_id,
                     (const uint8_t*)err, strlen(err), COAP_FMT_JSON,
@@ -622,9 +739,9 @@ private:
       return;
     }
 
-    char json[64];
+    char json[80];
     size_t json_len = 0;
-    if (!_servo_fn(angle, json, sizeof(json), &json_len)) {
+    if (!_servo_fn(servo_id, angle, json, sizeof(json), &json_len)) {
       const char* err = "{\"ok\":false,\"error\":\"servo failed\"}";
       _sendResponse(ip, port, rsp_type, COAP_CODE_BAD,
                     req->token, req->token_len, req->msg_id,

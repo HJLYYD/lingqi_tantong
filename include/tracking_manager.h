@@ -28,9 +28,26 @@ extern "C" {
 /* ── Spatial jump ── */
 #define TRACKING_SPATIAL_JUMP_MAX_M     3.0f
 
-/* ── ByteTrack-style two-stage confidence thresholds ── */
-#define TRACKING_IOU_THRESHOLD          0.30f  /* lowered from 0.35 for better occlusion matching */
-#define TRACKING_IOU_THRESHOLD_LOW      0.15f  /* second-stage recovery for occluded tracks */
+/* ── ByteTrack-style two-stage confidence thresholds ──
+ *
+ * IOU_THRESHOLD (0.30): primary matching gate for cascade (age ≤ 3).
+ *   Kept at 0.30 — matches ByteTrack best practice for 25-30 FPS.
+ *   At 3-5 FPS (K1), the Kalman predict → measurement IoU for the SAME
+ *   person is typically 0.35-0.70, so 0.30 is a safe lower bound.
+ *
+ * IOU_THRESHOLD_LOW (0.20): second-stage recovery for older/occluded tracks.
+ *   RAISED from 0.15 to 0.20 — 0.15 was too permissive and could match
+ *   different people's boxes, causing ID switches.  At 0.20, only
+ *   genuinely overlapping boxes (same person, partial occlusion) match.
+ *
+ * CONFIDENCE_HIGH (0.18): detections above this enter cascade matching.
+ *   Kept at 0.18 — DFL peaks from INT8 model at 320×320 rarely exceed 0.25,
+ *   so 0.18 captures real detections while filtering most noise.
+ *
+ * CONFIDENCE_LOW (0.12): detections in [0.12, 0.18) only match in stage B
+ *   (occlusion recovery).  Kept at 0.12 to catch partially occluded people. */
+#define TRACKING_IOU_THRESHOLD          0.30f
+#define TRACKING_IOU_THRESHOLD_LOW      0.20f  /* raised from 0.15: prevent false cross-person matches */
 #define TRACKING_CONFIDENCE_HIGH        0.18f
 #define TRACKING_CONFIDENCE_LOW         0.12f
 

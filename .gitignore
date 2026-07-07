@@ -69,3 +69,4 @@ esp32p4_firmware/dependencies.lock
 esp32p4_firmware/managed_components/
 
 CV/
+docs/

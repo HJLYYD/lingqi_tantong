@@ -143,7 +143,7 @@ pose:
   # "yolov8n-pose" or "yolo11n-pose"
   model_variant: "yolov8n-pose"
   confidence_threshold: 0.04      # ultra-low for 320x320 INT8 model (was 0.06)
-  iou_threshold: 0.40
+  iou_threshold: 0.55             # OKS-NMS: raised from 0.40 to suppress duplicate detections from INT8 model
   input_size: [480, 480]          # model's actual input is 320x320 (overridden at load)
   num_keypoints: 17
   skeleton_type: coco
@@ -182,46 +182,46 @@ action:
   inference_interval: 15
 
 tracking:
-  max_lost: 30                    # reduced from 60: 30f @ 3.5 FPS = 8.5s max prediction
-  max_occluded_frames: 45         # reduced from 90: extended but not infinite
-  min_iou: 0.30
-  max_distance: 5.0
+  max_lost: 30                    # 30f @ 3.5 FPS = 8.5s max prediction
+  max_occluded_frames: 45         # extended but not infinite
+  min_iou: 0.18                    # relaxed: easier to match detections across frames
+  max_distance: 40                 # pixels — relaxed from 5 to reduce false mismatches
   max_track_history: 300
   kalman_process_noise: 0.05
   kalman_measurement_noise: 0.10
-  # ── Enhanced confirmation (tuned for 320×320 INT8 model) ──
-  confirmation_frames: 2           # reduced: 2 hits to confirm
-  min_keypoints_for_confirm: 2     # lowered for partial-body at 320×320
+  # ── Enhanced confirmation (tuned for 640×480 at close range) ──
+  confirmation_frames: 1           # 1 hit to confirm: faster track locking
+  min_keypoints_for_confirm: 2     # only 2 keypoints needed
   min_keypoints_strong: 3          # lowered: INT8 model rarely exceeds 3 strong kpts
-  spatial_jump_max_m: 5.0          # relaxed: allow larger jumps for 320×320 noise
+  spatial_jump_max_m: 5.0          # relaxed: allow larger jumps for noisy 640×480
   # ── Cascade matching ──
   cascade_max_age: 30
-  cascade_min_hits: 2              # lowered from 3
-  appearance_weight: 0.25           # reduced: rely more on IoU than appearance
-  appearance_max_dist: 0.65         # relaxed cosine distance gate
-  iou_threshold_low: 0.10           # lowered second-stage IoU for occlusion
+  cascade_min_hits: 1              # lowered from 2: faster re-identification
+  appearance_weight: 0.20           # rely more on IoU than appearance
+  appearance_max_dist: 0.70         # relaxed cosine distance gate
+  iou_threshold_low: 0.15           # lower IoU gate for fast-moving objects
   # ── Occlusion handling ──
-  upper_body_min_keypoints: 3       # lowered: partial-body at 320×320
-  side_body_min_keypoints: 2        # lowered: one-side keypoints at 320×320
-  occlusion_score_threshold: 0.30   # lowered occlusion threshold
+  upper_body_min_keypoints: 3
+  side_body_min_keypoints: 2
+  occlusion_score_threshold: 0.25   # lowered occlusion threshold
   # ── Re-identification (NEW) ──
   reid_pool_max_age: 60           # frames to keep deleted track in re-id pool
   # ── Multi-person detection (NEW) ──
-  new_person_grace_frames: 3       # grace period for new person detection trigger
+  new_person_grace_frames: 1       # reduced grace period: faster new person detection
   init_state:
-    position_variance: 0.1
-    velocity_variance: 0.01
+    position_variance: 0.15        # increased initial uncertainty
+    velocity_variance: 0.02
   noise:
-    process_position: 0.01
-    process_velocity: 0.002
-    measurement: 0.04
-  ema_alpha: 0.25
+    process_position: 0.02
+    process_velocity: 0.005
+    measurement: 0.06              # increased: trust measurement less (noisy INT8)
+  ema_alpha: 0.35                   # increased: more responsive to new detections
 
 spatial:
-  fx: 960.0
-  fy: 960.0
-  cx: 320.0                      # 640×480 图像中心 (原 960.0 是 1920×1080 的)
-  cy: 240.0                      # 640×480 图像中心 (原 540.0 是 1920×1080 的)
+  fx: 650.0                         # OV3660 @ 640×480: f=3mm/1.4µm×640/2048≈670, 取 650
+  fy: 650.0                         # 深度公式 Z = H×fy/bbox_h, 精确值需实际标定
+  cx: 320.0                         # 640×480 图像中心
+  cy: 240.0                         # 640×480 图像中心
   avg_human_height: 1.70
   min_depth: 0.3
   max_depth: 120.0
@@ -292,7 +292,7 @@ visualization:
   show_fps: true
   show_depth: true
   show_imu_overlay: true
-  record_to_video: false            # explicit opt-in via --save-video CLI flag
+  record_to_video: true             # save video by default when pipeline runs
   display_enabled: false            # enable via --display CLI flag
   display_device: "/dev/fb0"
   rtsp_enabled: false               # enable via --rtsp CLI flag

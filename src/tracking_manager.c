@@ -1356,10 +1356,43 @@ void object_tracker_update(ObjectTracker* tracker,
         }
     }
 
-    /* ── Step 7: Create NEW tracks from unmatched HIGH-confidence dets ── */
+    /* ── Step 7: Create NEW tracks from unmatched HIGH-confidence dets ──
+     *
+     * PROXIMITY GATE: Before creating a new track, check if this detection
+     * overlaps significantly (IoU > 0.35) with ANY existing track (matched
+     * or unmatched, confirmed or unconfirmed).  If so, the detection is
+     * likely a duplicate of an already-tracked person (common with INT8
+     * quantized models that produce multiple boxes per person at different
+     * anchor scales).  Skip track creation — let the existing track handle
+     * this person.
+     *
+     * Without this gate, each duplicate detection becomes a permanent new
+     * track ID → "one person shown as multiple people" bug. */
+    #define NEW_TRACK_PROXIMITY_IOU_GATE 0.35f
     for (int h = 0; h < num_high; h++) {
         int d = det_high_idx[h];
         if (det_matched[d]) continue;
+
+        /* ── Proximity gate: skip if detection overlaps any existing track ── */
+        bool too_close_to_existing = false;
+        for (int t = 0; t < tracker->num_tracks; t++) {
+            float iou_existing = bbox_iou(&detections[d].bbox,
+                                          &tracker->tracks[t].object.detection.bbox);
+            if (iou_existing > NEW_TRACK_PROXIMITY_IOU_GATE) {
+                too_close_to_existing = true;
+                break;
+            }
+        }
+        if (too_close_to_existing) {
+            /* Detection is likely a duplicate — skip track creation.
+             * The existing track already covers this person. */
+            static int proximity_skip_count = 0;
+            if (++proximity_skip_count <= 5 || proximity_skip_count % 50 == 0) {
+                log_debug("Tracker: skipped new track (proximity gate, "
+                          "total skips=%d)", proximity_skip_count);
+            }
+            continue;
+        }
 
         /* ── Re-identification check ── */
         int reid_id = -1;
@@ -1382,6 +1415,7 @@ void object_tracker_update(ObjectTracker* tracker,
         }
         out_result->new_tracks++;
     }
+    #undef NEW_TRACK_PROXIMITY_IOU_GATE
 
     /* ── Step 8: Remove tracks lost for too long ──
      * Confirmed tracks: max_lost (30) or max_occluded (45) for partial body.
@@ -1405,6 +1439,95 @@ void object_tracker_update(ObjectTracker* tracker,
             out_result->lost_tracks++;
         }
     }
+
+    /* ── Step 8.5: Track deduplication — merge overlapping confirmed tracks ──
+     *
+     * PROBLEM: INT8-quantized YOLO models on K1 can produce duplicate detections
+     * for the same person (different anchor scales produce slightly different
+     * boxes, both pass OKS-NMS).  ByteTrack creates separate track IDs for each,
+     * and without merging they persist indefinitely — a single person appears as
+     * multiple people on the web UI.
+     *
+     * FIX: Periodically scan all pairs of recently-active confirmed tracks.
+     * When two tracks have high IoU overlap, merge the younger into the older:
+     *   - Keep the lower track_id (older creation)
+     *   - Transfer trajectory, appearance, and keypoint state
+     *   - Remove the duplicate track
+     *   - Log the merge for diagnostics
+     *
+     * Gate: only merge tracks that are BOTH recently matched (lost_count <= 1)
+     * to avoid merging a real track with a drifting ghost.  High IoU threshold
+     * (0.55) ensures we only merge near-identical boxes — the same person seen
+     * twice, not two people standing close together. */
+    #define TRACK_MERGE_IOU_THRESHOLD 0.55f
+    for (int i = 0; i < tracker->num_tracks; i++) {
+        TrackEntry* ei = &tracker->tracks[i];
+        if (!ei->confirmed || ei->lost_count > 1) continue;
+
+        for (int j = i + 1; j < tracker->num_tracks; j++) {
+            TrackEntry* ej = &tracker->tracks[j];
+            if (!ej->confirmed || ej->lost_count > 1) continue;
+
+            float iou_ij = bbox_iou(&ei->object.detection.bbox,
+                                    &ej->object.detection.bbox);
+            if (iou_ij < TRACK_MERGE_IOU_THRESHOLD) continue;
+
+            /* Merge: keep the OLDER track (lower track_id), discard the newer */
+            TrackEntry* survivor = (ei->track_id < ej->track_id) ? ei : ej;
+            TrackEntry* victim   = (ei->track_id < ej->track_id) ? ej : ei;
+
+            /* Transfer best appearance features from victim to survivor */
+            if (appearance_feature_is_valid(&victim->latest_appearance) &&
+                survivor->appearance_count < TRACKING_APPEARANCE_MAX_GALLERY) {
+                survivor->appearance_gallery[survivor->appearance_count++] =
+                    victim->latest_appearance;
+                survivor->latest_appearance = victim->latest_appearance;
+            }
+
+            /* Transfer keypoint stability if victim had better data */
+            if (victim->max_keypoints_seen > survivor->max_keypoints_seen) {
+                survivor->max_keypoints_seen = victim->max_keypoints_seen;
+                survivor->keypoint_stability_score =
+                    UTILS_MAX(survivor->keypoint_stability_score,
+                              victim->keypoint_stability_score);
+            }
+
+            /* Transfer spatial trajectory points */
+            for (int k = 0; k < victim->smoothed_count &&
+                 survivor->smoothed_count < TRACKING_MAX_TRAJECTORY; k++) {
+                survivor->smoothed_positions[survivor->smoothed_count++] =
+                    victim->smoothed_positions[k];
+            }
+
+            /* Update Kalman state: use survivor's prediction, victim's measurement */
+            kalman_update(&survivor->kf, &victim->object.detection.bbox);
+            survivor->object.detection = victim->object.detection;
+            survivor->lost_count = 0;
+            survivor->consecutive_hits = UTILS_MAX(survivor->consecutive_hits,
+                                                    victim->consecutive_hits);
+
+            /* Remove victim track */
+            int victim_idx = (ei->track_id < ej->track_id) ? j : i;
+            remove_track(tracker, victim_idx);
+            tracker->total_id_switches++;
+
+            /* Log merge event (throttled to avoid log spam) */
+            {
+                static int merge_log_count = 0;
+                if (++merge_log_count <= 5 || merge_log_count % 50 == 0) {
+                    log_info("Tracker: merged track #%d into #%d (IoU=%.2f, "
+                             "total merges=%d)",
+                             victim->track_id, survivor->track_id,
+                             (double)iou_ij, merge_log_count);
+                }
+            }
+
+            /* Restart outer loop — indices shifted by remove_track */
+            goto merge_restart;
+        }
+    }
+    merge_restart:
+    #undef TRACK_MERGE_IOU_THRESHOLD
 
     /* ── Step 9: Output only CONFIRMED + RECENTLY ACTIVE tracks ──
      * KEY FIX for ghost/residual boxes: a track that has been lost for

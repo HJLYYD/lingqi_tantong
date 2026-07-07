@@ -58,9 +58,9 @@ static void render_overlay_bgr(uint8_t* rgb, int img_w, int img_h,
                                 float fps, int frame_num);
 
 /* ── Push frame data to Web UI via WebSocket ──
- * Throttled to ~5 FPS (200ms).  Embeds a small JPEG thumbnail as base64
- * directly in the JSON so detection data and image stay in sync.
- * The frontend renders the thumbnail immediately — no separate HTTP fetch. */
+ * Both binary and JSON channels use the SAME resolution (640×480)
+ * so frontend overlay coordinates are always aligned with the image.
+ * Throttled to ~5 FPS (200ms). */
 static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
                                const TrackingResult* tr, int frame_num, float fps,
                                const uint8_t* rgb_data, int cam_w, int cam_h) {
@@ -71,21 +71,22 @@ static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
     if (now_ms - last_push_ms < 200) return;
     last_push_ms = now_ms;
 
-    /* ── Compress small JPEG thumbnail from RGB data ──
-     * 320×240 @ quality 22 = ~2-5 KB. Throttled: every 2nd frame. */
-    #define MAX_JPEG_SZ 8192
-    char jpeg_b64[12288];
+    /* ── JPEG encoding at camera-native resolution (640×480 by default) ──
+     * Same JPEG used for both binary WS channel and base64 JSON embed.
+     * This guarantees bbox coordinates always match the displayed image. */
+    #define PUSH_JPEG_SZ  131072
+    char jpeg_b64[196608];  /* base64 ceiling for 128KB JPEG */
     jpeg_b64[0] = '\0';
     int jpeg_b64_len = 0;
-    uint8_t raw_jpeg[8192];
+    uint8_t raw_jpeg[WS_MAX_JPEG_LEN];
     int raw_jpeg_len = 0;
-    int tw = 320, th = 240;  /* thumbnail size for bbox scaling */
+    int tw = cam_w, th = cam_h;  /* match camera resolution exactly */
 
     static int frame_skip_counter = 1;
     int encode_this_frame = (++frame_skip_counter % 2 == 0);
 
     if (rgb_data && cam_w > 0 && cam_h > 0 && encode_this_frame) {
-        /* Quick nearest-neighbour downsample to thumbnail size */
+        /* Quick nearest-neighbour copy (tw==cam_w, th==cam_h → no-op scale) */
         uint8_t* thumb = (uint8_t*)malloc((size_t)tw * th * 3);
         if (thumb) {
             for (int y = 0; y < th; y++) {
@@ -97,20 +98,21 @@ static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
                     dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
                 }
             }
-            /* libjpeg-turbo compress */
+            /* libjpeg-turbo: high quality for both channels */
             unsigned long jpeg_sz = 0;
             uint8_t* jpeg_buf = NULL;
             tjhandle tj = tjInitCompress();
             if (tj) {
                 int rc = tjCompress2(tj, thumb, tw, 0, th, TJPF_RGB,
                                      &jpeg_buf, &jpeg_sz,
-                                     TJSAMP_420, 22, TJFLAG_FASTDCT);
-                /* JPEG must be < MAX_JPEG_SZ to fit in base64 buffer */
-                if (rc == 0 && jpeg_buf && jpeg_sz > 0 && jpeg_sz < MAX_JPEG_SZ) {
+                                     TJSAMP_422, 85, TJFLAG_ACCURATEDCT);
+                if (rc == 0 && jpeg_buf && jpeg_sz > 0 && jpeg_sz < PUSH_JPEG_SZ) {
                     /* Save raw JPEG for binary WebSocket channel */
-                    memcpy(raw_jpeg, jpeg_buf, (size_t)jpeg_sz);
-                    raw_jpeg_len = (int)jpeg_sz;
-                    /* Base64 encode (standard alphabet) */
+                    if (jpeg_sz <= WS_MAX_JPEG_LEN) {
+                        memcpy(raw_jpeg, jpeg_buf, (size_t)jpeg_sz);
+                        raw_jpeg_len = (int)jpeg_sz;
+                    }
+                    /* Base64 encode for JSON channel */
                     static const char b64t[64] =
                         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
                     for (unsigned long i = 0; i < jpeg_sz; i += 3) {
@@ -123,8 +125,8 @@ static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
                         jpeg_b64[jpeg_b64_len++] = (remain >= 2) ? b64t[(tri >> 6) & 63] : '=';
                         jpeg_b64[jpeg_b64_len++] = (remain >= 3) ? b64t[tri & 63] : '=';
                     }
-                } else if (rc == 0 && jpeg_sz >= MAX_JPEG_SZ) {
-                    log_warn("[Web] JPEG thumbnail too large for base64 buffer: %lu bytes (max %d)", jpeg_sz, MAX_JPEG_SZ-1);
+                } else if (rc == 0 && jpeg_sz >= PUSH_JPEG_SZ) {
+                    log_warn("[Web] JPEG too large for buffer: %lu bytes", jpeg_sz);
                 }
                 if (jpeg_buf) tjFree(jpeg_buf);
                 tjDestroy(tj);
@@ -150,7 +152,9 @@ static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
         APPEND(",\"j\":\"%s\"", jpeg_b64);
     }
 
-    /* Scale bbox coords from camera resolution to thumbnail resolution */
+    /* Scale bbox coords to thumbnail resolution.
+     * Both JSON base64 thumb and binary JPEG are at tw×th resolution,
+     * so frontend overlay coordinates must match. */
     float sx = (cam_w > 0) ? (float)tw / (float)cam_w : 1.0f;
     float sy = (cam_h > 0) ? (float)th / (float)cam_h : 1.0f;
 
@@ -1637,10 +1641,17 @@ SystemController* system_controller_create(const char* config_path,
         config_get_int(sc->config, "tracking.new_person_grace_frames", 3)
     );
 
-    float fx = config_get_float(sc->config, "spatial.fx", 960.0f);
-    float fy = config_get_float(sc->config, "spatial.fy", 960.0f);
-    float cx = config_get_float(sc->config, "spatial.cx", 960.0f);
-    float cy = config_get_float(sc->config, "spatial.cy", 540.0f);
+    /* ── Spatial engine: camera intrinsics ──
+     * CRITICAL: Must match the actual camera resolution (640×480 by default).
+     * fx/fy = focal length in pixels.  For OV3660 at 640×480 with ~60° HFOV:
+     *   fx ≈ (width/2) / tan(HFOV/2) = 320 / tan(30°) ≈ 554 px
+     *   fy ≈ fx × (480/640) ≈ 416 px for square pixels
+     * Default 500 is a reasonable mid-point for uncalibrated OV3660 at 640×480.
+     * cx/cy = principal point = image center = (width/2, height/2). */
+    float fx = config_get_float(sc->config, "spatial.fx", 650.0f);
+    float fy = config_get_float(sc->config, "spatial.fy", 650.0f);
+    float cx = config_get_float(sc->config, "spatial.cx", 320.0f);
+    float cy = config_get_float(sc->config, "spatial.cy", 240.0f);
     float avg_height = config_get_float(sc->config, "spatial.avg_human_height", 1.7f);
     float cam_mat[9] = {fx, 0.0f, cx, 0.0f, fy, cy, 0.0f, 0.0f, 1.0f};
     sc->spatial_engine = spatial_engine_create(cam_mat, NULL, fx, avg_height);
