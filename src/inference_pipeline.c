@@ -25,8 +25,8 @@
 #define MIN_PERSON_CONFIDENCE       0.03f   /* Tuned for 320×320 INT8 model: DFL peaks 0.04-0.12 */
 #define MIN_PERSON_AREA_RATIO       0.005f  /* raised from 0.002: tiny blobs <0.5% of frame are noise */
 #define MAX_PERSON_AREA_RATIO       0.40f   /* lowered from 0.45: person >40% of frame is improbable */
-#define MIN_PERSON_ASPECT_RATIO     0.30f   /* tightened from 0.20: standing/walking person is 0.35-0.65 */
-#define MAX_PERSON_ASPECT_RATIO     1.80f   /* tightened from 2.0: arms-out pose at most ~1.5-1.8 */
+#define MIN_PERSON_ASPECT_RATIO     0.22f   /* v2.6: relaxed from 0.30 for half-body lateral views */
+#define MAX_PERSON_ASPECT_RATIO     2.80f   /* v2.6: relaxed from 1.80→2.80 for half-body (upper-torso only) */
 #define MIN_PERSON_HEIGHT_RATIO     0.04f   /* raised from 0.03: distant person still >4% of frame height */
 #define MAX_PERSON_HEIGHT_RATIO     0.95f   /* allows close-up person up to 95% of frame height */
 #define PERSON_NMS_IOU_THRESHOLD    0.45f   /* raised from 0.30: aggressive intra-model NMS.
@@ -172,7 +172,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         int w = config_get_int(config, "pose.input_size.0", 640);
         int h = config_get_int(config, "pose.input_size.1", 640);
         float conf = config_get_float(config, "pose.confidence_threshold", 0.08f);
-        float iou  = config_get_float(config, "pose.iou_threshold", 0.40f);
+        float iou  = config_get_float(config, "pose.iou_threshold", 0.55f);  /* v2.7: 0.40→0.55, less aggressive multi-person NMS */
         pipeline->pose_estimator = yolov8_pose_estimator_create(path_buf, w, h, conf, iou);
         if (!pipeline->pose_estimator) {
             log_critical("Failed to load PRIMARY pose model (variant=%s): %s",
@@ -191,7 +191,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
             path_buf[sizeof(path_buf) - 1] = '\0';
             int w = config_get_int(config, "face.input_size.0", 320);
             int h = config_get_int(config, "face.input_size.1", 320);
-            float conf = config_get_float(config, "face.confidence_threshold", 0.5f);
+            float conf = config_get_float(config, "face.confidence_threshold", 0.30f);  /* v2.6: lowered from 0.5→0.3 for better recall */
             float iou  = config_get_float(config, "face.iou_threshold", 0.4f);
             bool  face_ep = config_get_bool(config, "face.use_ep", false);
             pipeline->face_detector = yolov5_face_detector_create(path_buf, w, h, conf, iou, face_ep);
@@ -213,7 +213,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         if (m && m[0] != '\0') {
             strncpy(path_buf, m, sizeof(path_buf) - 1);
             path_buf[sizeof(path_buf) - 1] = '\0';
-            pipeline->face_recognizer = arcface_recognizer_create(path_buf, 112, 112, 0.55f);
+            pipeline->face_recognizer = arcface_recognizer_create(path_buf, 112, 112, 0.45f);  /* v2.6: lowered from 0.55→0.45 for better recall */
             if (pipeline->face_recognizer) {
                 pipeline->models_loaded[3] = true;
                 log_info("Face recognizer loaded: %s", path_buf);
@@ -298,12 +298,14 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
             if (pipeline->frame_diff) {
                 pipeline->frame_diff->adaptive_enabled =
                     config_get_bool(config, "frame_diff.adaptive_enabled", true);
+                /* v2.6: more aggressive skip — static: 40 frames, low-motion: 8 frames.
+                 * Force-process every 60 frames to prevent drift. */
                 pipeline->frame_diff->max_static_skip =
-                    config_get_int(config, "frame_diff.max_static_skip", 20);
+                    config_get_int(config, "frame_diff.max_static_skip", 40);
                 pipeline->frame_diff->max_low_motion_skip =
-                    config_get_int(config, "frame_diff.max_low_motion_skip", 5);
+                    config_get_int(config, "frame_diff.max_low_motion_skip", 8);
                 pipeline->frame_diff->force_process_every =
-                    config_get_int(config, "frame_diff.force_process_every", 30);
+                    config_get_int(config, "frame_diff.force_process_every", 60);
                 log_info("FrameDiff: enabled grid=%dx%d stride=%d cell=%.0f change=%.2f",
                          fd_grid_w, fd_grid_h, fd_stride,
                          (double)fd_cell, (double)fd_change);
@@ -400,7 +402,7 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
 
         if (kpt_filter_enabled && kv && num_poses > 0 && poses) {
             /* Find best-matching pose for this detection */
-            float best_pose_iou = 0.35f;
+            float best_pose_iou = 0.20f;  /* v2.7: 0.35→0.20, match more detections to poses */
             int best_pose_idx = -1;
             for (int p = 0; p < num_poses; p++) {
                 if (!poses[p].has_bbox) continue;
@@ -414,15 +416,19 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
             if (best_pose_idx >= 0) {
                 const PoseEstimation* matched_pose = &poses[best_pose_idx];
 
-                /* ── Count visible keypoints in each category ── */
+                /* ── Count visible keypoints in each category ──
+                 * v2.6: kpt_conf lowered from 0.08→0.06 for INT8 models.
+                 * KeypointValidator is opaque here; use KV_DEFAULT threshold. */
                 int n_upper = 0, n_left = 0, n_right = 0;
-                float kpt_conf = 0.08f;  /* INT8 at 320×320 rarely >0.15 */
+                float kpt_conf = KV_DEFAULT_KPT_CONF_THRESHOLD;
+                if (kpt_conf > 0.15f) kpt_conf = 0.10f;
+                if (kpt_conf < 0.05f) kpt_conf = 0.06f;
+                for (int k = 0; k <= 10 && k < matched_pose->num_keypoints; k++) {
+                    if (matched_pose->keypoints[k].confidence >= kpt_conf &&
+                        matched_pose->keypoints[k].x >= 0.0f &&
+                        matched_pose->keypoints[k].y >= 0.0f) n_upper++;
+                }
                 {
-                    for (int k = 0; k <= 10 && k < matched_pose->num_keypoints; k++) {
-                        if (matched_pose->keypoints[k].confidence >= kpt_conf &&
-                            matched_pose->keypoints[k].x >= 0.0f &&
-                            matched_pose->keypoints[k].y >= 0.0f) n_upper++;
-                    }
                     static const int left_chain[] = {1,3,5,7,9,11,13,15};
                     for (int k = 0; k < 8; k++) {
                         int idx = left_chain[k];
@@ -431,6 +437,8 @@ static int filter_detections(const Detection* input, int num_input, int img_w, i
                             matched_pose->keypoints[idx].x >= 0.0f &&
                             matched_pose->keypoints[idx].y >= 0.0f) n_left++;
                     }
+                }
+                {
                     static const int right_chain[] = {2,4,6,8,10,12,14,16};
                     for (int k = 0; k < 8; k++) {
                         int idx = right_chain[k];
@@ -575,29 +583,48 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
             for (int p = 0; p < num_person_dets && num_detected < 20; p++) {
                 const BoundingBox* pb = &person_dets[p].bbox;
                 float person_h = bbox_height(pb);
-                if (person_h < 40.0f) continue;  /* too distant to detect face */
+                if (person_h < 24.0f) continue;  /* v2.6: lowered from 40→24, detect faces farther away */
 
-                /* Head ROI: top portion of person bbox */
-                int roi_x = (int)(pb->x_min - person_h * 0.10f);
+                /* Head ROI: top portion of person bbox.
+                 * v2.6: expanded to 50% height for half-body persons.
+                 * v2.7: ROI made SQUARE to prevent aspect-ratio distortion
+                 * when resizing to 320×320 model input.  Non-square ROIs
+                 * stretch faces → wrong coordinates + lower detection rate. */
+                int roi_x = (int)(pb->x_min - person_h * 0.15f);
                 int roi_y = (int)(pb->y_min);
-                int roi_w = (int)(bbox_width(pb) + person_h * 0.20f);
-                int roi_h = (int)(person_h * 0.40f);
+                int roi_w = (int)(bbox_width(pb) + person_h * 0.30f);
+                int roi_h = (int)(person_h * 0.50f);
 
                 /* Clamp to frame */
                 if (roi_x < 0) { roi_w += roi_x; roi_x = 0; }
                 if (roi_y < 0) { roi_h += roi_y; roi_y = 0; }
                 if (roi_x + roi_w > width)  roi_w = width  - roi_x;
                 if (roi_y + roi_h > height) roi_h = height - roi_y;
-                if (roi_w < 24 || roi_h < 24) continue;
 
-                /* Crop ROI → contiguous buffer, then resize to model input.
-                 * Cannot pass frame+offset directly to utils_resize_image because
-                 * the source stride is full-frame width, not roi_w. */
-                uint8_t* crop_temp = (uint8_t*)malloc((size_t)roi_w * roi_h * 3);
+                /* v2.7: Make ROI square to avoid distortion on resize.
+                 * Take the larger dimension, expand symmetrically. */
+                int roi_dim = (roi_w > roi_h) ? roi_w : roi_h;
+                if (roi_dim < 24) continue;
+                /* Center the expansion so face stays in middle */
+                int roi_cx = roi_x + roi_w / 2;
+                int roi_cy = roi_y + roi_h / 2;
+                roi_x = roi_cx - roi_dim / 2;
+                roi_y = roi_cy - roi_dim / 2;
+                /* Re-clamp after squaring */
+                if (roi_x < 0) roi_x = 0;
+                if (roi_y < 0) roi_y = 0;
+                if (roi_x + roi_dim > width)  roi_x = width  - roi_dim;
+                if (roi_y + roi_dim > height) roi_y = height - roi_dim;
+                if (roi_x < 0 || roi_y < 0) continue;
+                roi_w = roi_dim;
+                roi_h = roi_dim;
+
+                /* Crop ROI → contiguous buffer, then resize to model input. */
+                uint8_t* crop_temp = (uint8_t*)malloc((size_t)roi_dim * roi_dim * 3);
                 if (!crop_temp) continue;
                 utils_crop_image(frame, width, height,
-                                 roi_x, roi_y, roi_w, roi_h, crop_temp);
-                utils_resize_image(crop_temp, roi_w, roi_h,
+                                 roi_x, roi_y, roi_dim, roi_dim, crop_temp);
+                utils_resize_image(crop_temp, roi_dim, roi_dim,
                                    roi_buf, 320, 320, 3);
                 free(crop_temp);
 
@@ -607,66 +634,123 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
                     face_detector, roi_buf, 320, 320, roi_faces, 3);
 
                 /* Map ROI-space coords back to full-frame.
-                 * The face detector's internal yolo_preprocess maps back via
-                 * scale/pad_x/pad_y (letterbox). For ROI mode, input is already
-                 * 320×320 → scale≈1.0, pad≈0.  The detector returns coords in
-                 * the 320×320 space; we scale back to ROI dimensions then offset. */
-                float sx = (float)roi_w / 320.0f;
-                float sy = (float)roi_h / 320.0f;
+                 * ROI is square (roi_dim×roi_dim) → resized to 320×320 WITH CORRECT
+                 * ASPECT RATIO.  Scale factor is uniform: sx = sy = roi_dim / 320. */
+                float sxy = (float)roi_dim / 320.0f;
 
                 for (int f = 0; f < n_roi && num_detected < 20; f++) {
                     detected[num_detected] = roi_faces[f];
-                    detected[num_detected].bbox.x_min =
-                        roi_faces[f].bbox.x_min * sx + (float)roi_x;
-                    detected[num_detected].bbox.y_min =
-                        roi_faces[f].bbox.y_min * sy + (float)roi_y;
-                    detected[num_detected].bbox.x_max =
-                        roi_faces[f].bbox.x_max * sx + (float)roi_x;
-                    detected[num_detected].bbox.y_max =
-                        roi_faces[f].bbox.y_max * sy + (float)roi_y;
+                    float fx1 = roi_faces[f].bbox.x_min * sxy + (float)roi_x;
+                    float fy1 = roi_faces[f].bbox.y_min * sxy + (float)roi_y;
+                    float fx2 = roi_faces[f].bbox.x_max * sxy + (float)roi_x;
+                    float fy2 = roi_faces[f].bbox.y_max * sxy + (float)roi_y;
+                    /* Tighten face bbox: YOLOv5-Face adds ~15% margin. Shrink 12% per side. */
+                    float fw = fx2 - fx1, fh = fy2 - fy1;
+                    float shrink_x = fw * 0.12f, shrink_y = fh * 0.12f;
+                    detected[num_detected].bbox.x_min = fx1 + shrink_x;
+                    detected[num_detected].bbox.y_min = fy1 + shrink_y;
+                    detected[num_detected].bbox.x_max = fx2 - shrink_x;
+                    detected[num_detected].bbox.y_max = fy2 - shrink_y;
+                    /* v2.7 BUGFIX: map face KEYPOINTS from ROI space to full-frame.
+                     * Previously only bbox was mapped; keypoints stayed in 320×320 space
+                     * → drawn at completely wrong positions on the full-frame overlay. */
+                    if (roi_faces[f].has_keypoints) {
+                        for (int kp = 0; kp < 5; kp++) {
+                            detected[num_detected].keypoints[kp][0] =
+                                roi_faces[f].keypoints[kp][0] * sxy + (float)roi_x;
+                            detected[num_detected].keypoints[kp][1] =
+                                roi_faces[f].keypoints[kp][1] * sxy + (float)roi_y;
+                        }
+                    }
                     num_detected++;
                 }
             }
             free(roi_buf);
-
-            if (num_detected > 0) goto face_recognition;
         }
     }
 
-    /* ── Fallback: full-frame detection ── */
-    num_detected = yolov5_face_detector_detect_faces(
-        face_detector, frame, width, height, detected, 20);
+    /* ── Full-frame detection (runs on-demand, not every cycle) ──
+     * v2.6: Full-frame face detection is EXPENSIVE (~80ms on K1 for 640×480).
+     * It only runs when:
+     *   1. ROI found zero faces — likely no person detections, need full-frame
+     *   2. ROI faces < person detections — some persons have undetected faces
+     *   3. Every 4th face cycle as a periodic sweep (catch new entry / half-body)
+     * Otherwise skipped. This keeps face detection overhead ~15ms avg vs ~80ms. */
+    static int ff_cycle_count = 0;
+    bool run_full_frame = false;
+    ff_cycle_count++;
 
-face_recognition:
+    if (num_detected == 0) {
+        run_full_frame = true;  /* on-demand: ROI found nothing */
+    } else if (num_person_dets > 0 && num_detected < num_person_dets) {
+        run_full_frame = true;  /* on-demand: some persons have no face */
+    } else if (ff_cycle_count % 4 == 0) {
+        run_full_frame = true;  /* periodic sweep: every 4th face cycle */
+    }
+
+    if (run_full_frame) {
+        FaceIdentity ff_faces[10];
+        int n_ff = yolov5_face_detector_detect_faces(
+            face_detector, frame, width, height, ff_faces, 10);
+        /* Merge full-frame faces (avoid duplicating ROI-detected faces) */
+        for (int ff = 0; ff < n_ff && num_detected < 20; ff++) {
+            bool is_dup = false;
+            for (int d = 0; d < num_detected; d++) {
+                if (bbox_iou(&ff_faces[ff].bbox, &detected[d].bbox) > 0.5f) {
+                    is_dup = true;
+                    /* Keep the higher-confidence detection */
+                    if (ff_faces[ff].confidence > detected[d].confidence) {
+                        detected[d] = ff_faces[ff];
+                    }
+                    break;
+                }
+            }
+            if (!is_dup) {
+                detected[num_detected++] = ff_faces[ff];
+            }
+        }
+    }
+
     if (num_detected <= 0) return 0;
+
+    /* ── Tighten all face bboxes ──
+     * YOLOv5-Face adds ~15% margin around the actual face. Shrink 10% per side
+     * for a tighter fit. Applied to both ROI and full-frame detected faces. */
+    for (int ti = 0; ti < num_detected; ti++) {
+        float fw = detected[ti].bbox.x_max - detected[ti].bbox.x_min;
+        float fh = detected[ti].bbox.y_max - detected[ti].bbox.y_min;
+        float sx = fw * 0.10f, sy = fh * 0.10f;
+        detected[ti].bbox.x_min += sx;
+        detected[ti].bbox.y_min += sy;
+        detected[ti].bbox.x_max -= sx;
+        detected[ti].bbox.y_max -= sy;
+    }
 
     int num_faces = 0;
 
     /* ── Per-person deduplication ──
-     * At most one face per person: keep the highest-confidence face whose
-     * center falls inside the person bbox. ROI-detected faces are already
-     * per-person by construction, but full-frame fallback may have multiples. */
-    int matched_persons[20] = {0};  /* track which person index got a face */
+     * v2.7: Find BEST matching person via bbox IoU (was: first-contains-center).
+     * When people stand close together, face centers can fall inside multiple
+     * person bboxes.  IoU-based matching correctly assigns each face to its
+     * owner.  At most one face per person (highest confidence wins). */
+    int matched_persons[20] = {0};
     int num_matched = 0;
 
     for (int i = 0; i < num_detected && num_faces < max_faces; i++) {
-        /* Find which person this face belongs to */
+        /* Find best-matching person by bbox IoU */
         int best_person = -1;
+        float best_iou = 0.15f;  /* minimum IoU to consider a match */
         if (num_person_dets > 0) {
-            float face_cx = bbox_center_x(&detected[i].bbox);
-            float face_cy = bbox_center_y(&detected[i].bbox);
             for (int p = 0; p < num_person_dets; p++) {
-                if (face_cx >= person_dets[p].bbox.x_min &&
-                    face_cx <= person_dets[p].bbox.x_max &&
-                    face_cy >= person_dets[p].bbox.y_min &&
-                    face_cy <= person_dets[p].bbox.y_max) {
+                float iou = bbox_iou(&detected[i].bbox, &person_dets[p].bbox);
+                if (iou > best_iou) {
+                    best_iou = iou;
                     best_person = p;
-                    break;
                 }
             }
         }
 
-        /* Skip faces not inside any person (when persons are known) */
+        /* Skip faces with no clear person match */
         if (num_person_dets > 0 && best_person < 0) continue;
 
         /* Per-person dedup: keep only highest-confidence face per person */
@@ -674,6 +758,7 @@ face_recognition:
             bool already_matched = false;
             for (int m = 0; m < num_matched; m++) {
                 if (matched_persons[m] == best_person) {
+                    /* Duplicate: keep higher-confidence face */
                     already_matched = true;
                     break;
                 }
@@ -936,21 +1021,88 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                             out_result->num_detections, (ttc > 0 ? ttc : out_result->num_detections));
     }
 
-    /* ── Step 3: Face detection (SUPPLEMENT, reduced frequency) ──
-     * In TRACKING mode, further reduce face detection frequency since
-     * we already have confirmed person tracks. */
+    /* ── Step 3: Face detection (SUPPLEMENT, balanced frequency + event-driven) ──
+     * v2.7: Three triggers for face detection:
+     *   1. Periodic: every 15 (TRACKING) / 8 (SEARCHING) / 60 (no dets) frames
+     *   2. New-person: detection count increased → run immediately (reduces lag)
+     *   3. First-person: 0→1 detections → run immediately (cold start)
+     * Face persistence cache bridges the gap between detection cycles. */
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_FACE) && pipeline->face_detector) {
         int face_interval;
         if (pipeline->cascade_state == PIPELINE_CASCADE_TRACKING) {
-            face_interval = (out_result->num_detections > 0) ? 30 : 120;
+            face_interval = (out_result->num_detections > 0) ? 15 : 60;
         } else {
-            face_interval = (out_result->num_detections > 0) ? 10 : 120;
+            face_interval = (out_result->num_detections > 0) ? 8 : 60;
         }
-        if (pipeline->frame_counter % face_interval == 0) {
+
+        bool run_face = (pipeline->frame_counter % face_interval == 0);
+
+        /* Event-driven: new person appeared? Force face detection on next cycle */
+        static int prev_det_count = -1;
+        if (!run_face && prev_det_count >= 0) {
+            if (out_result->num_detections > prev_det_count) {
+                run_face = true;  /* new person entered → immediate face check */
+            } else if (prev_det_count == 0 && out_result->num_detections > 0) {
+                run_face = true;  /* first person appeared → immediate face check */
+            }
+        }
+        prev_det_count = out_result->num_detections;
+
+        if (run_face) {
             out_result->num_faces = detect_faces(pipeline->face_detector, pipeline->face_recognizer,
                                              frame_data, width, height,
                                              out_result->detections, out_result->num_detections,
                                              out_result->faces, MAX_FACES_PER_FRAME);
+        }
+
+        /* ── Cross-validation: Face → Person rescue ──
+         * v2.7: If face detection found a face but the person detector missed
+         * that person, the face confirms human presence.  Expand the face bbox
+         * to estimate a full person bbox and add it as a synthetic detection.
+         * This fixes the "skeleton drawn but not tracked" problem where the
+         * keypoint validator rejects partial-body poses. */
+        if (out_result->num_faces > 0 && out_result->num_detections < MAX_DETECTIONS_PER_FRAME) {
+            for (int fi = 0; fi < out_result->num_faces; fi++) {
+                const FaceIdentity* face = &out_result->faces[fi];
+                /* Check if this face already belongs to a known detection */
+                bool already_covered = false;
+                for (int di = 0; di < out_result->num_detections; di++) {
+                    if (bbox_iou(&face->bbox, &out_result->detections[di].bbox) > 0.05f) {
+                        already_covered = true;
+                        /* Boost this detection's confidence — face confirms person */
+                        if (out_result->detections[di].confidence < 0.25f) {
+                            out_result->detections[di].confidence += 0.08f;
+                        }
+                        break;
+                    }
+                }
+                if (already_covered) continue;
+
+                /* Face without a person detection — synthesize one.
+                 * Estimate full body: face is ~1/7 of person height, centered.
+                 * Expand face bbox downward to approximate full body. */
+                float face_w = bbox_width(&face->bbox);
+                float face_h = bbox_height(&face->bbox);
+                float face_cx = bbox_center_x(&face->bbox);
+                float body_h = face_h * 7.0f;  /* head ≈ 1/7 body height */
+                float body_w = face_w * 2.5f;  /* shoulders ≈ 2.5× face width */
+
+                Detection synth;
+                memset(&synth, 0, sizeof(synth));
+                synth.bbox.x_min = UTILS_CLAMP(face_cx - body_w * 0.5f, 0.0f, (float)(width - 1));
+                synth.bbox.y_min = UTILS_CLAMP(face->bbox.y_min - face_h * 0.5f, 0.0f, (float)(height - 1));
+                synth.bbox.x_max = UTILS_CLAMP(face_cx + body_w * 0.5f, 0.0f, (float)(width - 1));
+                synth.bbox.y_max = UTILS_CLAMP(face->bbox.y_min + body_h, 0.0f, (float)(height - 1));
+                synth.confidence = face->confidence * 0.7f;  /* discounted: estimated, not detected */
+                synth.class_id = 0;  /* PERSON_CLASS_ID */
+                strncpy(synth.class_name, "person", MAX_STRING_LEN - 1);
+                synth.is_partial_body = true;
+                synth.num_visible_keypoints = 0;
+
+                if (bbox_height(&synth.bbox) > 12.0f && bbox_width(&synth.bbox) > 8.0f) {
+                    out_result->detections[out_result->num_detections++] = synth;
+                }
+            }
         }
     }
 

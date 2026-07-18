@@ -46,7 +46,7 @@ extern "C" {
  * characteristic height/width ratios.  Standing adults: 2.5-4.0.
  * Sitting/crouching: 1.2-2.5.  Objects (chairs, boxes) often fall
  * outside this range or are nearly square. */
-#define KV_BBOX_ASPECT_MIN       1.2f   /* sitting/crouching human */
+#define KV_BBOX_ASPECT_MIN       0.70f  /* v2.7: 1.2→0.70 for half-body (head+shoulders≈square bbox) */
 #define KV_BBOX_ASPECT_MAX       4.5f   /* standing adult + hat/bag */
 #define KV_BBOX_AREA_MIN_RATIO   0.003f /* ~0.3% of frame = distant person */
 #define KV_BBOX_AREA_MAX_RATIO   0.45f  /* ~45% of frame = very close person */

@@ -462,24 +462,25 @@ bool keypoint_validator_upper_body_check(
         }
     }
 
-    /* Minimum 4 upper-body keypoints required */
-    if (n_upper < 4) return false;
+    /* v2.6: Minimum 3 upper-body keypoints (was 4) — allows half-body
+     * where only head + shoulders are visible (e.g. behind obstacle). */
+    if (n_upper < 3) return false;
 
     /* At least one shoulder must be visible */
     if (!has_lshoulder && !has_rshoulder) return false;
 
-    /* Head-above-shoulders check if both visible */
-    if (has_nose && has_lshoulder && has_rshoulder) {
-        float sh_mid_y = (pose->keypoints[5].y + pose->keypoints[6].y) * 0.5f;
-        if (pose->keypoints[0].y >= sh_mid_y) return false; /* nose below shoulders */
+    /* Head-above-shoulders check: only if nose + at least one shoulder visible */
+    if (has_nose && (has_lshoulder || has_rshoulder)) {
+        float sh_y = has_lshoulder ? pose->keypoints[5].y : pose->keypoints[6].y;
+        if (pose->keypoints[0].y >= sh_y) return false; /* nose below shoulder */
     }
 
-    /* Shoulder symmetry if both visible */
+    /* Shoulder symmetry if both visible — relaxed for half-body */
     if (has_lshoulder && has_rshoulder) {
         float dy = fabsf(pose->keypoints[5].y - pose->keypoints[6].y);
         float bbox_h = bbox_height(bbox);
-        if (bbox_h > 0.0f && dy > kv->config.symmetry_tolerance * bbox_h * 5.0f) {
-            return false; /* severely asymmetric shoulders — not human */
+        if (bbox_h > 0.0f && dy > kv->config.symmetry_tolerance * bbox_h * 8.0f) {
+            return false; /* extremely asymmetric shoulders — not human */
         }
     }
 

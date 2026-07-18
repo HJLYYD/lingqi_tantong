@@ -463,6 +463,20 @@ function _swapVideoFrame(url, revoke) {
   backImg.src = url;
 }
 
+/* ── IoU helper: Intersection-over-Union between two [x1,y1,x2,y2] boxes ── */
+function boxIou(a, b) {
+  var ax1 = a[0], ay1 = a[1], ax2 = a[2], ay2 = a[3];
+  var bx1 = b[0], by1 = b[1], bx2 = b[2], by2 = b[3];
+  var ix = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+  var iy = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+  var inter = ix * iy;
+  if (inter <= 0) return 0;
+  var areaA = (ax2 - ax1) * (ay2 - ay1);
+  var areaB = (bx2 - bx1) * (by2 - by1);
+  var union = areaA + areaB - inter;
+  return union > 0 ? inter / union : 0;
+}
+
 function renderOvl(m) {
   alignOverlay();
   var c = D.ovl;
@@ -473,9 +487,34 @@ function renderOvl(m) {
   /* Sharper text rendering */
   ctx.textBaseline = 'top';
 
+  /* ── Collect high-priority boxes for dedup ──
+   * Track boxes and pose boxes will suppress raw detection boxes. */
+  var trks = m.t || [];
+  var poses = m.p || [];
   var dets = m.d || [];
+  var faces = m.fc || [];
+
+  /* Build suppressors list: track boxes (highest priority) + pose bboxes */
+  var suppressors = [];
+  for (var si = 0; si < trks.length; si++) {
+    if (trks[si].b) suppressors.push(trks[si].b);
+  }
+  for (var sp = 0; sp < poses.length; sp++) {
+    if (poses[sp].b) suppressors.push(poses[sp].b);
+  }
+
+  var IOU_THRESH = 0.45;
+
+  /* ── Detection boxes (lowest priority) — skip if overlapped by track/pose ── */
   for (var i = 0; i < dets.length; i++) {
     var d = dets[i];
+    /* Suppress detection box if it overlaps any higher-priority box */
+    var suppressed = false;
+    for (var sj = 0; sj < suppressors.length; sj++) {
+      if (boxIou(d, suppressors[sj]) > IOU_THRESH) { suppressed = true; break; }
+    }
+    if (suppressed) continue;
+
     /* +0.5 offset snaps 1px stroke to pixel grid for maximum sharpness */
     ctx.strokeStyle = '#FFD428'; ctx.lineWidth = 2;
     ctx.strokeRect(d[0]+0.5, d[1]+0.5, d[2]-d[0], d[3]-d[1]);
@@ -485,13 +524,52 @@ function renderOvl(m) {
     ctx.fillText(Math.round(d[4]*100)+'%', d[0]+2, d[1] > 18 ? d[1]-18 : d[1]+2);
   }
 
-  var poses = m.p || [];
+  /* ── Pose dedup: sort by keypoint count descending, suppress near-duplicates ── */
+  var POSE_IOU_THRESH = 0.55;  /* stricter: only suppress when clearly the same person */
   for (var pi = 0; pi < poses.length; pi++) {
+    var kp = poses[pi].k || [];
+    poses[pi]._kcount = 0;
+    for (var kc = 0; kc < kp.length; kc++) { if (kp[kc]) poses[pi]._kcount++; }
+  }
+  poses.sort(function(a, b) { return b._kcount - a._kcount; });
+
+  var poseActive = [];  /* boolean: should this pose be rendered? */
+  for (var pi2 = 0; pi2 < poses.length; pi2++) {
+    var dup = false;
+    if (poses[pi2].b) {
+      for (var pj = 0; pj < pi2; pj++) {
+        if (!poseActive[pj]) continue;
+        if (poses[pj].b && boxIou(poses[pi2].b, poses[pj].b) > POSE_IOU_THRESH) {
+          dup = true; break;
+        }
+      }
+    }
+    poseActive[pi2] = !dup;
+  }
+
+  /* ── Collect track boxes for pose-bbox suppression ── */
+  var trackBoxes = [];
+  for (var ti2 = 0; ti2 < trks.length; ti2++) {
+    if (trks[ti2].b) trackBoxes.push(trks[ti2].b);
+  }
+
+  /* ── Pose skeleton + keypoints (deduplicated) ── */
+  for (var pi = 0; pi < poses.length; pi++) {
+    if (!poseActive[pi]) continue;
     var p = poses[pi], k = p.k || [];
+
+    /* Pose bounding box: suppress if overlapped by any track box */
+    var poseSuppressed = false;
     if (p.b) {
+      for (var pk = 0; pk < trackBoxes.length; pk++) {
+        if (boxIou(p.b, trackBoxes[pk]) > IOU_THRESH) { poseSuppressed = true; break; }
+      }
+    }
+    if (p.b && !poseSuppressed) {
       ctx.strokeStyle = '#00DC78'; ctx.setLineDash([5,5]); ctx.lineWidth = 1.5;
       ctx.strokeRect(p.b[0]+0.5, p.b[1]+0.5, p.b[2]-p.b[0], p.b[3]-p.b[1]); ctx.setLineDash([]);
     }
+
     /* Skeleton lines — 2px solid for crispness */
     ctx.strokeStyle = '#00F082'; ctx.lineWidth = 2;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -508,7 +586,7 @@ function renderOvl(m) {
     }
   }
 
-  var trks = m.t || [];
+  /* ── Track boxes (highest priority) + labels ── */
   for (var ti = 0; ti < trks.length; ti++) {
     var t = trks[ti];
     if (!t.b) continue;
@@ -522,11 +600,89 @@ function renderOvl(m) {
     ctx.fillText(lbl, t.b[0]+2, t.b[1] > 18 ? t.b[1]-18 : t.b[1]+2);
   }
 
+  /* Face recognition overlay — magenta boxes + identity labels + landmarks */
+  var FC = ['#FF6EC7','#E040FB','#EA80FC','#FF80AB','#F48FB1'];  /* 5 face landmark colors */
+  for (var fi = 0; fi < faces.length; fi++) {
+    var fc = faces[fi];
+    if (!fc.b) continue;
+
+    /* Face bounding box — magenta, dashed */
+    ctx.strokeStyle = '#E040FB'; ctx.setLineDash([4,3]); ctx.lineWidth = 2;
+    ctx.strokeRect(fc.b[0]+0.5, fc.b[1]+0.5, fc.b[2]-fc.b[0], fc.b[3]-fc.b[1]);
+    ctx.setLineDash([]);
+
+    /* Identity label — pill background + text */
+    var idTxt = fc.id || 'unknown';
+    var simPct = fc.sim ? Math.round(fc.sim*100)+'%' : '';
+    var lbl = simPct ? idTxt+' '+simPct : idTxt;
+    ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
+    var tm = ctx.measureText(lbl);
+    var lw = tm.width + 14, lh = 22;
+    var lx = fc.b[0], ly = fc.b[1] > lh + 4 ? fc.b[1] - lh - 3 : fc.b[3] + 3;
+
+    /* Pill background */
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.beginPath();
+    ctx.moveTo(lx+10, ly); ctx.lineTo(lx+lw-10, ly);
+    ctx.arcTo(lx+lw, ly, lx+lw, ly+10, 10); ctx.lineTo(lx+lw, ly+lh-10);
+    ctx.arcTo(lx+lw, ly+lh, lx+lw-10, ly+lh, 10); ctx.lineTo(lx+10, ly+lh);
+    ctx.arcTo(lx, ly+lh, lx, ly+lh-10, 10); ctx.lineTo(lx, ly+10);
+    ctx.arcTo(lx, ly, lx+10, ly, 10); ctx.closePath();
+    ctx.fill();
+
+    /* Identity text — white + magenta highlight if recognized */
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = (fc.sim > 0.5) ? '#FF6EC7' : '#aaa';
+    ctx.fillText(lbl, lx+7, ly+lh/2+1);
+    ctx.textBaseline = 'top';
+
+    /* Face landmarks — 5 keypoints. v2.7: larger + white-ring style to
+     * visually separate from body pose keypoints (which use black rings).
+     * White outline + neon fill makes face landmarks unmistakable. */
+    if (fc.k && fc.k.length >= 5) {
+      for (var ki = 0; ki < 5; ki++) {
+        if (!fc.k[ki]) continue;
+        /* White outer ring — distinct from pose kpts' black ring */
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(fc.k[ki][0], fc.k[ki][1], 5.5, 0, Math.PI*2); ctx.fill();
+        /* Neon inner dot */
+        ctx.fillStyle = FC[ki] || '#FF6EC7';
+        ctx.beginPath(); ctx.arc(fc.k[ki][0], fc.k[ki][1], 3.5, 0, Math.PI*2); ctx.fill();
+      }
+      /* Draw face mesh lines: eyes-horizontal, nose-vertical, mouth-horizontal */
+      ctx.strokeStyle = 'rgba(255,110,199,0.7)'; ctx.lineWidth = 1.5;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      /* Left eye → Right eye */
+      if (fc.k[0] && fc.k[1]) {
+        ctx.beginPath(); ctx.moveTo(fc.k[0][0], fc.k[0][1]); ctx.lineTo(fc.k[1][0], fc.k[1][1]); ctx.stroke();
+      }
+      /* Eyes midpoint → Nose */
+      if (fc.k[0] && fc.k[1] && fc.k[2]) {
+        ctx.beginPath();
+        ctx.moveTo((fc.k[0][0]+fc.k[1][0])/2, (fc.k[0][1]+fc.k[1][1])/2);
+        ctx.lineTo(fc.k[2][0], fc.k[2][1]); ctx.stroke();
+      }
+      /* Nose → Left mouth corner */
+      if (fc.k[2] && fc.k[3]) {
+        ctx.beginPath(); ctx.moveTo(fc.k[2][0], fc.k[2][1]); ctx.lineTo(fc.k[3][0], fc.k[3][1]); ctx.stroke();
+      }
+      /* Nose → Right mouth corner */
+      if (fc.k[2] && fc.k[4]) {
+        ctx.beginPath(); ctx.moveTo(fc.k[2][0], fc.k[2][1]); ctx.lineTo(fc.k[4][0], fc.k[4][1]); ctx.stroke();
+      }
+      /* Left mouth → Right mouth */
+      if (fc.k[3] && fc.k[4]) {
+        ctx.beginPath(); ctx.moveTo(fc.k[3][0], fc.k[3][1]); ctx.lineTo(fc.k[4][0], fc.k[4][1]); ctx.stroke();
+      }
+    }
+  }
+
   /* Info bar at top */
   var barH = 28;
   ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(0, 0, W, barH);
   ctx.fillStyle = '#fff'; ctx.font = 'bold 11px ' + getComputedStyle(document.body).fontFamily;
-  ctx.fillText('帧 '+m.n+'  帧率 '+m.f+'  追踪 '+trks.length+'  检测 '+dets.length+(m.a?'  动作 '+m.a[0]:''), 10, 8);
+  var fcCount = (m.fc && m.fc.length) ? m.fc.length : 0;
+  ctx.fillText('帧 '+m.n+'  帧率 '+m.f+'  追踪 '+trks.length+'  检测 '+dets.length+'  人脸 '+fcCount+(m.a?'  动作 '+m.a[0]:''), 10, 8);
 }
 
 /* ═══════════════════════ 2D 地图（回退） ═══════════════════════ */
@@ -1277,7 +1433,19 @@ var WS = {
 
     case 'f':
       lastFrame = msg;
-      svFps.textContent = msg.f || '--';
+      /* v2.7: Calculate real display FPS from message arrival rate,
+       * not the pipeline processing rate (which includes frame-diff skips).
+       * Pipeline FPS shown as secondary value for debugging. */
+      (function(){
+        if (!WS._fpsTimes) WS._fpsTimes = [];
+        WS._fpsTimes.push(Date.now());
+        while (WS._fpsTimes.length > 15) WS._fpsTimes.shift();
+        if (WS._fpsTimes.length >= 2) {
+          var dt = (WS._fpsTimes[WS._fpsTimes.length-1] - WS._fpsTimes[0]) / 1000;
+          var realFps = dt > 0.01 ? (WS._fpsTimes.length - 1) / dt : 0;
+          svFps.textContent = realFps.toFixed(1);
+        }
+      })();
       svFrame.textContent = msg.n || 0;
       svTracks.textContent = msg.t ? msg.t.length : 0;
       svDets.textContent = msg.d ? msg.d.length : 0;
@@ -1287,9 +1455,7 @@ var WS = {
         svUptime.textContent = (up>=60?Math.floor(up/60)+'分':'')+(up%60)+'秒';
       }
 
-      if (msg.j) {
-        _swapVideoFrame('data:image/jpeg;base64,'+msg.j, false);
-      }
+      /* Binary JPEG channel handles the image (base64 removed from JSON in v2.7) */
 
       if (currentTab === 'cam') renderOvl(msg);
       if (currentTab === 'map') {

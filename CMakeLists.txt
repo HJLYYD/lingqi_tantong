@@ -326,6 +326,7 @@ set(BUSINESS_SOURCES
     src/spatial_engine.c
     src/world_coord.c
     src/result_manager.c
+    src/benchmark.c
 )
 
 set(OUTPUT_SOURCES

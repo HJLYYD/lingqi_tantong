@@ -37,7 +37,7 @@ extern "C" {
 /* ── Configuration ── */
 #define WS_MAX_CLIENTS         32          /* max concurrent WebSocket clients */
 #define WS_RING_SIZE           32          /* frame ring buffer capacity */
-#define WS_BROADCAST_INTERVAL_MS  200     /* timer period for frame broadcast */
+#define WS_BROADCAST_INTERVAL_MS  80      /* v2.7: 200→80ms for smoother display (~12 Hz max) */
 #define WS_STATUS_INTERVAL_MS  500         /* timer period for status broadcast */
 #define WS_MAX_FRAME_JSON_LEN  131072      /* max serialized frame JSON (w/ 320×240 base64 thumb) */
 #define WS_MAX_JPEG_LEN        65536       /* max raw JPEG size (original camera MJPEG frame) */

@@ -14,6 +14,7 @@
 #include "logger.h"
 #include "terminal_ui.h"
 #include "k1_platform.h"
+#include "benchmark.h"
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,7 +104,12 @@ static void usage(const char* p) {
     printf("Open http://localhost:8080 in a browser to control the pipeline.\n\n");
     printf("Modes:\n");
     printf("  --realtime           K1 dual-cluster realtime pipeline (CLI mode)\n");
-    printf("  --video PATH         Offline video file processing (CLI mode)\n\n");
+    printf("  --video PATH         Offline video file processing (CLI mode)\n");
+    printf("  --benchmark          Model inference benchmark (paper-ready tables)\n\n");
+    printf("Benchmark options:\n");
+    printf("  --benchmark-model N  Filter: yolo|pose|face|arcface|stgcn|all\n");
+    printf("  --benchmark-runs N   Timed iterations per model (default: 30)\n");
+    printf("  --benchmark-video P  Video file for pipeline E2E profiling\n\n");
     printf("Options:\n");
     printf("  --web [PORT]         Web UI port (default: 8080, implied in GUI mode)\n");
     printf("  --config PATH        YAML config (default: configs/default.yaml)\n");
@@ -127,6 +133,9 @@ static void usage(const char* p) {
     printf("  %s --web 9000                    (GUI mode on custom port)\n", p);
     printf("  %s --realtime --coap             (CLI mode)\n", p);
     printf("  %s --video test.mp4 --max-frames 100  (CLI mode)\n", p);
+    printf("  %s --benchmark                          (model timing)\n", p);
+    printf("  %s --benchmark --benchmark-runs 50      (50 runs per model)\n", p);
+    printf("  %s --benchmark --benchmark-video test_video.mp4  (+ pipeline profile)\n", p);
 }
 
 int main(int argc, char* argv[]) {
@@ -144,6 +153,10 @@ int main(int argc, char* argv[]) {
     bool json_mode = false;
     bool quiet_mode = false;
     int  web_port  = 0;        /* --web [PORT]  */
+    bool benchmark = false;
+    const char* bm_model = NULL;
+    int  bm_runs   = 0;
+    const char* bm_video = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
@@ -164,6 +177,10 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "--save-video")) save_video = true;
         else if (!strcmp(argv[i], "--json"))  json_mode = true;
         else if (!strcmp(argv[i], "--quiet")) quiet_mode = true;
+        else if (!strcmp(argv[i], "--benchmark")) benchmark = true;
+        else if (!strcmp(argv[i], "--benchmark-model") && i+1<argc) bm_model = argv[++i];
+        else if (!strcmp(argv[i], "--benchmark-runs") && i+1<argc) bm_runs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--benchmark-video") && i+1<argc) bm_video = argv[++i];
         else if (!strcmp(argv[i], "--web")) {
             web_port = 8080;  /* default */
             if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
@@ -188,6 +205,14 @@ int main(int argc, char* argv[]) {
 
     /* ── Banner ── */
     tui_banner("LingQi TanTong", "Edge AI Pipeline — SpacemiT K1 Muse Pi Pro");
+
+    /* ── Benchmark mode: early exit after running benchmarks ── */
+    if (benchmark) {
+        int bm_ret = benchmark_run(config, bm_model, bm_runs, bm_video);
+        log_shutdown();
+        tui_shutdown();
+        return bm_ret;
+    }
 
     /* ── Hardware ── */
     show_hardware();

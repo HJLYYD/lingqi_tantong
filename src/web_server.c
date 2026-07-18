@@ -759,14 +759,10 @@ static void broadcast_timer_fn(void *arg) {
         for (int i = 0; i < ws->ws_count; i++) {
             struct mg_connection *client = ws->ws_clients[i];
             if (client && is_ws(client)) {
-                /* 1. Send text JSON frame (metadata, no base64 JPEG) */
-                mg_ws_send(client, slot->json, (size_t)slot->json_len,
-                           WEBSOCKET_OP_TEXT);
-
-                /* 2. Send binary JPEG frame if available (single combined frame)
-                 *    Format: 'J'(0x4A) 'P'(0x50) frame_hi frame_lo | JPEG data */
+                /* v2.7: Send binary JPEG FIRST, then text JSON.
+                 * Frontend processes in order: image loads → overlay drawn on top.
+                 * This avoids overlay-on-stale-frame flicker. */
                 if (slot->has_jpeg && slot->jpeg_len > 0) {
-                    /* Combine 4-byte header + JPEG into single binary frame */
                     size_t total = 4 + (size_t)slot->jpeg_len;
                     uint8_t combined[4 + WS_MAX_JPEG_LEN];
                     combined[0] = 'J';
@@ -776,6 +772,10 @@ static void broadcast_timer_fn(void *arg) {
                     memcpy(combined + 4, slot->jpeg_data, (size_t)slot->jpeg_len);
                     mg_ws_send(client, combined, total, WEBSOCKET_OP_BINARY);
                 }
+
+                /* Text JSON frame (metadata only — no base64 JPEG, ~2KB) */
+                mg_ws_send(client, slot->json, (size_t)slot->json_len,
+                           WEBSOCKET_OP_TEXT);
             }
         }
 

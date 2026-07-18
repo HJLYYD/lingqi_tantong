@@ -150,16 +150,16 @@ pose:
 
 face:
   # SUPPLEMENTARY face detection + recognition (optional, reduced frequency).
-  # Face detection runs every 5 frames when people are detected,
-  # every 60 frames otherwise. Not critical for the primary task of
-  # person detection + pose estimation + action recognition.
+  # v2.6: lowered thresholds for better recall on INT8 quantized models.
+  # Face detection runs every 5-10 frames when people are detected,
+  # every 60 frames otherwise.
   detection_backend: ai_accel
   recognition_backend: ai_accel
   detection_model_path: "models/Face Recognition/yolov5n-face_320_cut.q.onnx"
   recognition_model_path: "models/Face Recognition/arcface_mobilefacenet_cut.q.onnx"
   face_min_size: 24
-  confidence_threshold: 0.50
-  similarity_threshold: 0.55
+  confidence_threshold: 0.30   # v2.6: lowered from 0.50 for better recall
+  similarity_threshold: 0.45   # v2.6: lowered from 0.55 for better recognition rate
   input_size: [320, 320]
   embedding_dim: 128   # ArcFace MobileFaceNet-cuted outputs [1,128]; must match FEATURE_VECTOR_DIM
   use_ep: false        # Enable SpacemiT EP (IO Binding required for safe TCM output reads)
