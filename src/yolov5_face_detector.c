@@ -93,9 +93,8 @@ YOLOv5FaceDetector* yolov5_face_detector_create(const char* model_path, int inpu
 void yolov5_face_detector_destroy(YOLOv5FaceDetector* det) {
     if (!det) return;
     ort_ctx_destroy(det->ctx);
-    const OrtApi* ort = ort_get_api();
-    if (det->session && ort) {
-        ort->ReleaseSession(det->session);
+    if (det->session) {
+        ort_release_session(det->session);
     }
     free(det);
 }
@@ -136,6 +135,9 @@ bool yolov5_face_detector_load_model(YOLOv5FaceDetector* det, const char* model_
         return false;
     }
 
+    /* Detect EP status for IO Binding decision */
+    det->ep_active = det->use_ep && ort_spacemit_ep_active();
+
     int dims[8] = {0};
     int rank = ort_get_input_shape(det->session, dims, 8);
     if (rank == 4 && dims[2] > 0 && dims[3] > 0) {
@@ -153,15 +155,17 @@ bool yolov5_face_detector_load_model(YOLOv5FaceDetector* det, const char* model_
     det->ctx = ort_ctx_create(det->session, det->input_width, det->input_height, 3);
     if (!det->ctx) {
         log_error("YOLOv5Face: failed to create inference context");
-        const OrtApi* ort = ort_get_api();
-        if (det->session && ort) ort->ReleaseSession(det->session);
-        det->session = NULL;
+        if (det->session) {
+            ort_release_session(det->session);
+            det->session = NULL;
+        }
         return false;
     }
     strncpy(det->ctx->input_name, det->input_name, sizeof(det->ctx->input_name) - 1);
 
-    log_info("YOLOv5-face model loaded: %s (%.2f MB) input=%dx%d",
-             model_path, file_size / (1024.0f * 1024.0f), det->input_width, det->input_height);
+    log_info("YOLOv5-face model loaded: %s (%.2f MB) input=%dx%d ep=%s",
+             model_path, file_size / (1024.0f * 1024.0f), det->input_width, det->input_height,
+             det->ep_active ? "SpacemiT+IOBinding" : "CPU");
     return true;
 }
 
@@ -529,9 +533,19 @@ int yolov5_face_detector_detect_faces(YOLOv5FaceDetector* det, const uint8_t* im
     OrtValue** output_vals = (OrtValue**)calloc(num_outputs, sizeof(OrtValue*));
     if (!output_vals) return 0;
 
-    int run_rc = ort_ctx_run(det->ctx, output_vals);
+    /* ── EP IO Binding path: route outputs to CPU memory ──
+     * SpacemiT EP's xquant-split "cut" model produces INT8 outputs in TCM.
+     * Reading INT8 as float* → SIGSEGV (buffer overflow 4×) or garbage data.
+     * IO Binding allocates outputs in CPU memory — ORT dequantizes during
+     * the TCM→CPU copy so callers always receive FLOAT tensors. */
+    int run_rc;
+    if (det->ep_active) {
+        run_rc = ort_ctx_run_io_binding(det->ctx, output_vals);
+    } else {
+        run_rc = ort_ctx_run(det->ctx, output_vals);
+    }
     if (run_rc != 0) {
-        log_error("YOLOv5Face inference failed");
+        log_error("YOLOv5Face inference failed (ep=%s)", det->ep_active ? "yes" : "no");
         free(output_vals);
         return 0;
     }

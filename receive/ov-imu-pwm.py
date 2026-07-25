@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CoAP 客户端：/stream 视频 + /imu 1Hz + MG996R 舵机 GUI 控制"""
+"""CoAP 客户端：/stream 视频 + /imu 1Hz + SG90 舵机 GUI 控制"""
 
 import json
 import os
@@ -29,9 +29,12 @@ STREAM_TOKEN = b"\xca\xfe\xba\xbe"
 IMU_TOKEN = b"\xde\xad\xbe\xef"
 SERVO_TOKEN = b"\xbe\xef\xca\xfe"
 
-SERVO_ANGLE_LEFT = 0
-SERVO_ANGLE_STOP = 90
-SERVO_ANGLE_RIGHT = 180
+# SG90 角度定位：0~180°，按住按钮步进扫角，松开保持当前位置
+SERVO_ANGLE_MIN = 0
+SERVO_ANGLE_MAX = 180
+SERVO_ANGLE_CENTER = 90
+SERVO_STEP_DEG = 3
+SERVO_TICK_MS = 40
 
 SERVO_H = 0  # GPIO40 左右
 SERVO_V = 1  # GPIO41 上下
@@ -341,12 +344,21 @@ class ServoClient:
         self._lock = threading.Lock()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.settimeout(SERVO_TIMEOUT)
+        self._angle = {SERVO_H: SERVO_ANGLE_CENTER, SERVO_V: SERVO_ANGLE_CENTER}
 
     def close(self) -> None:
         self._sock.close()
 
+    def angle(self, servo: int = SERVO_H) -> int:
+        return self._angle.get(servo, SERVO_ANGLE_CENTER)
+
     def send_angle(self, angle: int, servo: int = SERVO_H) -> None:
+        angle = max(SERVO_ANGLE_MIN, min(SERVO_ANGLE_MAX, int(angle)))
         with self._lock:
+            # 角度未变则不发，避免重复刷新 PWM 导致抖动
+            if self._angle.get(servo) == angle:
+                return
+            self._angle[servo] = angle
             payload = json.dumps({"servo": servo, "angle": angle}).encode()
             req = build_put("servo", self._msg_id, SERVO_TOKEN, payload)
             self._msg_id = (self._msg_id + 1) & 0xFFFF
@@ -355,34 +367,30 @@ class ServoClient:
         except OSError as e:
             print(f"舵机发送失败: {e}", file=sys.stderr)
 
-    def stop(self, servo: int = SERVO_H) -> None:
-        self.send_angle(SERVO_ANGLE_STOP, servo)
-
-    def stop_all(self) -> None:
-        self.stop(SERVO_H)
-        self.stop(SERVO_V)
-
-    def left(self) -> None:
-        self.send_angle(SERVO_ANGLE_LEFT, SERVO_H)
-
-    def right(self) -> None:
-        self.send_angle(SERVO_ANGLE_RIGHT, SERVO_H)
-
-    def up(self) -> None:
-        self.send_angle(SERVO_ANGLE_RIGHT, SERVO_V)
-
-    def down(self) -> None:
-        self.send_angle(SERVO_ANGLE_LEFT, SERVO_V)
+    def nudge(self, servo: int, delta: int) -> int:
+        """相对步进，返回新角度。"""
+        new_angle = self.angle(servo) + delta
+        self.send_angle(new_angle, servo)
+        return self.angle(servo)
 
 
 class ServoControlApp:
+    # 按住时的步进方向：左右=水平舵机，上下=垂直舵机
+    _DELTAS = {
+        "left": (SERVO_H, -SERVO_STEP_DEG),
+        "right": (SERVO_H, SERVO_STEP_DEG),
+        "up": (SERVO_V, -SERVO_STEP_DEG),
+        "down": (SERVO_V, SERVO_STEP_DEG),
+    }
+
     def __init__(self, root: tk.Tk, client: ServoClient, host: str = COAP_HOST):
         self.root = root
         self.client = client
         self.host = host
         self._pressed: set[str] = set()
+        self._tick_id: Optional[str] = None
 
-        root.title("OV3660 + IMU + 双舵机控制")
+        root.title("OV3660 + IMU + SG90 双舵机")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -393,7 +401,7 @@ class ServoControlApp:
         frame = tk.Frame(root, padx=24, pady=20)
         frame.pack()
 
-        tk.Label(frame, text="按住旋转，松开停止", font=title_font).grid(
+        tk.Label(frame, text="按住转动，松开保持", font=title_font).grid(
             row=0, column=0, columnspan=3, pady=(0, 16)
         )
 
@@ -457,14 +465,14 @@ class ServoControlApp:
         )
         self.down_btn.grid(row=3, column=1, pady=(8, 0))
 
-        self.status_var = tk.StringVar(value="状态: 停止")
+        self.status_var = tk.StringVar(value="状态: 保持")
         tk.Label(frame, textvariable=self.status_var, font=status_font, fg="#444").grid(
             row=4, column=0, columnspan=3, pady=(16, 0)
         )
 
         tk.Label(
             frame,
-            text=f"CoAP: {self.host}:{COAP_PORT}/servo  |  左右=GPIO40  上下=GPIO41",
+            text=f"SG90  |  CoAP: {self.host}:{COAP_PORT}/servo  |  左右=GPIO40  上下=GPIO41",
             font=tkfont.Font(size=10),
             fg="#888",
         ).grid(row=5, column=0, columnspan=3, pady=(8, 0))
@@ -484,50 +492,60 @@ class ServoControlApp:
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
 
-    def _servo_for(self, side: str) -> int:
-        return SERVO_V if side in ("up", "down") else SERVO_H
+    def _hold_status(self) -> str:
+        return "状态: 保持"
 
-    def _status_for(self, side: str) -> str:
+    def _move_status(self, side: str) -> str:
         labels = {
-            "left": "状态: 左舵机逆时针",
-            "right": "状态: 右舵机顺时针",
-            "up": "状态: 上舵机顺时针",
-            "down": "状态: 下舵机逆时针",
+            "left": "左转",
+            "right": "右转",
+            "up": "上仰",
+            "down": "下俯",
         }
-        return labels[side]
+        return f"状态: {labels[side]}"
+
+    def _cancel_tick(self) -> None:
+        if self._tick_id is not None:
+            self.root.after_cancel(self._tick_id)
+            self._tick_id = None
+
+    def _tick(self) -> None:
+        self._tick_id = None
+        if not self._pressed:
+            return
+        side = next(iter(self._pressed))
+        servo, delta = self._DELTAS[side]
+        self.client.nudge(servo, delta)
+        self.set_status(self._move_status(side))
+        self._tick_id = self.root.after(SERVO_TICK_MS, self._tick)
 
     def on_press(self, side: str) -> None:
+        self._cancel_tick()
         self._pressed.clear()
         self._pressed.add(side)
-        if side == "left":
-            self.client.left()
-        elif side == "right":
-            self.client.right()
-        elif side == "up":
-            self.client.up()
-        else:
-            self.client.down()
-        self.set_status(self._status_for(side))
+        servo, delta = self._DELTAS[side]
+        self.client.nudge(servo, delta)
+        self.set_status(self._move_status(side))
+        self._tick_id = self.root.after(SERVO_TICK_MS, self._tick)
 
     def on_release(self, side: str) -> None:
         if side in self._pressed:
             self._pressed.discard(side)
-            self.client.stop(self._servo_for(side))
-            if not self._pressed:
-                self.set_status("状态: 停止")
+            self._cancel_tick()
+            # SG90 松开后保持当前位置，不再回中
+            self.set_status(self._hold_status())
 
     def on_leave(self, side: str) -> None:
         self.on_release(side)
 
     def on_global_release(self, _event=None) -> None:
         if self._pressed:
-            for side in list(self._pressed):
-                self.client.stop(self._servo_for(side))
             self._pressed.clear()
-            self.set_status("状态: 停止")
+            self._cancel_tick()
+            self.set_status(self._hold_status())
 
     def on_close(self) -> None:
-        self.client.stop_all()
+        self._cancel_tick()
         self.client.close()
         self.root.destroy()
 
@@ -560,7 +578,10 @@ def _parse_main_args(argv: list[str]) -> tuple[str, bool]:
 def _start_stream_services(host: str) -> None:
     print(f"视频流: coap://{host}:{COAP_PORT}/stream")
     print(f"IMU 通道: coap://{host}:{COAP_PORT}/imu ({1/IMU_INTERVAL:.0f}Hz)")
-    print(f"舵机控制: coap://{host}:{COAP_PORT}/servo (servo:0=GPIO40左右, servo:1=GPIO41上下)")
+    print(
+        f"舵机控制: coap://{host}:{COAP_PORT}/servo "
+        f"(SG90 角度0~180, servo:0=GPIO40左右, servo:1=GPIO41上下)"
+    )
 
     ok, detail = probe_inbound(host)
     if ok:

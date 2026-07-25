@@ -170,6 +170,12 @@ const char* frame_diff_activity_name(FrameDiffActivity level);
  */
 void frame_diff_get_stats(const FrameDiff* fd, int* processed, int* skipped, float* skip_ratio);
 
+/*
+ * Get the change ratio from the last comparison (0.0–1.0).
+ * Used by face detection gating to skip during high-motion frames.
+ */
+float frame_diff_get_last_change(const FrameDiff* fd);
+
 #ifdef __cplusplus
 }
 #endif

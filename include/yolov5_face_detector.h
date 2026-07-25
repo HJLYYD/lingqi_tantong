@@ -21,6 +21,7 @@ typedef struct {
     float confidence_threshold;
     float nms_threshold;
     bool use_ep;                 /* enable SpacemiT EP (needs IO Binding for safe output reads) */
+    bool ep_active;              /* true if EP session was actually created (TCM available + model passes gate) */
     /* Cached after first inference — avoids per-frame tensor shape probing */
     int  output_format_cached;   /* 0=unset, 1=4D, 2=5D */
 } YOLOv5FaceDetector;

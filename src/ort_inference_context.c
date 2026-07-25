@@ -200,6 +200,145 @@ int ort_ctx_run(OrtInferenceContext* ctx, OrtValue** output_vals) {
     return 0;
 }
 
+/*
+ * IO-Binding variant — binds outputs to CPU memory so SpacemiT EP produces
+ * float outputs (ORT dequantizes during TCM→CPU copy) instead of INT8 in TCM.
+ *
+ * This is the correct long-term fix for "cut" quantized models (xquant-split
+ * 5D format) where the DequantizeLinear nodes are removed and EP produces
+ * raw INT8 tensors in TCM — reading those as float* causes SIGSEGV or
+ * incorrect data.
+ */
+int ort_ctx_run_io_binding(OrtInferenceContext* ctx, OrtValue** output_vals) {
+    if (!ctx || !ctx->session || !output_vals) return -1;
+
+    const OrtApi* ort = ort_get_api();
+    if (!ort) return -1;
+
+    /* ── Cache output names on first call ── */
+    if (!ctx->names_cached) {
+        OrtStatus* st = ort->SessionGetOutputCount(ctx->session, &ctx->num_outputs);
+        if (st) { ort->ReleaseStatus(st); ctx->num_outputs = 1; }
+        if (ctx->num_outputs == 0) ctx->num_outputs = 1;
+
+        ctx->output_names = (char**)calloc(ctx->num_outputs, sizeof(char*));
+        if (!ctx->output_names) return -1;
+
+        bool ok = true;
+        for (size_t i = 0; i < ctx->num_outputs; i++) {
+            char* name = NULL;
+            OrtStatus* s = ort->SessionGetOutputName(ctx->session, i, ctx->allocator, &name);
+            if (s || !name) {
+                if (s) ort->ReleaseStatus(s);
+                ok = false;
+                break;
+            }
+            ctx->output_names[i] = name;
+        }
+        if (!ok) {
+            for (size_t i = 0; i < ctx->num_outputs; i++) {
+                if (ctx->output_names[i]) {
+                    OrtStatus* sf = ort->AllocatorFree(ctx->allocator, ctx->output_names[i]);
+                    if (sf) ort->ReleaseStatus(sf);
+                }
+            }
+            free(ctx->output_names);
+            ctx->output_names = NULL;
+            return -1;
+        }
+        ctx->names_cached = true;
+    }
+
+    /* ── Create IO Binding ── */
+    OrtIoBinding* binding = NULL;
+    OrtStatus* st = ort->CreateIoBinding(ctx->session, &binding);
+    if (st) {
+        const char* msg = ort->GetErrorMessage(st);
+        log_error("ort_ctx_run_io_binding: CreateIoBinding failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(st);
+        return -1;
+    }
+
+    /* ── Bind input tensor (CPU memory, EP copies to TCM internally) ── */
+    int64_t input_shape[4] = {1, ctx->input_channels, ctx->input_height, ctx->input_width};
+    OrtValue* input_val = NULL;
+    st = ort->CreateTensorWithDataAsOrtValue(
+        ctx->memory_info, ctx->input_tensor, ctx->input_tensor_bytes,
+        input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_val);
+    if (st) {
+        const char* msg = ort->GetErrorMessage(st);
+        log_error("ort_ctx_run_io_binding: CreateTensor (input) failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(st);
+        ort->ReleaseIoBinding(binding);
+        return -1;
+    }
+
+    const char* input_name = ctx->input_name[0] ? ctx->input_name : "images";
+    st = ort->BindInput(binding, input_name, input_val);
+    if (st) {
+        const char* msg = ort->GetErrorMessage(st);
+        log_error("ort_ctx_run_io_binding: BindInput failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(st);
+        ort->ReleaseValue(input_val);
+        ort->ReleaseIoBinding(binding);
+        return -1;
+    }
+
+    /* ── Bind ALL outputs to CPU memory ──
+     * This is the key: ORT will allocate output tensors in CPU memory and
+     * dequantize during the TCM→CPU copy.  Outputs are always FLOAT type,
+     * safe to read with GetTensorMutableData. */
+    for (size_t i = 0; i < ctx->num_outputs; i++) {
+        st = ort->BindOutputToDevice(binding, ctx->output_names[i], ctx->memory_info);
+        if (st) {
+            const char* msg = ort->GetErrorMessage(st);
+            log_error("ort_ctx_run_io_binding: BindOutputToDevice[%zu] (%s) failed: %s",
+                      i, ctx->output_names[i], msg ? msg : "unknown");
+            ort->ReleaseStatus(st);
+            /* Non-fatal — continue with remaining outputs */
+        }
+    }
+
+    /* ── Run inference ── */
+    st = ort->RunWithBinding(ctx->session, NULL, binding);
+    ort->ReleaseValue(input_val);
+
+    if (st) {
+        const char* msg = ort->GetErrorMessage(st);
+        log_error("ort_ctx_run_io_binding: RunWithBinding failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(st);
+        ort->ReleaseIoBinding(binding);
+        return -1;
+    }
+
+    /* ── Retrieve output values ── */
+    OrtValue** bound_outputs = NULL;
+    size_t bound_count = 0;
+    st = ort->GetBoundOutputValues(binding, ctx->allocator, &bound_outputs, &bound_count);
+    ort->ReleaseIoBinding(binding);
+
+    if (st) {
+        const char* msg = ort->GetErrorMessage(st);
+        log_error("ort_ctx_run_io_binding: GetBoundOutputValues failed: %s", msg ? msg : "unknown");
+        ort->ReleaseStatus(st);
+        return -1;
+    }
+
+    /* Copy to caller's output_vals array (caller allocates this, we fill it) */
+    size_t n = bound_count < ctx->num_outputs ? bound_count : ctx->num_outputs;
+    for (size_t i = 0; i < n; i++) {
+        output_vals[i] = bound_outputs[i];
+    }
+
+    /* Free the bound_outputs pointer array (not the OrtValues!) */
+    if (bound_outputs && ctx->allocator) {
+        OrtStatus* sf = ort->AllocatorFree(ctx->allocator, bound_outputs);
+        if (sf) ort->ReleaseStatus(sf);
+    }
+
+    return 0;
+}
+
 void ort_ctx_release_outputs(OrtInferenceContext* ctx, OrtValue** output_vals, size_t count) {
     (void)ctx;
     if (!output_vals) return;

@@ -87,6 +87,15 @@ AIInferencePipeline* inference_pipeline_create(void) {
     /* ── Action recognition defaults ── */
     pipeline->action_inference_interval = 10;  /* default: run ST-GCN every 10 frames */
 
+    /* ── Anti-stutter: face detection optimizations ── */
+    pipeline->new_person_face_delay = 3;
+    pipeline->new_person_face_counter = 0;
+    pipeline->face_detect_deferred = false;
+    pipeline->face_roi_buf = NULL;
+    pipeline->face_crop_buf = NULL;
+    pipeline->face_crop_buf_size = 0;
+    pipeline->face_motion_skip_threshold = 0.40f;
+
     /* ── Frame differencing init (disabled until explicitly configured) ── */
     pipeline->frame_diff = NULL;
     pipeline->frame_diff_enabled = false;
@@ -114,7 +123,7 @@ void inference_pipeline_destroy(AIInferencePipeline* pipeline) {
         arcface_recognizer_destroy(pipeline->face_recognizer);
     }
     if (pipeline->action_recognizer) {
-        stgcn_action_recognizer_destroy(pipeline->action_recognizer);
+        tcn_action_predictor_destroy(pipeline->action_recognizer);
     }
     if (pipeline->keypoint_validator) {
         keypoint_validator_destroy(pipeline->keypoint_validator);
@@ -122,6 +131,8 @@ void inference_pipeline_destroy(AIInferencePipeline* pipeline) {
     if (pipeline->frame_diff) {
         frame_diff_destroy(pipeline->frame_diff);
     }
+    free(pipeline->face_roi_buf);
+    free(pipeline->face_crop_buf);
 
     free(pipeline);
 }
@@ -138,7 +149,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
      *   2. (reserved for future use — secondary detector disabled in unified mode)
      *   3. Face det      — face detection (every 10-120 frames)
      *   4. ArcFace       — face recognition (per-face)
-     *   5. ST-GCN        — CPU EP only (FP32)
+     *   5. 1D-TCN        — SpacemiT EP (INT8)
      */
 
     /* ── Step 1: YOLO-Pose (PRIMARY, REQUIRED) ──
@@ -226,7 +237,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         }
     }
 
-    /* ── Step 5: Action recognition ── */
+    /* ── Step 5: Action recognition (1D-TCN, INT8 SpacemiT EP) ── */
     {
         const char* m = config_get_string(config, "action.model_path", NULL);
         if (m && m[0] != '\0') {
@@ -237,16 +248,35 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
             int np = config_get_int(config, "action.num_persons", 1);
             int nc = config_get_int(config, "action.num_classes", 7);
             float conf = config_get_float(config, "action.confidence_threshold", 0.5f);
-            pipeline->action_recognizer = stgcn_action_recognizer_create(path_buf, nf, nk, np, nc, conf);
+            pipeline->action_recognizer = tcn_action_predictor_create(path_buf, nf, nk, np, nc, conf);
             if (pipeline->action_recognizer) {
                 pipeline->models_loaded[4] = true;
-                log_info("Action recognizer loaded: %s", path_buf);
+                /* Fast-start: allow predictions with fewer frames (replicated to fill window) */
+                int min_frames = config_get_int(config, "action.min_frames", 30);
+                tcn_action_predictor_set_min_frames(pipeline->action_recognizer, min_frames);
+                log_info("Action recognizer (1D-TCN) loaded: %s", path_buf);
             } else {
-                log_warning("Action recognizer failed: %s", path_buf);
+                log_warning("Action recognizer (1D-TCN) failed: %s", path_buf);
             }
         } else {
             pipeline->action_recognizer = NULL;
             log_info("Action recognition: DISABLED (no model_path)");
+        }
+    }
+
+    /* ── Step 5b: Pre-allocate face detection buffers (anti-stutter Plan 2) ── */
+    if (pipeline->face_detector) {
+        /* Single ROI resize buffer (320×320×3 = 300KB), reused across all persons */
+        pipeline->face_roi_buf = (uint8_t*)malloc(320 * 320 * 3);
+        /* Max-size crop buffer: worst case is full frame at 640×480 */
+        pipeline->face_crop_buf_size = (size_t)640 * 480 * 3;
+        pipeline->face_crop_buf = (uint8_t*)malloc(pipeline->face_crop_buf_size);
+        if (!pipeline->face_roi_buf || !pipeline->face_crop_buf) {
+            log_warning("Face buffer pre-allocation failed — falling back to per-frame malloc");
+            free(pipeline->face_roi_buf); pipeline->face_roi_buf = NULL;
+            free(pipeline->face_crop_buf); pipeline->face_crop_buf = NULL;
+        } else {
+            log_info("Face buffers pre-allocated: roi=300KB crop=900KB");
         }
     }
 
@@ -263,7 +293,7 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         pipeline->keypoint_validator = keypoint_validator_create(&kv_cfg);
         pipeline->keypoint_filter_enabled = (pipeline->keypoint_validator != NULL);
 
-        pipeline->cascade_enabled = config_get_bool(config, "detection.cascade_enabled", false);
+        pipeline->cascade_enabled = config_get_bool(config, "detection.cascade_enabled", true);  /* default ON for anti-stutter */
         pipeline->cascade_validation_interval = config_get_int(config, "detection.cascade_validation_interval", 15);
         pipeline->cascade_tracking_w = config_get_int(config, "detection.cascade_tracking_resolution.0", 320);
         pipeline->cascade_tracking_h = config_get_int(config, "detection.cascade_tracking_resolution.1", 320);
@@ -272,11 +302,17 @@ int inference_pipeline_load_models(AIInferencePipeline* pipeline, const char* mo
         pipeline->cascade_secondary_interval = config_get_int(config, "detection.cascade_secondary_interval", 5);
         pipeline->action_inference_interval = config_get_int(config, "action.inference_interval", 10);
 
+        /* ── Anti-stutter config (Plans 1, 3, 4) ── */
+        pipeline->new_person_face_delay = config_get_int(config, "detection.face_new_person_delay", 3);
+        pipeline->face_motion_skip_threshold = config_get_float(config, "detection.face_motion_skip_threshold", 0.40f);
+
         log_info("Cascade: enabled=%d validation_interval=%d secondary_interval=%d tracking_res=%dx%d",
                  pipeline->cascade_enabled, pipeline->cascade_validation_interval,
                  pipeline->cascade_secondary_interval,
                  pipeline->cascade_tracking_w, pipeline->cascade_tracking_h);
         log_info("Action: inference_interval=%d frames", pipeline->action_inference_interval);
+        log_info("AntiStutter: face_new_person_delay=%d motion_skip_thresh=%.2f",
+                 pipeline->new_person_face_delay, (double)pipeline->face_motion_skip_threshold);
     }
 
     /* ── Frame differencing (adaptive frame skip) ──
@@ -567,19 +603,17 @@ static int poses_to_detections(const PoseEstimation* poses, int num_poses,
 static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* face_recognizer,
                         const uint8_t* frame, int width, int height,
                         const Detection* person_dets, int num_person_dets,
-                        FaceIdentity* out_faces, int max_faces) {
+                        FaceIdentity* out_faces, int max_faces,
+                        uint8_t* roi_buf, uint8_t* crop_buf, size_t crop_buf_size) {
     if (!face_detector || !frame || !out_faces) return 0;
 
     FaceIdentity detected[20];
     int num_detected = 0;
 
     /* ── ROI mode: per-person head crop detection ──
-     * More accurate face landmarks because faces appear larger relative
-     * to the 320×320 model input.  ROI covers head + shoulders (top ~40%
-     * of person bbox with 10% horizontal margin). */
-    if (num_person_dets > 0) {
-        uint8_t* roi_buf = (uint8_t*)malloc(320 * 320 * 3);
-        if (roi_buf) {
+     * Uses pre-allocated roi_buf + crop_buf to avoid malloc/free per frame.
+     * ROI covers head + shoulders (top ~40% of person bbox with 10% horizontal margin). */
+    if (num_person_dets > 0 && roi_buf) {
             for (int p = 0; p < num_person_dets && num_detected < 20; p++) {
                 const BoundingBox* pb = &person_dets[p].bbox;
                 float person_h = bbox_height(pb);
@@ -619,14 +653,14 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
                 roi_w = roi_dim;
                 roi_h = roi_dim;
 
-                /* Crop ROI → contiguous buffer, then resize to model input. */
-                uint8_t* crop_temp = (uint8_t*)malloc((size_t)roi_dim * roi_dim * 3);
-                if (!crop_temp) continue;
+                /* Crop ROI → contiguous buffer, then resize to model input.
+                 * Uses pre-allocated crop_buf (anti-stutter Plan 2). */
+                size_t crop_needed = (size_t)roi_dim * roi_dim * 3;
+                if (!crop_buf || crop_needed > crop_buf_size) continue;
                 utils_crop_image(frame, width, height,
-                                 roi_x, roi_y, roi_dim, roi_dim, crop_temp);
-                utils_resize_image(crop_temp, roi_dim, roi_dim,
+                                 roi_x, roi_y, roi_dim, roi_dim, crop_buf);
+                utils_resize_image(crop_buf, roi_dim, roi_dim,
                                    roi_buf, 320, 320, 3);
-                free(crop_temp);
 
                 /* Run face detection on ROI */
                 FaceIdentity roi_faces[3];
@@ -644,13 +678,15 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
                     float fy1 = roi_faces[f].bbox.y_min * sxy + (float)roi_y;
                     float fx2 = roi_faces[f].bbox.x_max * sxy + (float)roi_x;
                     float fy2 = roi_faces[f].bbox.y_max * sxy + (float)roi_y;
-                    /* Tighten face bbox: YOLOv5-Face adds ~15% margin. Shrink 12% per side. */
-                    float fw = fx2 - fx1, fh = fy2 - fy1;
-                    float shrink_x = fw * 0.12f, shrink_y = fh * 0.12f;
-                    detected[num_detected].bbox.x_min = fx1 + shrink_x;
-                    detected[num_detected].bbox.y_min = fy1 + shrink_y;
-                    detected[num_detected].bbox.x_max = fx2 - shrink_x;
-                    detected[num_detected].bbox.y_max = fy2 - shrink_y;
+                    /* Map ROI-space coords to full-frame without per-side shrink.
+                     * Shrinking is done uniformly in the global tightening loop below
+                     * (applied to both ROI and full-frame faces at 5% per side).
+                     * Previously shrink was applied here AND there → ROI faces were
+                     * double-shrunk (15% per side → 30% total → bbox too tight). */
+                    detected[num_detected].bbox.x_min = fx1;
+                    detected[num_detected].bbox.y_min = fy1;
+                    detected[num_detected].bbox.x_max = fx2;
+                    detected[num_detected].bbox.y_max = fy2;
                     /* v2.7 BUGFIX: map face KEYPOINTS from ROI space to full-frame.
                      * Previously only bbox was mapped; keypoints stayed in 320×320 space
                      * → drawn at completely wrong positions on the full-frame overlay. */
@@ -665,30 +701,31 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
                     num_detected++;
                 }
             }
-            free(roi_buf);
         }
-    }
 
     /* ── Full-frame detection (runs on-demand, not every cycle) ──
-     * v2.6: Full-frame face detection is EXPENSIVE (~80ms on K1 for 640×480).
+     * v3.0: Full-frame face detection is EXPENSIVE (~80ms on K1 for 640×480).
+     * Anti-stutter (Plan 3): reduced frequency, stricter conditions.
      * It only runs when:
-     *   1. ROI found zero faces — likely no person detections, need full-frame
-     *   2. ROI faces < person detections — some persons have undetected faces
-     *   3. Every 4th face cycle as a periodic sweep (catch new entry / half-body)
-     * Otherwise skipped. This keeps face detection overhead ~15ms avg vs ~80ms. */
+     *   1. ROI found zero faces AND there are 0 person dets → sweep for new entries
+     *   2. ROI found zero faces AND no full-frame run in 10+ cycles → periodic sweep
+     *   3. Every 10th face cycle as a periodic sweep
+     * Otherwise skipped. This keeps face detection overhead ~8ms avg vs ~80ms. */
     static int ff_cycle_count = 0;
+    static int ff_last_sweep_cycle = -10;  /* last cycle where full-frame ran */
     bool run_full_frame = false;
     ff_cycle_count++;
 
-    if (num_detected == 0) {
-        run_full_frame = true;  /* on-demand: ROI found nothing */
-    } else if (num_person_dets > 0 && num_detected < num_person_dets) {
-        run_full_frame = true;  /* on-demand: some persons have no face */
-    } else if (ff_cycle_count % 4 == 0) {
-        run_full_frame = true;  /* periodic sweep: every 4th face cycle */
+    if (num_detected == 0 && num_person_dets == 0) {
+        run_full_frame = true;  /* no persons at all → sweep for entries */
+    } else if (num_detected == 0 && ff_cycle_count - ff_last_sweep_cycle >= 10) {
+        run_full_frame = true;  /* periodic sweep after 10+ cycles with no faces */
+    } else if (ff_cycle_count % 10 == 0) {
+        run_full_frame = true;  /* periodic sweep: every 10th face cycle (was 4th) */
     }
 
     if (run_full_frame) {
+        ff_last_sweep_cycle = ff_cycle_count;
         FaceIdentity ff_faces[10];
         int n_ff = yolov5_face_detector_detect_faces(
             face_detector, frame, width, height, ff_faces, 10);
@@ -714,12 +751,15 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
     if (num_detected <= 0) return 0;
 
     /* ── Tighten all face bboxes ──
-     * YOLOv5-Face adds ~15% margin around the actual face. Shrink 10% per side
-     * for a tighter fit. Applied to both ROI and full-frame detected faces. */
+     * YOLOv5-Face adds ~15% margin around the actual face. Shrink 5% per side
+     * (total 10%) for a tighter fit — matches official demo behavior.
+     * Applied uniformly to both ROI and full-frame detected faces.
+     * NOTE: ROI faces no longer have per-side shrink applied before this loop,
+     * so both paths get exactly the same treatment (fixes double-shrink bug). */
     for (int ti = 0; ti < num_detected; ti++) {
         float fw = detected[ti].bbox.x_max - detected[ti].bbox.x_min;
         float fh = detected[ti].bbox.y_max - detected[ti].bbox.y_min;
-        float sx = fw * 0.10f, sy = fh * 0.10f;
+        float sx = fw * 0.05f, sy = fh * 0.05f;
         detected[ti].bbox.x_min += sx;
         detected[ti].bbox.y_min += sy;
         detected[ti].bbox.x_max -= sx;
@@ -770,14 +810,16 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
         }
 
         if (face_recognizer) {
-            uint8_t* face_crop = (uint8_t*)malloc(112 * 112 * 3);
-            if (!face_crop) continue;
+            /* Reuse pre-allocated crop_buf for 112×112 face crop.
+             * 112×112×3 = 37KB fits in the 900KB crop_buf.
+             * ROI section above has completed by this point, so the buffer is free. */
+            if (!crop_buf || crop_buf_size < (size_t)(112 * 112 * 3)) continue;
 
             yolov5_face_detector_crop_face(face_detector, frame, width, height,
-                                            &detected[i], face_crop, 112, 112);
+                                            &detected[i], crop_buf, 112, 112);
 
             FaceIdentity identity = arcface_recognizer_recognize(
-                face_recognizer, face_crop, 112, 112);
+                face_recognizer, crop_buf, 112, 112);
             identity.bbox = detected[i].bbox;
             identity.confidence = detected[i].confidence;
             identity.has_keypoints = detected[i].has_keypoints;
@@ -785,7 +827,6 @@ static int detect_faces(YOLOv5FaceDetector* face_detector, ArcFaceRecognizer* fa
                    sizeof(detected[i].keypoints));
 
             out_faces[num_faces++] = identity;
-            free(face_crop);
         } else {
             out_faces[num_faces++] = detected[i];
         }
@@ -913,7 +954,7 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
             /* ── SKIP: reuse previous inference result ── */
             *out_result = pipeline->last_full_result;
 
-            /* Still push best pose to ST-GCN for temporal continuity */
+            /* Still push best pose to TCN for temporal continuity */
             if ((pipeline->enabled_stages & PIPELINE_ENABLE_ACTION) &&
                 pipeline->action_recognizer &&
                 out_result->num_poses > 0) {
@@ -925,12 +966,12 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                         best_p = p;
                     }
                 }
-                stgcn_action_recognizer_push_pose(pipeline->action_recognizer,
+                tcn_action_predictor_push_pose(pipeline->action_recognizer,
                     &out_result->poses[best_p], width, height);
 
-                /* Read latest async ST-GCN result */
+                /* Read latest async TCN result */
                 ActionResult latest;
-                if (stgcn_action_recognizer_get_latest(pipeline->action_recognizer, &latest)) {
+                if (tcn_action_predictor_get_latest(pipeline->action_recognizer, &latest)) {
                     out_result->action = latest;
                     out_result->has_action = (latest.num_actions > 0);
                 }
@@ -1021,38 +1062,76 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                             out_result->num_detections, (ttc > 0 ? ttc : out_result->num_detections));
     }
 
-    /* ── Step 3: Face detection (SUPPLEMENT, balanced frequency + event-driven) ──
-     * v2.7: Three triggers for face detection:
-     *   1. Periodic: every 15 (TRACKING) / 8 (SEARCHING) / 60 (no dets) frames
-     *   2. New-person: detection count increased → run immediately (reduces lag)
-     *   3. First-person: 0→1 detections → run immediately (cold start)
-     * Face persistence cache bridges the gap between detection cycles. */
+    /* ── Step 3: Face detection (SUPPLEMENT, anti-stutter optimized) ──
+     *
+     * Triggers (in priority order):
+     *   1. Periodic: every 20 (TRACKING) / 12 (SEARCHING) / 60 (no dets) frames
+     *      → increased from 15/8 to reduce overhead
+     *   2. New-person DELAYED: detection count increased → set 3-frame countdown
+     *      → avoids the 80-200ms spike on first-detection frame (Plan 1)
+     *   3. First-person DELAYED: 0→1 detections → set 2-frame countdown
+     *   4. HIGH-MOTION SKIP: frame_diff change_ratio > threshold → postpone face (Plan 4)
+     *
+     * Deferred detection flag ensures faces aren't lost when deferred. */
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_FACE) && pipeline->face_detector) {
         int face_interval;
         if (pipeline->cascade_state == PIPELINE_CASCADE_TRACKING) {
-            face_interval = (out_result->num_detections > 0) ? 15 : 60;
+            face_interval = (out_result->num_detections > 0) ? 20 : 60;  /* was 15, raised for anti-stutter */
         } else {
-            face_interval = (out_result->num_detections > 0) ? 8 : 60;
+            face_interval = (out_result->num_detections > 0) ? 12 : 60;  /* was 8, raised for anti-stutter */
         }
 
         bool run_face = (pipeline->frame_counter % face_interval == 0);
 
-        /* Event-driven: new person appeared? Force face detection on next cycle */
+        /* ── Deferred face detection: countdown from new-person trigger ── */
+        if (pipeline->new_person_face_counter > 0) {
+            pipeline->new_person_face_counter--;
+            if (pipeline->new_person_face_counter == 0) {
+                run_face = true;  /* countdown expired → run now */
+                pipeline->face_detect_deferred = false;
+            }
+        }
+
+        /* ── Plan 1: Delayed new-person face detection ──
+         * Instead of immediate trigger (80-200ms spike), start a countdown.
+         * Detection count transient spikes (e.g. false positive → corrected)
+         * are naturally filtered by the countdown. */
         static int prev_det_count = -1;
         if (!run_face && prev_det_count >= 0) {
             if (out_result->num_detections > prev_det_count) {
-                run_face = true;  /* new person entered → immediate face check */
+                /* New person appeared → delay face check by N frames */
+                pipeline->new_person_face_counter = pipeline->new_person_face_delay;
+                pipeline->face_detect_deferred = true;
             } else if (prev_det_count == 0 && out_result->num_detections > 0) {
-                run_face = true;  /* first person appeared → immediate face check */
+                /* First person: shorter delay (2 frames vs default) */
+                pipeline->new_person_face_counter = 2;
+                pipeline->face_detect_deferred = true;
             }
         }
         prev_det_count = out_result->num_detections;
+
+        /* ── Plan 4: Skip face detection during high-motion frames ──
+         * When frame_diff change_ratio is very high, the scene is changing
+         * rapidly → deferred faces are likely motion-blurred anyway. */
+        if (run_face && pipeline->frame_diff_enabled && pipeline->frame_diff) {
+            float change_ratio = frame_diff_get_last_change(pipeline->frame_diff);
+            if (change_ratio > pipeline->face_motion_skip_threshold) {
+                run_face = false;
+                pipeline->face_detect_deferred = true;
+                /* Reset countdown to try again soon */
+                if (pipeline->new_person_face_counter == 0) {
+                    pipeline->new_person_face_counter = 3;
+                }
+            }
+        }
 
         if (run_face) {
             out_result->num_faces = detect_faces(pipeline->face_detector, pipeline->face_recognizer,
                                              frame_data, width, height,
                                              out_result->detections, out_result->num_detections,
-                                             out_result->faces, MAX_FACES_PER_FRAME);
+                                             out_result->faces, MAX_FACES_PER_FRAME,
+                                             pipeline->face_roi_buf, pipeline->face_crop_buf,
+                                             pipeline->face_crop_buf_size);
         }
 
         /* ── Cross-validation: Face → Person rescue ──
@@ -1106,13 +1185,13 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
         }
     }
 
-    /* ── Step 4: Action recognition from pose keypoints ──
-     * Push poses to ST-GCN sliding window (fast, ~10μs).
-     * Actual inference runs async on CPU 2 via stgcn_action_recognizer_run_async().
-     * Result read below via stgcn_action_recognizer_get_latest(). */
+    /* ── Step 4: Action prediction from pose keypoints ──
+     * Push poses to 1D-TCN sliding window (fast, ~10μs).
+     * Actual inference runs async on CPU 2 via tcn_action_predictor_run_async().
+     * Result read below via tcn_action_predictor_get_latest(). */
     if ((pipeline->enabled_stages & PIPELINE_ENABLE_ACTION) && pipeline->action_recognizer
         && out_result->num_poses > 0) {
-        /* ST-GCN expects ONE skeleton per timestep.  Select the highest-
+        /* TCN expects ONE skeleton per timestep.  Select the highest-
          * confidence pose to avoid corrupting the temporal buffer with
          * interleaved multi-person skeletons. */
         int best_p = 0;
@@ -1123,11 +1202,11 @@ int inference_pipeline_process_frame(AIInferencePipeline* pipeline,
                 best_p = p;
             }
         }
-        stgcn_action_recognizer_push_pose(pipeline->action_recognizer,
+        tcn_action_predictor_push_pose(pipeline->action_recognizer,
             &out_result->poses[best_p], width, height);
         /* Non-blocking: read latest async result if available */
         ActionResult latest;
-        if (stgcn_action_recognizer_get_latest(pipeline->action_recognizer, &latest)) {
+        if (tcn_action_predictor_get_latest(pipeline->action_recognizer, &latest)) {
             out_result->action = latest;
             out_result->has_action = (latest.num_actions > 0);
         }

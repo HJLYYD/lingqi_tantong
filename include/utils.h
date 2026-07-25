@@ -62,6 +62,8 @@ int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
 
 int utils_write_bmp(const char* path, const uint8_t* data, int width, int height);
 
+int utils_base64_encode(const uint8_t* data, int data_len, char* out, int out_len);
+
 #ifdef __cplusplus
 }
 #endif

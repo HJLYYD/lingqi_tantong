@@ -303,6 +303,7 @@ set(CORE_SOURCES
     src/keypoint_validator.c
     src/frame_diff.c
     src/web_server.c
+    src/face_gallery.c
     lib/mongoose/mongoose.c
 )
 
@@ -318,6 +319,7 @@ set(MODEL_SOURCES
     src/yolov5_face_detector.c
     src/arcface_recognizer.c
     src/stgcn_action_recognizer.c
+    src/tcn_action_predictor.c
 )
 
 set(BUSINESS_SOURCES

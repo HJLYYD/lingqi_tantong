@@ -297,3 +297,8 @@ void frame_diff_get_stats(const FrameDiff* fd, int* processed, int* skipped, flo
         *skip_ratio = (total > 0) ? (float)fd->total_skipped / (float)total : 0.0f;
     }
 }
+
+float frame_diff_get_last_change(const FrameDiff* fd) {
+    if (!fd) return 0.0f;
+    return fd->last_change_ratio;
+}

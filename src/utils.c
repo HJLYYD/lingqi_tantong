@@ -469,6 +469,33 @@ int soft_jpeg_decode_to_rgb(const uint8_t* jpeg_data, size_t jpeg_len,
 #endif
 }
 
+static const char BASE64_ALPHABET[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+int utils_base64_encode(const uint8_t* data, int data_len, char* out, int out_len) {
+    if (!data || !out || data_len < 0 || out_len < 1) return -1;
+
+    int out_idx = 0;
+    for (int i = 0; i < data_len; i += 3) {
+        int remaining = data_len - i;
+        uint32_t triple = ((uint32_t)(data[i]) << 16);
+        if (remaining > 1) triple |= ((uint32_t)(data[i + 1]) << 8);
+        if (remaining > 2) triple |=  (uint32_t)(data[i + 2]);
+
+        int num_chars = (remaining < 3) ? remaining + 1 : 4;
+        for (int j = 0; j < num_chars; j++) {
+            if (out_idx >= out_len - 1) { out[out_idx] = '\0'; return out_idx; }
+            out[out_idx++] = BASE64_ALPHABET[(triple >> (18 - j * 6)) & 0x3F];
+        }
+        for (int j = num_chars; j < 4; j++) {
+            if (out_idx >= out_len - 1) { out[out_idx] = '\0'; return out_idx; }
+            out[out_idx++] = '=';
+        }
+    }
+    out[out_idx] = '\0';
+    return out_idx;
+}
+
 int utils_write_bmp(const char* path, const uint8_t* data, int width, int height) {
     FILE* f = fopen(path, "wb");
     if (!f) return -1;

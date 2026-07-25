@@ -32,6 +32,8 @@ extern "C" {
 #define COAP_TYPE_ACK   2
 
 #define COAP_CODE_GET       0x01
+#define COAP_CODE_PUT       0x03
+#define COAP_CODE_CHANGED   0x44
 #define COAP_CODE_CONTENT   0x45
 
 #define COAP_OPT_ETAG       4
@@ -46,6 +48,7 @@ extern "C" {
 /* ── Stream token (与 Python 客户端 ov-imu-pwm.py 一致) ── */
 #define COAP_STREAM_TOKEN  0xCAFEBABE
 #define COAP_IMU_TOKEN     0xDEADBEEF
+#define COAP_SERVO_TOKEN   0xBEEFCAFE
 
 typedef struct CoapReceiver CoapReceiver;
 
@@ -62,6 +65,20 @@ bool coap_receiver_get_latest_frame(CoapReceiver* receiver,
 bool coap_receiver_is_connected(CoapReceiver* receiver);
 void coap_receiver_set_imu_raw_callback(CoapReceiver* receiver,
                                          CoapImuRawCallback cb, void* user);
+
+/*
+ * ── Servo control (CoAP PUT /servo, fire-and-forget) ──
+ *
+ * Sends a CoAP PUT request to ESP32's /servo endpoint with JSON payload
+ * {"servo":N,"angle":N}.  Matches the Python client's ServoClient.send_angle().
+ * Fire-and-forget: does not wait for CoAP response.
+ *
+ * @param servo_id  0 = horizontal pan  (GPIO40)
+ *                  1 = vertical tilt   (GPIO41)
+ * @param angle     0-180 degrees (clamped by ESP32)
+ * @return true if UDP send succeeded, false on error
+ */
+bool coap_receiver_send_servo(CoapReceiver* receiver, int servo_id, int angle);
 
 #ifdef __cplusplus
 }

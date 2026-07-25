@@ -19,15 +19,16 @@ system:
   # K1 Cluster0: 512KB shared TCM across 4 AI cores.
   # intra=1 maximizes EP coverage: YOLOv8-Pose + Face (3 EP sessions).
   #
-  # Current EP session allocation (3 models on SpacemiT EP):
+  # Current EP session allocation (production, 3 models on SpacemiT EP):
   #   1. yolov8n-pose.q.onnx  (~170KB TCM) — person detection + 17-keypoint pose
-  #   2. yolov5n-face_320_cut.q.onnx (~170KB TCM) — face detection
-  #   3. arcface_mobilefacenet_cut.q.onnx (~170KB TCM) — face recognition
-  #   Total: ~510KB / 512KB TCM — fully utilized, no headroom for more EP models.
+  #   2. yolov5n-face_320_cut.q.onnx (~170KB TCM) — face detection (IO Binding)
+  #   3. arcface_mobilefacenet_cut.q.onnx (~100KB TCM) — face recognition
+  #   Total: ~440KB / 512KB TCM — fits with headroom.
+  #   YOLO11n (benchmark only, production disabled): +~170KB → ~610KB > 512KB.
+  #   Graceful fallback: if TCM exhausted, EP falls back to CPU for that model.
   #
-  # stgcn.fp32.onnx uses CPU EP (not quantized) — runs on general-purpose core.
-  # To add ST-GCN to EP: quantize stgcn → .q.onnx, then reduce face_interval
-  # so face models don't compete for TCM with ST-GCN's session.
+  # 1D-TCN uses standard Conv1D ops → SpacemiT EP fully supported.
+  # The INT8 model runs on IME+RVV hardware acceleration (~6ms/inference).
   spacemit_ep_intra_threads: 1  # intra=1 only — max EP models on K1's 512KB TCM
   log_level: INFO
   startup_mode: realtime
@@ -56,6 +57,14 @@ coap:
   wifi_ssid: "ESP32-Camera-AP"
   wifi_password: "12345678"
   frame_timeout_s: 10
+
+# ── SG90 舵机控制 (网页实时控制, CoAP PUT /servo → ESP32) ──
+servo:
+  step_deg: 3        # 每次步进角度 (按住按钮时)
+  tick_ms: 40         # 按住时步进间隔 (ms)
+  center_deg: 90      # 回中角度
+  servo_h: 0          # GPIO40 水平/左右
+  servo_v: 1          # GPIO41 垂直/上下
 
 k1_imu:
   enabled: false          # GY85 (ADXL345+ITG3205) not populated on most Muse Pi Pro boards
@@ -118,13 +127,16 @@ detection:
   keypoint_min_count: 2            # allow 2 visible keypoints (was 3)
   keypoint_min_confidence: 0.05    # ultra-low for INT8 model (was 0.08)
   keypoint_validity_threshold: 0.12 # relaxed anatomical check (was 0.25)
-  # ── Cascade optimization (single-model mode) ──
-  cascade_enabled: false
+  # ── Cascade optimization (anti-stutter) ──
+  cascade_enabled: true               # reduce resolution when tracking confirmed persons
   cascade_validation_interval: 15
   cascade_secondary_interval: 5
   cascade_tracking_resolution: [320, 320]
   fallback_confidence: 0.08        # lowered from 0.20 for weak DFL peaks
   fallback_area_ratio_min: 0.004   # lowered from 0.008 to catch distant people
+  # ── Face detection anti-stutter ──
+  face_new_person_delay: 3         # delay face check N frames after new person (avoids spike)
+  face_motion_skip_threshold: 0.40 # skip face detection when frame change > 40%
 
 pose:
   # PERSON detector + pose estimator — selectable model variant.
@@ -162,24 +174,29 @@ face:
   similarity_threshold: 0.45   # v2.6: lowered from 0.55 for better recognition rate
   input_size: [320, 320]
   embedding_dim: 128   # ArcFace MobileFaceNet-cuted outputs [1,128]; must match FEATURE_VECTOR_DIM
-  use_ep: false        # Enable SpacemiT EP (IO Binding required for safe TCM output reads)
+  use_ep: true         # Enable SpacemiT EP (IO Binding routes outputs to CPU for safe reads)
   liveness_detection: false
 
 action:
   enabled: true
   backend: ai_accel
-  model_path: "models/Action Prediction/Skeleton-based Action Prediction/stgcn_int8.onnx"
+  model_path: "models/Action Prediction/Skeleton-based Action Prediction/1D-TCN_Skeleton_INT8.onnx"
   # num_frames/num_keypoints/num_persons are auto-detected from model input shape
   # at load time.  These values are fallback defaults only.
-  # The INT8 ST-GCN model expects NTU-RGB+D standard: 300 frames, 25 keypoints, 2 persons.
+  # The INT8 1D-TCN model expects: [1, 3, 300, 18] — 300 frames, 18 OpenPose keypoints.
   num_frames: 300        # fallback — auto-detected from model
-  num_keypoints: 25      # fallback — auto-detected from model (NTU-RGB+D 25 joints)
-  num_persons: 2         # fallback — auto-detected from model
-  num_classes: 7          # Auto-detected from model output shape at load time; 7-class subset of NTU RGB+D
+  num_keypoints: 18      # fallback — auto-detected from model (OpenPose-18)
+  num_persons: 1         # fallback — auto-detected from model (4D input, no person dim)
+  num_classes: 400        # Auto-detected from model output shape at load time
   confidence_threshold: 0.50
-  # ST-GCN now uses INT8-quantized model → SpacemiT EP acceleration (~3× faster vs CPU FP32).
-  # inference_interval=15: run every 15 pose frames ≈ every 1.5s at 10 FPS.
-  inference_interval: 15
+  # 1D-TCN uses INT8 model → SpacemiT EP acceleration (~6ms vs ST-GCN ~400ms CPU EP).
+  # inference_interval=5: run every 5 pose frames ≈ every 0.5s at 10 FPS
+  # (reduced from 15 for faster first-result latency and more responsive UI).
+  inference_interval: 5
+  # min_frames=30: start predicting after 30 frames (~2s at 16 FPS).
+  # Available frames are replicated to fill the 300-frame temporal window.
+  # Set to 300 to require full buffer (no replication, highest accuracy).
+  min_frames: 30
 
 tracking:
   max_lost: 30                    # 30f @ 3.5 FPS = 8.5s max prediction
@@ -356,7 +373,7 @@ performance:
   # Cluster0 (AI cores 0-3): 512KB shared TCM → AI inference
   #   Core 0: PostProcess (tracking + spatial engine, stripped from rendering)
   #   Core 1: Inference main (YOLO pose + face detect + ArcFace)
-  #   Core 2: ST-GCN action recognition (CPU EP, FP32)
+  #   Core 2: 1D-TCN action prediction (SpacemiT EP, INT8)
   #   Core 3: OpenMP worker
   # Cluster1 (I/O cores 4-7): Data movement + visualization
   #   Core 4: Capture (CoAP receive + JPEG decode via JPU)

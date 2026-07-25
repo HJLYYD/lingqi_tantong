@@ -41,6 +41,7 @@ extern "C" {
 #define WS_STATUS_INTERVAL_MS  500         /* timer period for status broadcast */
 #define WS_MAX_FRAME_JSON_LEN  131072      /* max serialized frame JSON (w/ 320×240 base64 thumb) */
 #define WS_MAX_JPEG_LEN        65536       /* max raw JPEG size (original camera MJPEG frame) */
+#define WS_GALLERY_INTERVAL_MS 1000        /* face gallery broadcast interval */
 
 /* ── WebSocket frame ring buffer entry ── */
 typedef struct {

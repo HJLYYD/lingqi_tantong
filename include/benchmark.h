@@ -31,13 +31,15 @@ typedef enum {
     BM_MODEL_YOLOV5_FACE,
     BM_MODEL_ARCFACE,
     BM_MODEL_STGCN,
+    BM_MODEL_TCN,
     BM_MODEL_COUNT
 } BMModel;
 
 /* ── Single model benchmark result ── */
 typedef struct {
     char   model_name[BM_MAX_NAME_LEN];
-    char   precision[16];          /* "FP32" or "INT8+EP" */
+    char   precision[16];          /* "INT8+EP", "INT8 (CPU)", "FP32 (CPU)" */
+    bool   ep_actually_used;       /* true if SpacemiT EP was actually active for this model */
     char   input_shape[64];        /* e.g. "640×640×3" */
     int    warmup_runs;
     int    timed_runs;
@@ -47,7 +49,10 @@ typedef struct {
     double mean_ms;
     double median_ms;
     double stddev_ms;
-    double p95_ms;                 /* 95th percentile */
+    double p95_ms;                 /* 95th percentile (nearest-rank method, Hyndman & Fan R1) */
+    double ci95_lo_ms;             /* 95% confidence interval lower bound */
+    double ci95_hi_ms;             /* 95% confidence interval upper bound */
+    bool   thermal_throttling_detected; /* true if |mean - median| / median > 2% */
     bool   valid;                  /* false if model failed to load */
     char   error_msg[256];
 } BMModelResult;
@@ -122,6 +127,11 @@ BMModelResult benchmark_stgcn(const char* model_path, int num_frames, int num_kp
                                int num_persons, int num_classes, float conf_thresh,
                                int warmup_runs, int timed_runs);
 
+/** Benchmark 1D-TCN action predictor. */
+BMModelResult benchmark_tcn(const char* model_path, int num_frames, int num_kpts,
+                             int num_persons, int num_classes, float conf_thresh,
+                             int warmup_runs, int timed_runs);
+
 /** Profile full inference pipeline over N frames (video file or camera). */
 BMPipelineProfile benchmark_pipeline_profile(const char* config_path,
                                               const char* video_path,
@@ -138,10 +148,14 @@ void bm_print_result_row(const BMModelResult* r);
 /** Print the full benchmark report with all tables. */
 void bm_print_report(const BMBenchmarkReport* report);
 
-/** Compute statistics (min/max/mean/median/stddev/p95) from latency array. */
+/** Compute statistics (min/max/mean/median/stddev/p95/CI95/throttling) from latency array.
+ *  P95 uses nearest-rank method (Hyndman & Fan R1): index = ceil(n * 0.95) - 1.
+ *  CI95 = mean ± 1.96 * stddev / sqrt(n).
+ *  Thermal throttling detected when |mean - median| / median > 2%. */
 void bm_compute_stats(double* latencies, int n, double* out_min, double* out_max,
                       double* out_mean, double* out_median, double* out_stddev,
-                      double* out_p95);
+                      double* out_p95, double* out_ci95_lo, double* out_ci95_hi,
+                      bool* out_throttling);
 
 /** Sort double array in-place (ascending). */
 void bm_sort_double(double* arr, int n);

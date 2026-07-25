@@ -107,6 +107,9 @@ struct CoapReceiver {
     volatile bool   running;
     volatile bool   shutdown;
     pthread_mutex_t mutex;
+
+    /* ── 舵机角度去重 (匹配 Python ServoClient._angle) ── */
+    int    servo_last_angle[2];   /* -1 = 未初始化 */
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -721,6 +724,157 @@ static bool coap_send_request(CoapReceiver* r, const char* path,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  CoAP PUT 请求构建（舵机控制）
+ *
+ *  参考 Python 客户端 ov-imu-pwm.py 的 build_put() + ServoClient.send_angle()。
+ *  构造 CoAP PUT 请求: header(CON, code=PUT, TKL=4) + token + Uri-Path + payload.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int build_coap_put(const char* path, uint16_t msg_id,
+                          const uint8_t token[4],
+                          const uint8_t* payload, int payload_len,
+                          uint8_t* out, int out_max) {
+    /* Parse path segments */
+    char segments[4][32];
+    int num_segs = 0;
+    const char* p = path;
+    while (*p == '/') p++;
+    if (*p == '\0') return 0;
+
+    const char* start = p;
+    while (*p && num_segs < 4) {
+        if (*p == '/') {
+            int len = (int)(p - start);
+            if (len > 0 && len < 32) {
+                memcpy(segments[num_segs], start, len);
+                segments[num_segs][len] = '\0';
+                num_segs++;
+            }
+            start = p + 1;
+        }
+        p++;
+    }
+    if (*start) {
+        int len = (int)(p - start);
+        if (len > 0 && len < 32) {
+            memcpy(segments[num_segs], start, len);
+            segments[num_segs][len] = '\0';
+            num_segs++;
+        }
+    }
+
+    /* Build URI-Path options */
+    uint8_t opts[256];
+    int opt_len = 0;
+    int prev_opt = 0;
+    for (int i = 0; i < num_segs; i++) {
+        int seg_len = (int)strlen(segments[i]);
+        int n = encode_option(opts + opt_len, prev_opt, COAP_OPT_URI_PATH,
+                              (const uint8_t*)segments[i], seg_len);
+        if (n < 0 || opt_len + n > (int)sizeof(opts)) return 0;
+        opt_len += n;
+        prev_opt = COAP_OPT_URI_PATH;
+    }
+
+    /* Header: Ver=1, Type=CON(0), TKL=4, Code=PUT(0x03) */
+    int pos = 0;
+    if (pos + 4 + 4 > out_max) return 0;
+    out[pos++] = (1 << 6) | (COAP_TYPE_CON << 4) | 4;  /* TKL=4 */
+    out[pos++] = COAP_CODE_PUT;
+    write_u16_be(out + pos, msg_id);
+    pos += 2;
+    memcpy(out + pos, token, 4);
+    pos += 4;
+
+    /* URI-Path options */
+    if (opt_len > 0) {
+        if (pos + opt_len > out_max) return 0;
+        memcpy(out + pos, opts, opt_len);
+        pos += opt_len;
+    }
+
+    /* Payload marker + payload */
+    if (payload && payload_len > 0) {
+        if (pos + 1 + payload_len > out_max) return 0;
+        out[pos++] = 0xFF;  /* payload marker */
+        memcpy(out + pos, payload, payload_len);
+        pos += payload_len;
+    }
+
+    return pos;
+}
+
+/* ── Public API: send servo angle to ESP32 ── */
+
+bool coap_receiver_send_servo(CoapReceiver* r, int servo_id, int angle) {
+    if (!r || r->sock_fd < 0) return false;
+    if (servo_id < 0 || servo_id > 1) return false;
+
+    /* Clamp to [0, 180] — matches Python: max(MIN, min(MAX, int(angle))) */
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+
+    /* ── Angle dedup (Python ServoClient.send_angle line 359) ──
+     * Skip send if angle unchanged — avoids redundant PWM writes and jitter.
+     * servo_last_angle init to -1 ensures first command always sends. */
+    if (r->servo_last_angle[servo_id] == angle) {
+        log_debug("[CoapRX] servo %d → %d° (skipped, angle unchanged)", servo_id, angle);
+        return true;  /* not an error — treat as success */
+    }
+    r->servo_last_angle[servo_id] = angle;
+
+    /* Build JSON payload: {"servo":N,"angle":N}
+     * — matches Python: json.dumps({"servo": servo, "angle": angle}) */
+    char json[64];
+    int json_len = snprintf(json, sizeof(json),
+                            "{\"servo\":%d,\"angle\":%d}", servo_id, angle);
+    if (json_len <= 0 || json_len >= (int)sizeof(json)) return false;
+
+    /* Build CoAP PUT packet with 4-byte servo token (big-endian)
+     * — matches Python: SERVO_TOKEN = b"\xbe\xef\xca\xfe" */
+    uint8_t token[4];
+    token[0] = (uint8_t)((COAP_SERVO_TOKEN >> 24) & 0xFF);  /* 0xBE */
+    token[1] = (uint8_t)((COAP_SERVO_TOKEN >> 16) & 0xFF);  /* 0xEF */
+    token[2] = (uint8_t)((COAP_SERVO_TOKEN >> 8) & 0xFF);   /* 0xCA */
+    token[3] = (uint8_t)(COAP_SERVO_TOKEN & 0xFF);           /* 0xFE */
+
+    /* msg_id wrapping — matches Python: self._msg_id = (self._msg_id + 1) & 0xFFFF */
+    static uint16_t s_msg_id = 100;  /* Python starts at 100 */
+    uint16_t msg_id = s_msg_id;
+    s_msg_id = (uint16_t)((s_msg_id + 1) & 0xFFFF);
+
+    /* Build CoAP PUT request to path "servo"
+     * — matches Python: build_put("servo", self._msg_id, SERVO_TOKEN, payload) */
+    uint8_t tx[COAP_MAX_PACKET];
+    int tx_len = build_coap_put("servo", msg_id, token,
+                                (const uint8_t*)json, json_len,
+                                tx, sizeof(tx));
+    if (tx_len <= 0) return false;
+
+    /* Resolve ESP32 address */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)r->esp_port);
+    if (inet_pton(AF_INET, r->esp_ip, &addr.sin_addr) != 1) {
+        log_error("[CoapRX] servo: inet_pton(%s) failed", r->esp_ip);
+        return false;
+    }
+
+    /* Fire-and-forget: sendto() is thread-safe per POSIX
+     * — matches Python: self._sock.sendto(req, (self.host, self.port)) */
+    ssize_t n = sendto(r->sock_fd, tx, tx_len, 0,
+                       (struct sockaddr*)&addr, sizeof(addr));
+    if (n != tx_len) {
+        log_warning("[CoapRX] servo sendto failed: %s", strerror(errno));
+        return false;
+    }
+
+    log_info("[CoapRX] servo %d → %d° (%d bytes sent)", servo_id, angle, tx_len);
+    return true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  处理接收到的 CoAP 数据包
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -1025,6 +1179,8 @@ CoapReceiver* coap_receiver_create(const char* esp_ip, int esp_port,
     r->connected = false;
     r->reconnect_delay_s = COAP_RECONNECT_INITIAL_S;
     r->has_pose = false;
+    r->servo_last_angle[0] = -1;
+    r->servo_last_angle[1] = -1;
 
     assembly_init(&r->assembly);
 

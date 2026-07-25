@@ -7,7 +7,7 @@
 #include "yolov8_pose_estimator.h"
 #include "yolov5_face_detector.h"
 #include "arcface_recognizer.h"
-#include "stgcn_action_recognizer.h"
+#include "tcn_action_predictor.h"
 #include "keypoint_validator.h"
 #include "frame_diff.h"
 
@@ -41,7 +41,7 @@ typedef struct {
     YOLOv8PoseEstimator* pose_estimator;
     YOLOv5FaceDetector* face_detector;
     ArcFaceRecognizer* face_recognizer;
-    STGCNActionRecognizer* action_recognizer;
+    TcnActionPredictor* action_recognizer;
 
     uint32_t enabled_stages;
     bool models_loaded[5];
@@ -90,6 +90,24 @@ typedef struct {
     bool      frame_diff_enabled;      /* master switch from config */
     InferResult last_full_result;      /* cached result from last processed frame */
     bool      has_last_result;         /* true after first processed frame */
+
+    /* ── NEW: Anti-stutter optimizations ── */
+
+    /* Plan 1: Delay face detection after new person appears.
+     * Prevents the 80-200ms spike on the frame a person first enters. */
+    int  new_person_face_delay;        /* frames to wait before face check (default: 3) */
+    int  new_person_face_counter;      /* countdown: 0 = ready to run */
+    bool face_detect_deferred;         /* true when a face check was postponed */
+
+    /* Plan 2: Pre-allocated face detection buffers.
+     * Eliminates per-person malloc/free in detect_faces hot path. */
+    uint8_t* face_roi_buf;             /* pre-alloc 320×320×3 for ROI resize */
+    uint8_t* face_crop_buf;            /* pre-alloc max-size crop buffer */
+    size_t   face_crop_buf_size;       /* allocated size of crop buffer */
+
+    /* Plan 4: Skip face detection during high-motion frames.
+     * When frame_diff change_ratio exceeds this, postpone face detection. */
+    float face_motion_skip_threshold;  /* change_ratio above which to skip face (default: 0.40) */
 } AIInferencePipeline;
 
 AIInferencePipeline* inference_pipeline_create(void);

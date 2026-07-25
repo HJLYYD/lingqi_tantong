@@ -18,6 +18,14 @@ static int g_ep_session_count = 0;
                              * one intra-op thread pool.  Models run sequentially → TCM footprint
                              * is N_threads × ~170KB (not sessions × threads × ~170KB).
                              * 4 quantized models: YOLOv8-Pose + YOLO11 + FaceDet + ArcFace */
+
+/* ── EP session tracking for correct release counting ──
+ * ort_release_session() needs to know whether a session was created with EP
+ * to correctly decrement g_ep_session_count.  We track EP sessions by pointer
+ * in a small static array (max 8, actual usage ≤ MAX_EP_SESSIONS=4). */
+#define MAX_TRACKED_EP_SESSIONS 8
+static OrtSession* g_ep_session_ptrs[MAX_TRACKED_EP_SESSIONS] = {0};
+static int g_ep_session_tracked = 0;
 #ifdef HAS_SPACEMIT_EP
 static bool g_ep_enabled_pref = true;
 static bool g_ep_tcm_permanently_failed = false;  /* Set on first TCM alloc failure; skip EP for all subsequent models */
@@ -392,6 +400,10 @@ use_cpu:  /* fallthrough label for EP skip */
             ep_succeeded = true;
             g_ep_session_count++;
             g_spacemit_ep_active = true;
+            /* Track this session pointer for correct release counting */
+            if (g_ep_session_tracked < MAX_TRACKED_EP_SESSIONS) {
+                g_ep_session_ptrs[g_ep_session_tracked++] = session;
+            }
         }
     } else {
         status = g_ort_api->CreateSession(g_ort_env, model_path, session_opts, &session);
@@ -466,6 +478,50 @@ int ort_get_input_shape(OrtSession* session, int* out_dims, int max_dims) {
         out_dims[i] = (int)dims[i];
     }
     return (int)num_dims;
+}
+
+/*
+ * ort_release_session — Release an ONNX Runtime session with correct EP accounting.
+ *
+ * Directly calling g_ort_api->ReleaseSession() bypasses the EP session counter
+ * (g_ep_session_count), causing it to never decrement.  Over time this leaks EP
+ * slots until MAX_EP_SESSIONS is reached and all new EP registrations are refused.
+ *
+ * This wrapper checks the EP tracking table, decrements the counter for EP sessions,
+ * and resets the permanent-TCM-failure flag when all EP sessions are released.
+ *
+ * Callers should use this instead of direct ReleaseSession() for any session
+ * created via ort_create_session().
+ */
+void ort_release_session(OrtSession* session) {
+    if (!session || !g_ort_api) return;
+
+    pthread_mutex_lock(&g_ort_mutex);
+
+    /* Check if this session was created with EP */
+    for (int i = 0; i < g_ep_session_tracked; i++) {
+        if (g_ep_session_ptrs[i] == session) {
+            if (g_ep_session_count > 0) {
+                g_ep_session_count--;
+            }
+            /* Remove from tracking array (swap with last, shrink) */
+            g_ep_session_ptrs[i] = g_ep_session_ptrs[--g_ep_session_tracked];
+            g_ep_session_ptrs[g_ep_session_tracked] = NULL;
+
+            /* Reset permanent failure flag when all EP sessions released */
+            if (g_ep_session_count <= 0) {
+                g_ep_session_count = 0;
+#ifdef HAS_SPACEMIT_EP
+                g_ep_tcm_permanently_failed = false;
+#endif
+            }
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&g_ort_mutex);
+
+    g_ort_api->ReleaseSession(session);
 }
 
 #endif

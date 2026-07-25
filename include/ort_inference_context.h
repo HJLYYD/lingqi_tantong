@@ -54,6 +54,21 @@ bool ort_ctx_prepare_input(OrtInferenceContext* ctx, const float* data, size_t b
  */
 bool ort_ctx_input_ready(OrtInferenceContext* ctx, size_t bytes);
 int ort_ctx_run(OrtInferenceContext* ctx, OrtValue** output_vals);
+
+/*
+ * IO-Binding variant of ort_ctx_run — binds OUTPUT tensors to CPU memory via
+ * OrtIoBinding.  Input is still passed via ctx->input_tensor (CPU memory,
+ * EP copies to TCM internally).  Output tensors allocated in CPU memory are
+ * safe to read as float* regardless of the model's internal quantization.
+ *
+ * Use this when SpacemiT EP produces INT8 outputs in TCM — IO Binding forces
+ * ORT to dequantize during the TCM→CPU copy so callers always receive FLOAT.
+ *
+ * output_vals must be pre-allocated with calloc(num_outputs, sizeof(OrtValue*)).
+ * On success, output_vals[i] contains the CPU-memory OrtValue.
+ */
+int ort_ctx_run_io_binding(OrtInferenceContext* ctx, OrtValue** output_vals);
+
 void ort_ctx_release_outputs(OrtInferenceContext* ctx, OrtValue** output_vals, size_t count);
 /* ── Output value pool ──
  * Returns a pre-allocated OrtValue* array (size ctx->num_outputs, zeroed).

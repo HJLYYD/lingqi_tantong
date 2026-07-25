@@ -1,12 +1,12 @@
 # LingQi TanTong (灵柒探瞳) — Edge AI Inference Pipeline
 
-> **Version**: v2.5 — Muse Pi Pro (SpacemiT K1 X60) Fully Adapted
+> **Version**: v2.7 — 1D-TCN Action Recognition + Face Gallery
 > **Target Platform**: SpacemiT K1 X60 (Muse Pi Pro) — RISC-V 64 (Bianbu Linux 2.1+)
 > **Development Platform**: Linux (Cross-compilation) / K1 Native Build
 > **Language Standard**: C11 + C++17 (SpacemiT EP Bridge)
 > **Build System**: CMake ≥3.16
-> **Total Code**: ~15,000 lines C/C++ (Shooter End, K1 Muse Pi Pro)
-> **Models**: 5 ONNX models (4 INT8-quantized + 1 FP32)
+> **Total Code**: ~35,000 lines C/C++ (35 C + 1 C++ source files, 35 headers, plus Mongoose 7.22 embedded library)
+> **Models**: 6 ONNX model types (5 INT8-quantized + 1 FP32) — YOLOv8-Pose, YOLO11n-Pose, YOLOv5-Face, ArcFace, 1D-TCN, ST-GCN | 9 model files total | 26 model families in CV/ test suite
 
 ---
 
@@ -40,38 +40,43 @@ The LingQi TanTong system consists of two physical computing nodes:
 
 | Computing Node | Hardware Platform | Core Responsibilities |
 |---|---|---|
-| **Arrow End** | ESP32 + OV3660 + GY85 | Image capture (OV3660 VGA), IMU attitude estimation (ADXL345 + ITG3205), CoAP/UDP video streaming + IMU telemetry (WiFi AP mode) |
+| **Arrow End** | ESP32 + OV3660 + GY85 | Image capture (OV3660 VGA), IMU attitude estimation (ADXL345 + ITG3205), CoAP/UDP video streaming + IMU telemetry + servo control (WiFi AP mode) |
 | **Shooter End** | SpacemiT K1 Muse Pi Pro | AI inference acceleration (RVV 1.0 + IME 2.0 TOPS), multi-object tracking (ByteTrack + Hungarian + cascade matching), 3D world-coordinate localization (K1 odometry + pinhole model), Web UI visualization (Three.js 3D) |
 
-The system provides the following **10 core capabilities**:
+The system provides the following **12 core capabilities**:
 
 1. **Person Detection & Pose Estimation (Unified Model)**: YOLOv8-Pose (PRIMARY) performs BOTH person detection AND 17-keypoint COCO pose estimation in a single forward pass. YOLO11n-Pose available as alternative variant. Hardware-accelerated via ONNX Runtime + SpacemiT Execution Provider (RVV 1.0 + IME).
 
 2. **Face Detection & Recognition**: YOLOv5-Face lightweight face detection (320×320 INT8) cascaded with ArcFace MobileFaceNet-cuted deep feature extraction (128-dimensional embedding vector). Cosine similarity matching for identity re-identification.
 
-3. **Action Recognition**: ST-GCN (Spatial-Temporal Graph Convolutional Network) for skeleton-based action recognition. Supports 7-class NTU-RGB+D action subset. INT8-quantized for SpacemiT EP acceleration.
+3. **1D-TCN Action Recognition** (v2.7): 1D Temporal Convolutional Network for skeleton-based action recognition, replacing ST-GCN as the primary action model. Supports 400-class action taxonomy (60 named NTU-RGB+D classes + auto-labeled). INT8-quantized with **SpacemiT EP hardware acceleration** (~6ms/inference vs ST-GCN ~400ms CPU EP). COCO-17→OpenPose-18 keypoint remapping at push time. Async prediction API with thread-safe result retrieval and fast-start frame replication.
 
-4. **Multi-Object Tracking**: ByteTrack-inspired cascade matching + Kuhn-Munkres Hungarian algorithm + 7-state Kalman filtering + EMA smoothing (α=0.35). Includes re-identification pool, occlusion handling, and multi-person detection with new-person grace frames.
+4. **ST-GCN Action Recognition** (Legacy): Spatial-Temporal Graph Convolutional Network for skeleton-based action recognition. Supports 7-class NTU-RGB+D action subset. CPU EP only (graph convolution ops not supported by IME hardware).
 
-5. **3D World-Coordinate Localization**: K1 INS odometry (strapdown inertial navigation + ZUPT EKF) provides dynamic world origin. Pinhole camera model monocular depth estimation fused with IMU pitch correction. Multi-point anatomical depth sampling with MAD outlier rejection. World coordinate system with adaptive anchor strategy (SEVIS-3D inspired).
+5. **Multi-Object Tracking**: ByteTrack-inspired cascade matching + Kuhn-Munkres Hungarian algorithm + 7-state Kalman filtering + EMA smoothing (α=0.35). Includes re-identification pool, occlusion handling, and multi-person detection with new-person grace frames.
 
-6. **Web UI (Three.js 3D Visualization)**: Embedded HTTP + WebSocket server (Mongoose). Real-time frame streaming with bounding boxes, skeleton overlays, 3D world-coordinate projection. Pipeline lifecycle control (start/stop) from browser. Ceramic-white design system with Chinese localization.
+6. **3D World-Coordinate Localization**: K1 INS odometry (strapdown inertial navigation + ZUPT EKF) provides dynamic world origin. Pinhole camera model monocular depth estimation fused with IMU pitch correction. Multi-point anatomical depth sampling with MAD outlier rejection. World coordinate system with adaptive anchor strategy (SEVIS-3D inspired).
 
-7. **Terminal UI (3-mode adaptive)**: Auto-detects TTY/CI/pipe. Three output modes: HUMAN (Unicode color), PLAIN (ASCII), MACHINE (JSON Lines). Checklist spinner for model loading, progress bar for offline video, status line for realtime mode.
+7. **Web UI (Three.js 3D Visualization)**: Embedded HTTP + WebSocket server (Mongoose). Real-time frame streaming with bounding boxes, skeleton overlays, 3D world-coordinate projection. Face gallery with base64-encoded thumbnails. Pipeline lifecycle control (start/stop) from browser. Ceramic-white design system with Chinese localization.
 
-8. **Real-time Data Link**: CoAP/UDP wireless protocol (RFC 7252) implementing ESP32 → K1 Block2 video streaming + IMU telemetry over WiFi. Adaptive burst pacing to optimize throughput.
+8. **Face Gallery** (v2.7): Time-windowed collection of detected face thumbnails with recognition results. Track-ID-based deduplication, identity-level merge (keeps highest similarity), time-based expiry pruning. WebSocket broadcast to all connected clients for real-time face gallery display in Web UI.
 
-9. **K1 Hardware Acceleration**: RISC-V Vector 1.0 (256-bit VLEN) auto-vectorization + IME matrix extension instructions (2.0 TOPS). Dual-cluster pipeline parallelism (Cluster0 AI cores 0-3, Cluster1 I/O cores 4-7). TCM tightly-coupled memory (512KB) for model weight preloading. VPU hardware H.264 encode, JPU hardware JPEG decode.
+9. **Terminal UI (3-mode adaptive)**: Auto-detects TTY/CI/pipe. Three output modes: HUMAN (Unicode color), PLAIN (ASCII), MACHINE (JSON Lines). Checklist spinner for model loading, progress bar for offline video, status line for realtime mode.
 
-10. **Adaptive Frame Skip**: Grid-based subsampled MAD (Mean Absolute Difference) frame differencing. Three activity levels (STATIC/LOW_MOTION/ACTIVE) with adaptive skip limits. Up to 10× effective throughput improvement on static scenes (~0.2ms comparison cost vs ~150ms inference savings).
+10. **Real-time Data Link**: CoAP/UDP wireless protocol (RFC 7252) implementing ESP32 → K1 Block2 video streaming + IMU telemetry over WiFi. Servo control via CoAP PUT `/servo` endpoint for pan/tilt adjustment.
 
-### 1.3 Three Run Modes
+11. **K1 Hardware Acceleration**: RISC-V Vector 1.0 (256-bit VLEN) auto-vectorization + IME matrix extension instructions (2.0 TOPS). Dual-cluster pipeline parallelism (Cluster0 AI cores 0-3, Cluster1 I/O cores 4-7). TCM tightly-coupled memory (512KB) for model weight preloading. VPU hardware H.264 encode, JPU hardware JPEG decode.
+
+12. **Comprehensive Benchmarking** (v2.7): Built-in `--benchmark` mode supporting 6 models (YOLOv8-Pose, YOLO11n-Pose, YOLOv5-Face, ArcFace, ST-GCN, 1D-TCN) with warmup + timed iterations, full statistics (min/max/mean/median/stddev/P95/CI95), thermal throttling detection, and pipeline end-to-end profiling. Paper-ready ASCII table output.
+
+### 1.3 Four Run Modes
 
 | Mode | Trigger | Description |
 |---|---|---|
-| **GUI Mode** (default) | No arguments, or `--web [PORT]` | Embedded Web UI at `http://localhost:8080`. Pipeline starts IDLE; user controls lifecycle from browser. Three.js 3D visualization with real-time WebSocket frame streaming. |
-| **Realtime CLI** | `--realtime` | K1 dual-cluster pipeline (Capture→Inference→PostProcess threads). V4L2 camera or CoAP WiFi input. Terminal UI status display. |
+| **GUI Mode** (default) | No arguments, or `--web [PORT]` | Embedded Web UI at `http://localhost:8080`. Pipeline starts IDLE; user controls lifecycle from browser. Three.js 3D visualization with real-time WebSocket frame streaming and face gallery. |
+| **Realtime CLI** | `--realtime` | K1 dual-cluster pipeline (Capture→Inference→PostProcess→Viz threads). V4L2 camera or CoAP WiFi input. Terminal UI status display. |
 | **Offline CLI** | `--video PATH` | Video file frame-by-frame processing. Progress bar with FPS/ETA. Full inference→tracking→localization→visualization pipeline. AVI output. |
+| **Benchmark** | `--benchmark` | Model inference benchmarking with paper-ready tables. Supports per-model filtering, configurable iteration count, and pipeline E2E profiling. |
 
 ### 1.4 Technical Specifications
 
@@ -80,7 +85,8 @@ The system provides the following **10 core capabilities**:
 | Object Detection FPS (K1 EP INT8) | ≥25 | ~10-15 (480×480, 4-model cascade) |
 | Object Detection mAP50 (YOLOv8-Pose) | ≥48% | Model integrated (INT8 quantized) |
 | Face Detection AP (YOLOv5-Face) | ≥90% | Model integrated (INT8 quantized) |
-| Action Recognition Accuracy (ST-GCN) | ≥70% | Model integrated (INT8, 7-class) |
+| Action Recognition Accuracy (1D-TCN) | ≥70% | Model integrated (INT8+EP, 400-class) |
+| Action Recognition Latency (1D-TCN EP) | <50ms | ~6ms/inference (vs ~400ms ST-GCN CPU EP) |
 | Tracking ID Switch Rate | <5% | Implemented (cascade + Hungarian + re-id) |
 | Spatial Localization Error (<10m) | <20% | Implemented (anatomical depth + MAD outlier) |
 | End-to-end Latency (Arrow→Display) | <200ms | ~150ms (excluding Arrow WiFi) |
@@ -92,11 +98,13 @@ The system provides the following **10 core capabilities**:
 
 2. **RISC-V AI Acceleration Practice**: Systematically applied SpacemiT K1's RVV 1.0 + IME instruction set for computer vision inference acceleration, accumulating practical experience for the RISC-V AI ecosystem.
 
-3. **Multi-sensor Fusion Localization**: Implemented a spatial localization scheme fusing INS odometry (strapdown + ZUPT EKF), visual monocular depth estimation, and adaptive world anchors — effectively improving robustness in GPS-denied environments.
+3. **1D-TCN on SpacemiT EP**: Demonstrated that 1D temporal convolution models (unlike ST-GCN's graph convolutions) can fully leverage K1's IME hardware acceleration, achieving ~60× speedup over CPU EP for action recognition.
 
-4. **Full C Language Embedded Implementation**: Entire system written in C11 with a minimal C++17 bridge for SpacemiT EP. Zero dependency on heavyweight frameworks (Python, OpenCV, ROS). Portable to various resource-constrained platforms.
+4. **Multi-sensor Fusion Localization**: Implemented a spatial localization scheme fusing INS odometry (strapdown + ZUPT EKF), visual monocular depth estimation, and adaptive world anchors — effectively improving robustness in GPS-denied environments.
 
-5. **Browser-Based 3D Visualization**: Novel Web UI approach using Mongoose embedded server + Three.js rendering, eliminating the need for a physical display while providing rich 3D world-coordinate visualization.
+5. **Full C Language Embedded Implementation**: Entire system written in C11 with a minimal C++17 bridge for SpacemiT EP. Zero dependency on heavyweight frameworks (Python, OpenCV, ROS). Portable to various resource-constrained platforms.
+
+6. **Browser-Based 3D Visualization**: Novel Web UI approach using Mongoose embedded server + Three.js rendering, eliminating the need for a physical display while providing rich 3D world-coordinate visualization and face gallery.
 
 ---
 
@@ -114,7 +122,17 @@ The emergence of single-stage detectors — YOLO [Redmon et al., 2016], SSD [Liu
 
 For face detection, **YOLOv5-Face** (~0.8M parameters, INT8 quantized) balances accuracy and inference efficiency at 320×320 input resolution. For face recognition, **ArcFace** [Deng et al., 2019] uses Additive Angular Margin Loss in angular space to significantly improve inter-class separability and intra-class compactness. This project uses MobileFaceNet-cuted architecture outputting 128-dimensional feature vectors, matched via cosine similarity.
 
-### 2.3 Multi-Object Tracking Methods
+### 2.3 Action Recognition: From ST-GCN to 1D-TCN
+
+Skeleton-based action recognition has evolved through two major paradigms:
+
+**ST-GCN (Spatial-Temporal Graph Convolutional Network)** [Yan et al., 2018] models the human skeleton as a spatio-temporal graph, applying graph convolutions across both spatial (joint-joint edges) and temporal (frame-frame edges) dimensions. This project originally used ST-GCN with INT8 quantization for 7-class action recognition. However, **graph convolution operators are not supported by SpacemiT IME hardware**, requiring CPU EP fallback (~400ms/inference).
+
+**1D-TCN (Temporal Convolutional Network)** [Lea et al., 2017] uses standard 1D convolutions along the temporal dimension, treating skeleton sequences as multi-channel time series. **Critically, 1D convolution operators (Conv1D, BN, ReLU) are natively supported by SpacemiT IME**, enabling full INT8 hardware acceleration (~6ms/inference). In v2.7, 1D-TCN replaces ST-GCN as the primary action recognition model, achieving ~60× speedup while supporting 400 action classes (vs 7 for ST-GCN).
+
+COCO-17 keypoints from YOLOv8-Pose are remapped to OpenPose-18 format at push time via a static mapping table (neck joint synthesized as shoulder midpoint). Fast-start frame replication fills the 300-frame temporal window when only partial skeleton history is available (minimum 30 frames ≈ 2s at 16 FPS).
+
+### 2.4 Multi-Object Tracking Methods
 
 The mainstream paradigms of MOT are divided into Tracking-by-Detection and Joint Detection and Tracking. **SORT** [Bewley et al., 2016] constructed an efficient tracking framework using Kalman filter prediction and Hungarian algorithm association. **DeepSORT** [Wojke et al., 2017] introduced appearance features for occlusion robustness. **ByteTrack** [Zhang et al., 2022] innovatively proposed using low-confidence detection boxes for secondary matching, achieving SOTA performance on MOT17/MOT20.
 
@@ -126,7 +144,7 @@ This project implements a ByteTrack-inspired tracker with:
 - **Re-identification pool**: Deleted tracks retained for 60 frames for re-association
 - **Occlusion handling**: Upper-body (≥3 keypoints) and side-body (≥2 keypoints) fallback validation
 
-### 2.4 Inertial Navigation and Attitude Estimation
+### 2.5 Inertial Navigation and Attitude Estimation
 
 **Madgwick filter** [Madgwick et al., 2011] uses gradient descent optimization to fuse accelerometer, gyroscope, and magnetometer (9-DOF) data, providing drift-free yaw angle estimation with a single tunable parameter β. On the K1 Shooter End, raw IMU readings from the Arrow End (or K1's onboard ICM-20948) are processed through Madgwick filtering for attitude quaternion output.
 
@@ -134,13 +152,13 @@ For K1 self-motion estimation, the system implements **Strapdown Inertial Naviga
 
 **Yaw Unobservability Note**: ZUPT EKF only observes velocity error (zero-velocity pseudo-measurement). Yaw angle is completely unobservable from velocity measurements alone [Ilyas et al., Sensors 2016], resulting in ~1-5°/min gyro Z-axis drift. The WorldCoord adaptive anchor strategy mitigates this for short runs (<60s) by locking stationary person positions.
 
-### 2.5 RISC-V Vector Extension and AI Acceleration
+### 2.6 RISC-V Vector Extension and AI Acceleration
 
 The **RISC-V Vector Extension (RVV 1.0)** [RISC-V International, 2021] is a variable-length SIMD ISA supporting VLEN from 32 to 65536 bits. The SpacemiT X60 core implements RVV 1.0 with VLEN=256 bits — a single vector instruction processes 8 float32 or 16 int16 operands simultaneously. The proprietary **IME (Intelligent Matrix Extension)** adds 16 custom AI acceleration instructions (matrix multiply, sliding window), achieving 2.0 TOPS of in-core AI compute when working with RVV 1.0 [SpacemiT, 2024].
 
-**Important**: K1 X60 has NO independent NPU. AI acceleration comes entirely from RVV 1.0 + IME instructions within the CPU cores. The core advantage is zero-copy: data is processed inside the CPU core without DMA transfers to an external accelerator.
+**Important**: K1 X60 has NO independent NPU. AI acceleration comes entirely from RVV 1.0 + IME instructions within the CPU cores. The core advantage is zero-copy: data is processed inside the CPU core without DMA transfers to an external accelerator. IME supports standard convolution operators (Conv1D, Conv2D, BN, ReLU) but NOT graph convolution operators — this is why 1D-TCN (Conv1D-based) can use EP acceleration while ST-GCN cannot.
 
-### 2.6 Embedded Deep Inference Framework
+### 2.7 Embedded Deep Inference Framework
 
 **ONNX Runtime** [Microsoft, 2023] is a cross-platform deep learning inference engine supporting multiple hardware Execution Providers (EP). SpacemiT provides a customized EP (`libspacemit_ep.so`) registered through `SessionOptionsSpaceMITEnvInit()`, automatically mapping convolutions and matrix multiplications to RVV 1.0 + IME instructions. The EP only supports INT8-quantized models (.q.onnx produced by SpacemiT's xquant tool); FP32 models silently fall back to CPU EP.
 
@@ -191,7 +209,7 @@ Core design principles:
 
 ### 3.3 Development Process and Quality Control
 
-The project adopts a quality assurance system driven by systematic code reviews. Across the v1.0 → v2.5 iteration history, reviews covering all 32 source files and 32 header files identified and fixed critical defects including:
+The project adopts a quality assurance system driven by systematic code reviews. Across the v1.0 → v2.7 iteration history, reviews covering all 35 source files and 35 header files identified and fixed critical defects including:
 
 - **YOLOv8 ONNX Output Format Correction**: (x1,y1,x2,y2) → (cx,cy,w,h) format correction in pose estimator
 - **K1 No Independent NPU Cognitive Correction**: Comprehensively cleaned up all improper "NPU" references, replacing with "RISC-V AI instruction acceleration"
@@ -199,8 +217,10 @@ The project adopts a quality assurance system driven by systematic code reviews.
 - **GLRT ZUPT Threshold**: Corrected from 300,000 (never fired) to 500 (proper 4× headroom above baseline)
 - **Velocity Clamp**: Tightened from 50 m/s (180 km/h) to 5 m/s (18 km/h) for physically meaningful pedestrian/mobile-robot speeds
 - **GCC X60 Auto-Vectorization Safety**: Disabled `-ftree-vectorize` on GCC <15 to prevent misaligned vector load/store SIGBUS (X60 lacks Zicclsm hardware support)
+- **TCN Cluster1 SIGILL**: Discovered that ORT MLAS RVV kernels crash on Cluster1 cores; moved TCN thread to Cluster0 CPU3
+- **1D-TCN EP Compatibility**: Confirmed that Conv1D operators are IME-supported, enabling INT8 hardware acceleration for the TCN model (unlike ST-GCN's unsupported graph convolutions)
 
-For detailed change records, see [docs/CODE_CHANGE_LOG.md](docs/CODE_CHANGE_LOG.md).
+For detailed change records, see the project's git commit history (`git log`).
 
 ---
 
@@ -249,7 +269,7 @@ The LingQi TanTong system adopts a **dual-device heterogeneous computing archite
 │  │  │CoapReceiver  │  │ TrackingManager│  │ Web UI Server  │  ││
 │  │  │ IMUHandler   │  │ SpatialEngine  │  │ VideoWriter    │  ││
 │  │  │ ModelStore   │  │  WorldCoord    │  │ (AVI Export)   │  ││
-│  │  │ FrameDiff    │  │ K1Odometry     │  │                │  ││
+│  │  │ FrameDiff    │  │ K1Odometry     │  │ FaceGallery    │  ││
 │  │  │ K1IMU        │  │ ORT+SpacemiTEP │  │                │  ││
 │  │  └──────────────┘  └────────────────┘  └────────────────┘  ││
 │  │                                                              ││
@@ -278,9 +298,10 @@ The Shooter End (K1) software system is organized into functional module groups:
 ├────────────┼─────────────────────────────────────────────────┤
 │                     Controller Layer                           │
 │  ┌─────────▼───────────┐                                     │
-│  │ system_controller.c │  3-mode orchestration:              │
-│  │                     │  GUI(web idle) / Realtime(K1 3-thread│
-│  │ pipeline_state.c    │  pipeline) / Offline(video loop)    │
+│  │ system_controller.c │  4-mode orchestration:              │
+│  │                     │  GUI(web idle) / Realtime(K1 4-thread│
+│  │ pipeline_state.c    │  pipeline) / Offline(video loop) /  │
+│  │                     │  Benchmark(model timing)            │
 │  └─────────────────────┘                                     │
 ├──────────────────────────────────────────────────────────────┤
 │                   Business Logic Layer                         │
@@ -289,7 +310,8 @@ The Shooter End (K1) software system is organized into functional module groups:
 │  │                  │ │                  │ │              │  │
 │  │ YOLOv8-Pose(1°)  │ │ Cascade+Hungarian│ │ Pinhole model│  │
 │  │ YOLOv5-Face→ArcFace│ │ + 7-state Kalman│ │ + IMU correct│  │
-│  │ ST-GCN(action)   │ │ + EMA + re-id    │ │ + MAD fusion │  │
+│  │ 1D-TCN(action)   │ │ + EMA + re-id    │ │ + MAD fusion │  │
+│  │ ST-GCN(legacy)   │ │                  │ │              │  │
 │  └──────────────────┘ └──────────────────┘ └──────────────┘  │
 │  ┌──────────────────┐ ┌──────────────────┐                   │
 │  │   WorldCoord     │ │   K1Odometry     │                   │
@@ -318,7 +340,14 @@ The Shooter End (K1) software system is organized into functional module groups:
 │  │  WebServer    │ │   Web UI      │ │  VideoWriter  │       │
 │  │  (Mongoose)   │ │  (Three.js)   │ │               │       │
 │  │ HTTP+WS server│ │ 3D world view │ │ AVI encoding  │       │
+│  │               │ │ +face gallery │ │               │       │
 │  └───────────────┘ └───────────────┘ └───────────────┘       │
+│  ┌───────────────┐                                             │
+│  │ FaceGallery   │                                             │
+│  │               │                                             │
+│  │ Thumbnail DB  │                                             │
+│  │ identity dedup│                                             │
+│  └───────────────┘                                             │
 ├──────────────────────────────────────────────────────────────┤
 │                      Support Layer                             │
 │  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐       │
@@ -350,8 +379,9 @@ FrameData (uint8*, width, height, channels, timestamp)
     ├──▶ YOLOv5-Face (periodic, every 5-60 frames)
     │       └── ArcFace ──▶ FaceIdentity[] (128-d feature vectors)
     │
-    ├──▶ ST-GCN (periodic, every ~15 frames)
-    │       └── ActionPrediction[] (7-class NTU-RGB+D subset)
+    ├──▶ 1D-TCN (periodic, every ~5 pose frames, async)
+    │       │     COCO-17 → OpenPose-18 remap at push time
+    │       └── ActionPrediction[] (400-class taxonomy)
     │
     └──▶ SpatialEngine ──▶ depth → camera coords → WorldCoord
             │
@@ -397,6 +427,8 @@ FrameData (uint8*, width, height, channels, timestamp)
 | K1Odometry | pose, velocity | WorldCoord, SpatialEngine | Thread-safe getter |
 | WorldCoord | world positions | WebServer, SystemController | Thread-safe getter |
 | IMUHandler | IMUExternalPose | SpatialEngine | Function call parameter |
+| TcnActionPredictor | ActionResult | InferencePipeline | Async get_latest (mutex-protected) |
+| FaceGallery | gallery JSON | WebServer | face_gallery_build_json() (mutex-protected) |
 | SystemController | vis_buffer (uint8_t*) | VideoWriter | Function call parameter |
 | SystemController | frame_json | WebServer | web_server_push_frame() ring buffer |
 
@@ -409,14 +441,16 @@ The K1 X60 processor has 8 cores divided into two clusters. The system enables a
 │                                                                    │
 │  CPU 1: Inference Thread                                          │
 │    RingBuffer[slot].rgb → YOLOv8-Pose → face detect → ArcFace    │
-│    → ST-GCN dispatch → RingBuffer[slot].inference                 │
+│    → TCN dispatch (async) → RingBuffer[slot].inference            │
 │                                                                    │
 │  CPU 0: PostProcess Thread                                        │
 │    RingBuffer[slot].inference → tracking → spatial → WorldCoord  │
 │    → serialize JSON → WebServer ring buffer → release slot        │
 │                                                                    │
-│  CPU 2: OpenMP worker / spare                                     │
-│  CPU 3: OpenMP worker                                             │
+│  CPU 2: OpenMP worker                                              │
+│  CPU 3: TCN async prediction thread (needs RVV, INT8+EP, ~6ms)   │
+│         ⚠ MUST stay on Cluster0 — Cluster1 causes SIGILL in      │
+│           ORT MLAS RVV kernels                                    │
 └────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────── Cluster1 (I/O, cores 4-7) ────────────────────┐
@@ -458,6 +492,7 @@ Slot acquisition and release adopt a **producer-consumer model** with `pthread_m
 | **Frame Assembly Buffer** | CoAP Block2 data assembled in 128KB dynamic buffer | Realloc on large frames, zero-copy output |
 | **Frame Data Heap Allocation** | FrameData malloc'd in video_processor, freed in controller | Clear ownership transfer |
 | **WebSocket Ring Buffer** | 32-slot lock-protected ring buffer for frame JSON | PostProcess → WebServer thread |
+| **TCN Pre-allocated Tensor** | Single float* buffer allocated at model load, reused per inference | Eliminates per-frame malloc/free; split-lock design |
 
 ---
 
@@ -475,13 +510,14 @@ SystemController* system_controller_create(const char* config_path, const char* 
     // Step 4: Model file manager (validate model directory integrity)
     // Step 5: IMU handler (window_size=10, min_interval=0.01s, max_gap=0.1s)
     // Step 6: Frame differencing (adaptive frame skip)
-    // Step 7: Inference pipeline (YOLOv8-Pose + Face + ArcFace + ST-GCN)
+    // Step 7: Inference pipeline (YOLOv8-Pose + Face + ArcFace + 1D-TCN)
     // Step 8: Tracking manager (cascade matching + Hungarian + 7-state Kalman)
     // Step 9: Spatial engine (pinhole model + anatomical depth sampling)
     // Step 10: K1 odometry (INS+ZUPT EKF, if K1 IMU available)
     // Step 11: World coordinate system (adaptive anchors)
     // Step 12: Result manager (session tracking, JSON/CSV export)
-    // Step 13: Web server (Mongoose HTTP+WebSocket, if GUI/--web mode)
+    // Step 13: Face gallery (time-windowed face thumbnail collection)
+    // Step 14: Web server (Mongoose HTTP+WebSocket, if GUI/--web mode)
 }
 ```
 
@@ -501,9 +537,9 @@ IDLE ──→ STARTING ──→ RUNNING ──→ STOPPING ──→ IDLE
 
 Thread-safe with `pthread_mutex_t` + `pthread_cond_t` for blocking wait (`psm_wait_for`). Each transition records a timestamp and reason string for diagnostics.
 
-### 5.3 System Controller: Three-Mode Orchestration
+### 5.3 System Controller: Four-Mode Orchestration
 
-[system_controller.c](src/system_controller.c) orchestrates three run modes:
+[system_controller.c](src/system_controller.c) orchestrates four run modes:
 
 #### GUI Mode (Default)
 ```
@@ -524,6 +560,7 @@ system_controller_process_realtime_k1():
   → Spawn Capture thread (CPU4)
   → Spawn Inference thread (CPU1)
   → Spawn PostProcess thread (CPU0)
+  → Spawn TCN async thread (CPU3)
   → Spawn Viz thread (CPU6)
   → Terminal UI status line updates
 ```
@@ -539,10 +576,25 @@ for each frame in video:
     6. associate_poses_with_objects()              → IoU match
     7. associate_faces_with_objects()              → IoU match
     8. world_coord_register_person()               → World coordinates
-    9. visualizer_render_detection_view()          → vis_buffer
-    10. video_writer_write_frame()                 → Output AVI
-    11. FPS statistics + TUI progress update
-    12. frame_data_destroy()
+    9. face_gallery_update()                       → Gallery thumbnail
+   10. visualizer_render_detection_view()          → vis_buffer
+   11. video_writer_write_frame()                  → Output AVI
+   12. FPS statistics + TUI progress update
+   13. frame_data_destroy()
+```
+
+#### Benchmark Mode (`--benchmark`)
+```
+benchmark_run():
+  → Initialize ONNX Runtime environment
+  → For each model (filtered by --benchmark-model):
+      1. Create session + inference context
+      2. Warmup runs (5 iterations, discarded)
+      3. Timed runs (30 iterations default, configurable via --benchmark-runs)
+      4. Compute statistics: min/max/mean/median/stddev/P95/CI95
+      5. Detect thermal throttling (|mean - median| / median > 2%)
+  → Optional pipeline profile (--benchmark-video PATH)
+  → Print paper-ready ASCII tables
 ```
 
 ### 5.4 Inference Pipeline: Cascaded AI Model Execution
@@ -554,16 +606,18 @@ Pipeline Stage                    Model                    Frequency         Bac
 ────────────────────────────────────────────────────────────────────────────────────
 1. Frame Differencing            MAD grid comparison      Every frame       CPU (0.2ms)
 2. Person Detection + Pose       YOLOv8-Pose (PRIMARY)    Every frame       SpacemiT EP
-3. Face Detection                YOLOv5-Face              Every 5 frames*   SpacemiT EP
+3. Face Detection                YOLOv5-Face              Every ~5 frames*  SpacemiT EP (IO Binding)
 4. Face Recognition              ArcFace                  Per detected face SpacemiT EP
-5. Action Recognition            ST-GCN                   Every 15 frames   SpacemiT EP
+5. Action Recognition            1D-TCN (PRIMARY)         Every 5 frames†   SpacemiT EP
+6. Action Recognition (legacy)   ST-GCN                   Every 15 frames   CPU EP
 ```
 
 *Face detection runs every 5 frames when people are detected, every 60 frames otherwise.
+†1D-TCN inference runs every 5 pose frames (~0.5s at 10 FPS), async on dedicated thread.
 
 #### 5.4.1 YOLOv8-Pose Unified Detection + Pose Estimation
 
-The PRIMARY model performs BOTH person detection AND 17-keypoint COCO pose estimation in a single forward pass. This eliminates the separate YOLO11n secondary detector, saving ~150ms/frame and one TCM slot.
+The PRIMARY model performs BOTH person detection AND 17-keypoint COCO pose estimation in a single forward pass. This eliminates the need for a separate person detector model, saving ~150ms/frame and one TCM slot. YOLO11n-pose is available as an alternative pose model variant (selectable via `--pose-model yolo11n-pose`).
 
 **xquant-split Format Decoding**: SpacemiT's INT8 quantization splits the model output into per-stride groups, each containing:
 - DFL regression head [1, 64, H, W] — 4 coordinates × 16 distribution bins
@@ -594,9 +648,38 @@ for each detected_face:
     // 128-dimensional feature vector → cosine similarity matching
 ```
 
-#### 5.4.3 ST-GCN Action Recognition
+#### 5.4.3 1D-TCN Action Recognition (v2.7 PRIMARY)
 
-ST-GCN processes skeleton sequences using spatial-temporal graph convolutions. The INT8 model accepts NTU-RGB+D standard format: 300 frames, 25 keypoints, 2 persons. Keypoint count is auto-converted from COCO-17 to NTU-25 format. Inference runs every ~15 pose frames (≈1.5s at 10 FPS).
+[tcn_action_predictor.c](src/tcn_action_predictor.c) implements 1D Temporal Convolutional Network action recognition — the PRIMARY action model replacing ST-GCN:
+
+```
+Architecture:
+  Model: 1D-TCN_Skeleton_INT8.onnx (INT8 quantized, SpacemiT EP accelerated)
+  Input:  [1, C=3, T=300, V=18] — 300 frames, 18 OpenPose keypoints, 3 channels (x, y, conf)
+  Output: [1, 400] — 400 action class scores
+  Latency: ~6ms (INT8+EP) vs ~400ms (ST-GCN CPU EP) — ~60× speedup
+
+Keypoint Mapping: COCO-17 → OpenPose-18
+  - Direct 1:1 mapping for most joints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles)
+  - Neck (OpenPose-1) synthesized as midpoint of left+right shoulders
+  - Unused COCO joints left at (0,0,0)
+
+Fast-Start Frame Replication:
+  - Default min_frames=30 (~2s at 16 FPS): starts predicting after 30 frames
+  - Available frames replicated to fill 300-frame window (t_src = t_dst % valid_frames)
+  - When buffer reaches 300 frames, 1:1 mapping (no replication)
+  - Avoids zero-padding which produces garbage predictions
+
+Async Prediction API (split-lock design):
+  Phase 1 (under mutex, ~1ms): Copy skeleton_buffer → prealloc tensor
+  Phase 2 (no lock, ~6ms):    ORT Run() on prealloc tensor
+  Phase 3 (result_mutex):     Store latest result, set has_new_action flag
+
+Thread model (K1 pipeline):
+  - Push: Inference thread (CPU1) calls push_pose() each frame
+  - Predict: TCN async thread (CPU3, Cluster0) calls run_async() every 5 frames
+  - Read: PostProcess thread (CPU0) calls get_latest() for output
+```
 
 #### 5.4.4 Adaptive Cascade State Machine
 
@@ -664,7 +747,7 @@ F = [[1, 0, 0, 0, dt, 0,  0 ],
 
 The tracker uses cascade matching (grouping tracks by time-since-update, matching freshest first) with the Kuhn-Munkres Hungarian algorithm for optimal global assignment. The cost matrix combines:
 - **IoU (80% weight)**: Spatial overlap between predicted and detected boxes
-- **Appearance (20% weight)**: Cosine distance between feature vectors
+- **Appearance (20% weight)**: Cosine distance between feature vectors (when enabled; default disabled for pure IoU ByteTrack)
 
 #### 5.6.3 Key Features
 
@@ -751,13 +834,71 @@ where:
 - Moving K1: slow momentum update (α=0.15) for smooth anchor tracking
 - Person timeout: 60s after last sighting
 
-### 5.10 Madgwick AHRS Filter
+### 5.10 Face Gallery (v2.7)
 
-[madgwick_filter.c](src/madgwick_filter.c) (in `src/` via IMU handler) implements the Madgwick orientation filter, fusing accelerometer, gyroscope, and magnetometer data to estimate device attitude with a single tunable parameter β=0.08.
+[face_gallery.c](src/face_gallery.c) maintains a thread-safe, time-windowed collection of detected face thumbnails with recognition results:
 
-### 5.11 CoAP/UDP Communication Protocol
+```
+Data Structure:
+  FaceGalleryEntry[256] entries, each containing:
+    - track_id (primary dedup key)
+    - identity string + similarity score
+    - 128-dim L2-normalized feature vector
+    - Bounding box in image coordinates
+    - JPEG thumbnail (max 8192 bytes, 112×112 crops)
+    - Last-seen timestamp (ms) + active flag
 
-#### 5.11.1 Endpoints
+Deduplication Strategy (3-tier):
+  1. Track-ID key: same track → update in place (latest thumbnail wins)
+  2. Identity merge: same identity across track_ids → keep highest similarity
+  3. Time-based expiry: entries older than TTL (default 60s) pruned
+
+Thread Safety:
+  - Updated from push_frame_to_web() in viz thread (face crop extraction)
+  - Read by gallery_broadcast_timer_fn() in mongoose server thread
+  - All operations protected by internal pthread_mutex_t
+
+Web UI Integration:
+  - face_gallery_build_json() produces "type":"g" WebSocket message
+  - Thumbnails base64-encoded inline (no separate HTTP request needed)
+  - Clients render gallery panel with identity labels and age indicators
+```
+
+### 5.11 Benchmark Module (v2.7)
+
+[benchmark.c](src/benchmark.c) provides comprehensive model inference timing with paper-ready output:
+
+```
+Supported Models (6):
+  BM_MODEL_YOLOV8_POSE  — YOLOv8-Pose unified detection + pose
+  BM_MODEL_YOLO11N_POSE — YOLO11n-Pose alternative variant
+  BM_MODEL_YOLOV5_FACE  — YOLOv5-Face face detection
+  BM_MODEL_ARCFACE      — ArcFace feature extraction
+  BM_MODEL_STGCN        — ST-GCN action recognition (legacy, CPU EP)
+  BM_MODEL_TCN          — 1D-TCN action prediction (INT8+EP)
+
+Statistics per model:
+  - Warmup runs: 5 (discarded for cache/TCM warmup)
+  - Timed runs: 30 default (configurable via --benchmark-runs)
+  - Metrics: min, max, mean, median, stddev, P95 (nearest-rank), CI95
+  - Thermal throttling detection: |mean - median| / median > 2%
+  - EP detection: reports whether SpacemiT EP was actually used
+
+Pipeline E2E Profile (--benchmark-video PATH):
+  - Stage breakdown: capture, preprocess, inference (pose+face+arcface+tcn),
+    postprocess, tracking, spatial, render, total
+  - Per-frame timing collection over N frames
+
+Output: Formatted ASCII tables suitable for paper screenshots.
+```
+
+### 5.12 Madgwick AHRS Filter
+
+The Madgwick orientation filter is implemented inside [imu_handler.c](src/imu_handler.c), fusing accelerometer and gyroscope data to estimate device attitude with a single tunable parameter β=0.08. Two independent Madgwick filter instances run for dual-IMU fusion (K1 local + ESP32 remote), with a Wahba gravity-vector alignment step to unify their reference frames.
+
+### 5.13 CoAP/UDP Communication Protocol
+
+#### 5.13.1 Endpoints
 
 | Endpoint | Method | Direction | Content | Frequency |
 |---|---|---|---|---|
@@ -765,11 +906,11 @@ where:
 | `/imu` | GET | K1→ESP (poll) | JSON `{"ax":...,"ay":...,"az":...,"gx":...,"gy":...,"gz":...}` | 1 Hz |
 | `/servo` | PUT | K1→ESP (control) | JSON `{"angle": N}` (0=CCW, 90=STOP, 180=CW) | On demand |
 
-#### 5.11.2 Block2 Transfer
+#### 5.13.2 Block2 Transfer
 
 JPEG frames transmitted using CoAP Block2 (RFC 7959) block-wise transfer with adaptive pacing (4-12 blocks/tick, 0-2ms inter-block gap).
 
-### 5.12 Web UI System
+### 5.14 Web UI System
 
 [web_server.c](src/web_server.c) + [web/index.html](web/index.html) provide a complete browser-based control interface:
 
@@ -780,8 +921,8 @@ JPEG frames transmitted using CoAP Block2 (RFC 7959) block-wise transfer with ad
 │  (Three.js)  │                    │   HTTP+WS    │
 │              │   WebSocket /ws    │   Server     │
 │  3D Render   │◄──────────────────►│  (pthread)   │
-└──────────────┘                    └──────┬───────┘
-                                           │
+│ +Gallery     │                    └──────┬───────┘
+└──────────────┘                           │
                               Frame JSON ring buffer
                               (32 slots, mutex-protected)
                                            │
@@ -794,11 +935,13 @@ JPEG frames transmitted using CoAP Block2 (RFC 7959) block-wise transfer with ad
 - Pipeline start/stop control from browser
 - Real-time WebSocket frame streaming (JSON + binary JPEG)
 - 3D world-coordinate visualization (Three.js)
+- Face gallery panel with identity labels and age indicators
+- Servo pan/tilt control via Web UI buttons
 - Bounding box + skeleton overlay on video
 - Status indicators (WebSocket connection, pipeline state, FPS)
 - Ceramic-white design system, Chinese localization
 
-### 5.13 Terminal UI System
+### 5.15 Terminal UI System
 
 [terminal_ui.c](src/terminal_ui.c) provides a rich CLI interface with automatic TTY/CI/pipe detection:
 
@@ -810,7 +953,7 @@ JPEG frames transmitted using CoAP Block2 (RFC 7959) block-wise transfer with ad
 
 **UI Components**: Banner, section headers, checklist spinners (model loading), progress bars (offline video), status lines (realtime mode), key-value pairs, intro/outro summaries.
 
-### 5.14 Visualization Rendering Pipeline
+### 5.16 Visualization Rendering Pipeline
 
 CPU-based 2D rendering (in `system_controller.c` and related modules):
 - Bounding boxes: Bresenham line algorithm ×4 edges, variable line width
@@ -820,7 +963,7 @@ CPU-based 2D rendering (in `system_controller.c` and related modules):
 - Top-down view: Spatial position projection on overhead map
 - Colors: 8-track rotating color palette (configurable)
 
-### 5.15 SpacemiT Execution Provider Call Chain
+### 5.17 SpacemiT Execution Provider Call Chain
 
 ```
 ort_global_init()
@@ -913,6 +1056,10 @@ cmake --build build -j$(nproc)
 |---|---|---|---|
 | `--video PATH` | string | — | Offline video file processing (CLI mode) |
 | `--realtime` | flag | false | K1 dual-cluster realtime pipeline (CLI mode) |
+| `--benchmark` | flag | false | Model inference benchmark (paper-ready tables) |
+| `--benchmark-model N` | string | `all` | Filter: yolo\|pose\|face\|arcface\|tcn\|stgcn\|all |
+| `--benchmark-runs N` | int | `30` | Timed iterations per model |
+| `--benchmark-video P` | string | — | Video file for pipeline E2E profiling |
 | `--web [PORT]` | int | 8080 | Web UI port (implied in GUI mode) |
 | `--config PATH` | string | `configs/default.yaml` | YAML configuration file |
 | `--output PATH` | string | `output` | Output directory |
@@ -950,6 +1097,12 @@ cmake --build build -j$(nproc)
 
 # With custom pose model variant
 ./lingqi_tantong --video test.mp4 --pose-model yolo11n-pose
+
+# Benchmark mode
+./lingqi_tantong --benchmark                                    # All models, 30 runs each
+./lingqi_tantong --benchmark --benchmark-model tcn              # TCN only
+./lingqi_tantong --benchmark --benchmark-runs 50                # 50 runs per model
+./lingqi_tantong --benchmark --benchmark-video test_video.mp4   # + pipeline E2E profile
 ```
 
 ### 6.6 systemd Service Deployment (Production)
@@ -984,17 +1137,20 @@ Models must be placed in the `models/` directory with this structure:
 
 ```
 models/
-├── Human Recognition/
-│   └── yolo11n.q.onnx                          # YOLO11n secondary detector (optional)
-├── Face Recognition/
-│   ├── yolov5n-face_320_cut.q.onnx             # YOLOv5-Face face detection (INT8)
-│   └── arcface_mobilefacenet_cut.q.onnx        # ArcFace feature extraction (INT8)
-└── Action Prediction/
-    ├── Skeleton Recognition/
-    │   ├── yolov8n-pose.q.onnx                 # YOLOv8-Pose PRIMARY (INT8)
-    │   └── yolo11n-pose.q.onnx                 # YOLO11n-Pose alternative (INT8)
-    └── Skeleton-based Action Prediction/
-        └── stgcn_int8.onnx                     # ST-GCN action recognition (INT8)
+├── Action Prediction/
+│   ├── Object Detection/
+│   │   └── yolov11n_320x320.q.onnx               # YOLO11n object detector (optional, INT8, disabled in unified mode)
+│   ├── Skeleton Recognition/
+│   │   ├── yolov8n-pose.q.onnx                   # YOLOv8-Pose PRIMARY detection+pose (INT8)
+│   │   └── yolo11n-pose.q.onnx                   # YOLO11n-Pose alternative variant (INT8)
+│   └── Skeleton-based Action Prediction/
+│       ├── 1D-TCN_Skeleton_INT8.onnx             # 1D-TCN PRIMARY action recognition (INT8+EP)
+│       ├── stgcn_int8.onnx                       # ST-GCN legacy action recognition (CPU EP)
+│       └── stgcn.fp32.onnx                       # ST-GCN FP32 variant (development/testing)
+└── Face Recognition/
+    ├── yolov5n-face_320_cut.q.onnx               # YOLOv5-Face face detection (INT8)
+    ├── yolov5n-face_cut.q.onnx                   # YOLOv5-Face face detection (INT8, legacy)
+    └── arcface_mobilefacenet_cut.q.onnx          # ArcFace feature extraction (INT8)
 ```
 
 ---
@@ -1032,6 +1188,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `camera_fps` | float | `15.0` | Capture frame rate |
 | `camera_format` | string | `MJPEG` | Capture pixel format |
 | `camera_buffer_count` | int | `4` | V4L2 buffer count |
+| `capture_min_interval_ms` | int | `0` | Min interval between captures (0=disabled) |
 | `save_frame_interval` | int | `1` | Output video save interval |
 
 #### 7.2.3 CoAP `coap`
@@ -1045,20 +1202,35 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `wifi_password` | string | `12345678` | WiFi password |
 | `frame_timeout_s` | int | `10` | Auto-exit after N seconds idle |
 
-#### 7.2.4 Detection `detection`
+#### 7.2.4 Servo `servo`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `step_deg` | int | `3` | Step angle per button press |
+| `tick_ms` | int | `40` | Hold-to-repeat interval (ms) |
+| `center_deg` | int | `90` | Center/stop angle |
+| `servo_h` | int | `0` | Horizontal servo GPIO pin |
+| `servo_v` | int | `1` | Vertical servo GPIO pin |
+
+#### 7.2.5 Detection `detection`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `backend` | string | `ai_accel` | Inference backend |
+| `model_path` | string | `""` | Secondary detector path (empty=disabled in unified mode) |
 | `confidence_threshold` | float | `0.12` | Detection confidence threshold |
 | `iou_threshold` | float | `0.40` | NMS IoU threshold |
 | `input_size` | int[2] | `[640, 640]` | Model input size |
-| `cascade_enabled` | bool | `false` | Enable cascade state machine |
+| `cascade_enabled` | bool | `true` | Enable cascade state machine |
 | `cascade_validation_interval` | int | `15` | Full-check interval |
+| `cascade_secondary_interval` | int | `5` | Periodic full-detection check interval in TRACKING mode |
 | `keypoint_min_count` | int | `2` | Minimum visible keypoints |
 | `keypoint_min_confidence` | float | `0.05` | Keypoint confidence floor |
+| `fallback_confidence` | float | `0.08` | Confidence threshold for DFL-only detection |
+| `face_new_person_delay` | int | `3` | Delay face check N frames after new person |
+| `face_motion_skip_threshold` | float | `0.40` | Skip face detection when frame change > ratio |
 
-#### 7.2.5 Pose `pose`
+#### 7.2.6 Pose `pose`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1070,28 +1242,36 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `num_keypoints` | int | `17` | COCO keypoint count |
 | `skeleton_type` | string | `coco` | Keypoint layout |
 
-#### 7.2.6 Face `face`
+#### 7.2.7 Face `face`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `detection_backend` | string | `ai_accel` | Face detection backend |
 | `recognition_backend` | string | `ai_accel` | Face recognition backend |
-| `confidence_threshold` | float | `0.50` | Face detection threshold |
-| `similarity_threshold` | float | `0.55` | Identity matching threshold |
+| `confidence_threshold` | float | `0.30` | Face detection threshold (lowered for INT8 recall) |
+| `similarity_threshold` | float | `0.45` | Identity matching threshold |
 | `input_size` | int[2] | `[320, 320]` | Face detection input |
 | `embedding_dim` | int | `128` | ArcFace feature vector dimension |
+| `use_ep` | bool | `true` | Enable SpacemiT EP (IO Binding) |
+| `face_min_size` | int | `24` | Minimum face size in pixels |
 | `liveness_detection` | bool | `false` | Anti-spoofing |
 
-#### 7.2.7 Action `action`
+#### 7.2.8 Action `action`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `true` | Enable action recognition |
 | `backend` | string | `ai_accel` | Inference backend |
+| `model_path` | string | `1D-TCN_Skeleton_INT8.onnx` | 1D-TCN model path (PRIMARY) |
+| `num_frames` | int | `300` | Temporal window (auto-detected from model) |
+| `num_keypoints` | int | `18` | OpenPose-18 keypoints (auto-detected) |
+| `num_persons` | int | `1` | Persons per sample (auto-detected) |
+| `num_classes` | int | `400` | Action class count (auto-detected from model) |
 | `confidence_threshold` | float | `0.50` | Action confidence threshold |
-| `inference_interval` | int | `15` | Run every N pose frames |
+| `inference_interval` | int | `5` | Run TCN every N pose frames |
+| `min_frames` | int | `30` | Minimum frames before fast-start prediction |
 
-#### 7.2.8 Tracking `tracking`
+#### 7.2.9 Tracking `tracking`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1106,13 +1286,19 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `reid_pool_max_age` | int | `60` | Re-ID pool retention |
 | `spatial_jump_max_m` | float | `5.0` | Max position jump (meters) |
 | `new_person_grace_frames` | int | `1` | New person confirmation delay |
+| `cascade_max_age` | int | `30` | Cascade matching max age |
+| `cascade_min_hits` | int | `1` | Cascade matching min hits |
+| `upper_body_min_keypoints` | int | `3` | Upper-body fallback threshold |
+| `side_body_min_keypoints` | int | `2` | Side-body fallback threshold |
 
-#### 7.2.9 Spatial Localization `spatial`
+#### 7.2.10 Spatial Localization `spatial`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `fx` | float | `650.0` | Horizontal focal length |
 | `fy` | float | `650.0` | Vertical focal length |
+| `cx` | float | `320.0` | Principal point X |
+| `cy` | float | `240.0` | Principal point Y |
 | `avg_human_height` | float | `1.70` | Assumed average height (m) |
 | `min_depth` | float | `0.3` | Minimum depth (m) |
 | `max_depth` | float | `120.0` | Maximum depth (m) |
@@ -1121,7 +1307,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `depth_outlier_mad_mult` | float | `2.5` | MAD outlier multiplier |
 | `depth_min_keypoint_conf` | float | `0.25` | Min keypoint confidence for depth |
 
-#### 7.2.10 K1 IMU `k1_imu`
+#### 7.2.11 K1 IMU `k1_imu`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1130,7 +1316,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `sample_rate_hz` | int | `100` | IMU sampling rate |
 | `calibration_samples` | int | `200` | Bias calibration samples |
 
-#### 7.2.11 Odometry `odometry`
+#### 7.2.12 Odometry `odometry`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1144,7 +1330,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `glrt_threshold` | float | `500.0` | GLRT statistic threshold |
 | `export_csv` | bool | `true` | Export trajectory CSV |
 
-#### 7.2.12 World Coordinates `world_coord`
+#### 7.2.13 World Coordinates `world_coord`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1156,7 +1342,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `anchor_motion_threshold` | float | `0.30` | Anchor motion detection (m) |
 | `anchor_moving_alpha` | float | `0.15` | Moving anchor momentum |
 
-#### 7.2.13 AR Render `ar_render`
+#### 7.2.14 AR Render `ar_render`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1165,7 +1351,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `show_k1_compass` | bool | `true` | Show K1 compass (yaw indicator) |
 | `show_k1_speed` | bool | `true` | Show K1 speed bar (km/h) |
 
-#### 7.2.14 Frame Differencing `frame_diff`
+#### 7.2.15 Frame Differencing `frame_diff`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1180,7 +1366,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `max_low_motion_skip` | int | `5` | Max skips in low-motion |
 | `force_process_every` | int | `30` | Force inference every N frames |
 
-#### 7.2.15 Visualization `visualization`
+#### 7.2.16 Visualization `visualization`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1197,8 +1383,12 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `show_depth` | bool | `true` | Depth values |
 | `show_imu_overlay` | bool | `true` | IMU data overlay |
 | `record_to_video` | bool | `true` | Save output video |
+| `video_output_path` | string | `output/realtime_output.mp4` | Output video path |
+| `rtsp_enabled` | bool | `false` | RTSP streaming (via --rtsp) |
+| `rtsp_url` | string | `rtsp://0.0.0.0:8554/live` | RTSP URL |
+| `colors` | array | 8 RGB triples | Per-track color palette |
 
-#### 7.2.16 K1 Hardware `k1_hardware`
+#### 7.2.17 K1 Hardware `k1_hardware`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1217,7 +1407,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `pipeline.viz_thread_cpu` | int | `6` | Viz thread core |
 | `power.governor` | string | `performance` | CPU frequency governor |
 
-#### 7.2.17 Performance `performance`
+#### 7.2.18 Performance `performance`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1227,6 +1417,9 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `pipeline_pin_to_core` | bool | `true` | Thread core pinning |
 | `realtime_scheduling` | bool | `true` | SCHED_FIFO scheduling |
 | `rt_priority` | int | `50` | Real-time priority |
+| `inference_core` | int | `1` | Inference thread core |
+| `visualization_core` | int | `2` | Legacy visualization core |
+| `imu_core` | int | `0` | IMU processing core |
 
 ---
 
@@ -1254,6 +1447,7 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | `Cannot open /dev/tcm: Permission denied` | IME device permissions | `sudo chmod 777 /dev/tcm` |
 | `CoAP receive timeout` | ESP32 WiFi disconnected | Check ESP32 AP, K1 WiFi connection |
 | `SIGBUS on K1` | Misaligned vector instruction (GCC <15 + X60) | Use Clang, or disable `-ftree-vectorize` |
+| `SIGILL in ORT MLAS RVV kernel` | TCN thread on Cluster1 | Ensure TCN runs on Cluster0 (CPU3) |
 | `Web UI: failed to start on port` | Port already in use | Use `--web 9000` for alternative port |
 
 ### 8.3 Performance Issues
@@ -1265,6 +1459,8 @@ The system uses a YAML-style key-value configuration file ([configs/default.yaml
 | Memory growing | `htop` RSS monitor | Check FrameData destroy per frame |
 | IMU attitude jitter | Adjust Madgwick `beta` | Lower β to 0.04-0.06 |
 | ZUPT never fires | Check GLRT threshold | Lower to 500 (was 300,000 in earlier versions) |
+| TCN returns empty results | Skeleton buffer not full | Check buffer_fill count; lower min_frames to 30 |
+| ST-GCN >400ms inference | Graph conv not IME-supported | Switch to 1D-TCN for EP acceleration |
 
 ### 8.4 Frequently Asked Questions
 
@@ -1278,11 +1474,23 @@ A: GCC <15 on X60 may emit misaligned vector load/store instructions that cause 
 
 **Q: What is the TCM allocation strategy?**
 
-A: K1 Cluster0 has 512KB shared TCM. With `spacemit_ep_intra_threads=1` (~170KB per EP session), the system fits 3 EP models: YOLOv8-Pose, YOLOv5-Face, and ArcFace (total ~510KB). ST-GCN uses CPU EP (FP32, not quantized).
+A: K1 Cluster0 has 512KB shared TCM. With `spacemit_ep_intra_threads=1` (~170KB per EP session), the system fits 3 EP models: YOLOv8-Pose, YOLOv5-Face, and ArcFace (total ~440KB). 1D-TCN runs on the same TCM (~100KB) via shared EP, fitting within the 512KB budget.
 
 **Q: How does the DFL peakiness confidence work?**
 
 A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (all sigmoid outputs ≈0.5). Instead, the system computes the ratio of the max DFL bin value to the mean across all 16 bins. A peaked distribution (one bin much higher than others) indicates a confident bounding box regression, which serves as a proxy for detection confidence.
+
+**Q: Why 1D-TCN instead of ST-GCN?**
+
+A: ST-GCN uses graph convolution operators which are NOT supported by SpacemiT IME hardware, forcing CPU EP fallback (~400ms/inference). 1D-TCN uses standard Conv1D operators which ARE supported by IME, enabling INT8 hardware acceleration (~6ms/inference) — a ~60× speedup. Additionally, 1D-TCN supports 400 action classes vs ST-GCN's 7.
+
+**Q: Why does TCN run on Cluster0 (CPU3) and not Cluster1?**
+
+A: ORT MLAS RVV kernels rely on RISC-V Vector instructions which are only available on Cluster0 cores (CPUs 0-3). Running TCN inference on Cluster1 (CPUs 4-7) triggers SIGILL. This was discovered during testing and fixed in v2.7.
+
+**Q: How does the benchmark mode work?**
+
+A: `--benchmark` runs warmup (5 iterations, discarded) + timed inference (30 iterations default) on each model. It reports min/max/mean/median/stddev/P95/CI95, detects thermal throttling, and indicates whether SpacemiT EP was actually used. Add `--benchmark-video PATH` for end-to-end pipeline stage breakdown.
 
 ---
 
@@ -1290,14 +1498,15 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 
 ### 9.1 Expected Performance (K1 X60 + SpacemiT EP 2.0.2)
 
-| Model | CPU-only (FP32) | SpacemiT EP (INT8) |
-|---|---|---|
-| YOLOv8-Pose (480×480) | ~800ms | **~100ms** |
-| YOLOv5-Face (320×320) | ~300ms | **~40ms** |
-| ArcFace (112×112) | ~100ms | **~15ms** |
-| ST-GCN (300 frames) | ~200ms | **~60ms** |
+| Model | CPU-only (FP32) | SpacemiT EP (INT8) | Speedup |
+|---|---|---|---|
+| YOLOv8-Pose (480×480) | ~800ms | **~100ms** | 8× |
+| YOLOv5-Face (320×320) | ~300ms | **~40ms** | 7.5× |
+| ArcFace (112×112) | ~100ms | **~15ms** | 6.7× |
+| 1D-TCN (300 frames, INT8) | ~200ms | **~6ms** | 33× |
+| ST-GCN (300 frames, CPU EP only) | ~400ms | N/A (graph conv unsupported) | — |
 
-> **Note**: These are estimates based on similar RISC-V platforms. The INT8→FP32 speedup is expected to be 3-5× due to IME matrix instruction optimizations for INT8.
+> **Note**: 1D-TCN benefits dramatically from IME because Conv1D is a first-class citizen of the IME instruction set. ST-GCN's graph convolutions cannot use IME at all. Model auto-detection of input shapes at load time ensures correct dimensions regardless of quantization artifacts.
 
 ### 9.2 Memory Usage Analysis
 
@@ -1305,22 +1514,28 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 |---|---|---|
 | Frame buffer (640×480×3) | ~0.9 MB | Single frame RGB |
 | CoAP assembly buffer | ~0.13 MB | 128KB Block2 reassembly |
-| Tracker (40 targets × ~3.5KB) | ~0.14 MB | Including Kalman state |
-| Trajectory history (40 × 60 points) | ~0.03 MB | SpatialPosition |
+| Tracker (64 targets × ~3.5KB) | ~0.22 MB | Including Kalman state |
+| Trajectory history (64 × 60 points) | ~0.05 MB | SpatialPosition |
+| TCN pre-allocated tensor (3×300×18×2) | ~0.13 MB | Reused per inference, 2-person buffer |
+| Face gallery (256 entries × ≤10KB) | ~2.5 MB | Including JPEG thumbnails |
 | ONNX Runtime (4 models loaded) | ~400-600 MB | Runtime peak |
 | **Total (estimated peak)** | **< 800 MB** | Within K1 4GB constraint |
 
 ### 9.3 Optimization Strategies
 
-1. **Model INT8 Quantization** (Highest Priority): SpacemiT EP's IME instructions provide 3-5× acceleration for INT8 models. Use SpacemiT's xquant tool for quantization.
+1. **Model INT8 Quantization** (Highest Priority): SpacemiT EP's IME instructions provide 3-33× acceleration for INT8 models. Use SpacemiT's xquant tool for quantization. 1D-TCN benefits most due to native Conv1D support.
 
 2. **Adaptive Frame Skip**: Frame differencing saves ~150ms per skipped frame at ~0.2ms cost. STATIC scenes achieve up to 10× effective throughput.
 
-3. **Unified Detection+Pose**: Using YOLOv8-Pose as PRIMARY eliminates the separate YOLO11n secondary detector, saving one full EP inference (~100ms) and one TCM slot per frame.
+3. **Unified Detection+Pose**: Using YOLOv8-Pose as PRIMARY eliminates the need for a separate person detector model, saving one full EP inference (~100ms) and one TCM slot per frame.
 
-4. **K1 Thread Core Binding**: Pinning threads to specific cores (described in config) maximizes cache locality and minimizes cross-cluster traffic.
+4. **TCN Split-Lock Async Prediction**: Phase 1 (copy, ~1ms under mutex) + Phase 2 (ORT inference, ~6ms no lock). Push and predict run concurrently without contention.
 
-5. **System-Level Tuning**:
+5. **K1 Thread Core Binding**: Pinning threads to specific cores (described in config) maximizes cache locality and minimizes cross-cluster traffic. TCN on Cluster0 CPU3 avoids Cluster1 SIGILL.
+
+6. **Pre-allocated Buffers**: TCN input tensor, face ROI/crop buffers, and inference context memory are all pre-allocated at model load time — zero per-frame malloc/free.
+
+7. **System-Level Tuning**:
    ```bash
    sudo chmod 777 /dev/tcm
    sudo cpufreq-set -g performance
@@ -1341,7 +1556,7 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 
 4. **AVI Video Output Uncompressed**: Raw RGB24 format generates ~800MB/min at 640×480@15fps. K1 VPU H.264/H.265 hardware encoding integration would dramatically reduce file sizes.
 
-5. **ATW Not GPU-Accelerated**: Asynchronous Time Warp currently performs O(W×H) per-pixel transforms on CPU (>200ms at 1080p), far exceeding the MTP ≤17.8ms threshold.
+5. **ST-GCN Cannot Use IME**: Graph convolution operators are unsupported by SpacemiT IME hardware. ST-GCN permanently runs on CPU EP (~400ms/inference). The 1D-TCN migration resolves this for action recognition, but any future graph-conv models face the same limitation.
 
 6. **No Visual-Inertial Odometry**: When the K1 camera moves, target world coordinates experience drift without VINS-Mono style visual-inertial bundle adjustment.
 
@@ -1349,14 +1564,17 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 
 8. **WiFi Range Limitation**: ESP32 ↔ K1 uses CoAP/UDP over WiFi. Longer-range radio links (LoRa, UART direct) not implemented.
 
+9. **TCN Class Taxonomy Partial**: Only 60 of 400 classes have human-readable names (NTU-RGB+D common subset). Remaining 340 classes display as `action_N`.
+
 ### 10.2 Development Roadmap
 
-#### v2.6 (Near-term)
+#### v2.8 (Near-term)
 - [ ] K1 hardware benchmarking (`onnxruntime_perf_test -e spacemit`)
 - [ ] EP vs CPU-only real-world comparison report
 - [ ] RVV hand-written vectorization: letterbox, NMS, matrix multiply critical paths
 - [ ] JPU hardware JPEG decode integration for Arrow UART frames
 - [ ] Web UI 3D skeleton rendering in world coordinate view
+- [ ] Complete TCN class name taxonomy (400 classes)
 
 #### v3.0 (Mid-term)
 - [ ] VINS-Mono visual-inertial odometry (IMU pre-integration + sliding window BA)
@@ -1381,6 +1599,7 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 | ESP32 WiFi congestion at high FPS | Medium | Block2 packet loss | Lower JPEG quality, increase block pacing |
 | K1 4GB memory insufficient for all models | Low | System OOM | Model lazy loading, LRU eviction |
 | TCM allocation failure with 4 EP models | Medium | EP session creation fails | Limit to 3 EP models, FP32 fallback for 4th |
+| ORT MLAS SIGILL on Cluster1 | Medium | TCN thread crash | Pin TCN to Cluster0 (CPU3); add runtime core check |
 
 ---
 
@@ -1401,12 +1620,14 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 11. Bewley, A., et al. (2016). Simple Online and Realtime Tracking. *ICIP 2016*.
 12. Wojke, N., Bewley, A., & Paulus, D. (2017). Simple Online and Realtime Tracking with a Deep Association Metric. *ICIP 2017*.
 13. Zhang, Y., et al. (2022). ByteTrack: Multi-Object Tracking by Associating Every Detection Box. *ECCV 2022*.
-14. Mahony, R., Hamel, T., & Pflimlin, J. M. (2008). Nonlinear Complementary Filters on the Special Orthogonal Group. *IEEE TAC*, 53(5).
-15. Madgwick, S. O. H., Harrison, A. J. L., & Vaidyanathan, R. (2011). Estimation of IMU and MARG orientation using a gradient descent algorithm. *ICORR 2011*.
-16. Skog, I., et al. (2010). Zero-Velocity Detection — An Algorithm Evaluation. *IEEE TBME*, 57(11).
-17. Black, H. (1964). A Passive System for Determining the Attitude of a Satellite. *AIAA Journal*, 2(7). [TRIAD algorithm]
-18. Ilyas, M., et al. (2016). Drift Reduction in Pedestrian Navigation. *Sensors*, 16(5). [Yaw unobservability in ZUPT EKF]
-19. Savage, P. G. (2000). *Strapdown Analytics*. Strapdown Associates.
+14. Yan, S., Xiong, Y., & Lin, D. (2018). Spatial Temporal Graph Convolutional Networks for Skeleton-Based Action Recognition. *AAAI 2018*.
+15. Lea, C., Flynn, M. D., Vidal, R., Reiter, A., & Hager, G. D. (2017). Temporal Convolutional Networks for Action Segmentation and Detection. *CVPR 2017*.
+16. Mahony, R., Hamel, T., & Pflimlin, J. M. (2008). Nonlinear Complementary Filters on the Special Orthogonal Group. *IEEE TAC*, 53(5).
+17. Madgwick, S. O. H., Harrison, A. J. L., & Vaidyanathan, R. (2011). Estimation of IMU and MARG orientation using a gradient descent algorithm. *ICORR 2011*.
+18. Skog, I., et al. (2010). Zero-Velocity Detection — An Algorithm Evaluation. *IEEE TBME*, 57(11).
+19. Black, H. (1964). A Passive System for Determining the Attitude of a Satellite. *AIAA Journal*, 2(7). [TRIAD algorithm]
+20. Ilyas, M., et al. (2016). Drift Reduction in Pedestrian Navigation. *Sensors*, 16(5). [Yaw unobservability in ZUPT EKF]
+21. Savage, P. G. (2000). *Strapdown Analytics*. Strapdown Associates.
 
 ### Technical Specifications and Standards
 
@@ -1431,45 +1652,48 @@ A: SpacemiT's xquant INT8 quantization destroys the YOLO classification head (al
 
 ```
 lingqi_tantong/
-├── include/                                   # Header files (32)
+├── include/                                   # Header files (35)
 │   ├── core_types.h                           #   Core data types: BBox, Detection, Pose, Face,
-│   │                                          #     TrackedObject, InferenceResult, etc.
+│   │                                          #     TrackedObject, InferenceResult, PipelineTiming, etc.
 │   ├── system_controller.h                    #   System main controller interface
 │   ├── pipeline_state.h                       #   5-state pipeline FSM (IDLE→STARTING→RUNNING→STOPPING→ERROR)
-│   ├── inference_pipeline.h                   #   AI inference pipeline (4-model cascade)
+│   ├── inference_pipeline.h                   #   AI inference pipeline (4-model cascade + cascade FSM)
 │   ├── tracking_manager.h                     #   ByteTrack-style multi-object tracking
 │   ├── spatial_engine.h                       #   3D spatial localization (pinhole model)
 │   ├── world_coord.h                          #   World coordinate system (K1 dynamic origin)
 │   ├── k1_odometry.h                          #   K1 INS+ZUPT EKF odometry
 │   ├── k1_imu.h                               #   K1 onboard IMU driver (ICM-20948, I²C)
-│   ├── k1_platform.h                          #   K1 platform detection + capability query
+│   ├── k1_platform.h                          #   K1 platform detection + capability query + TCM alloc
 │   ├── yolov8_pose_estimator.h                #   YOLOv8-Pose unified detection + 17-keypoint pose
 │   ├── yolov5_face_detector.h                 #   YOLOv5-Face face detection (320×320 INT8)
 │   ├── arcface_recognizer.h                   #   ArcFace face recognition (128-d embedding)
-│   ├── stgcn_action_recognizer.h              #   ST-GCN skeleton-based action recognition
+│   ├── stgcn_action_recognizer.h              #   ST-GCN skeleton-based action recognition (legacy, CPU EP)
+│   ├── tcn_action_predictor.h                 #   1D-TCN action prediction (PRIMARY, INT8+EP, 400-class)
 │   ├── yolo_postprocess.h                     #   YOLO output decoding (DFL, NMS, grid assembly)
 │   ├── keypoint_validator.h                   #   Keypoint anatomical validation (3-tier)
 │   ├── frame_diff.h                           #   Adaptive frame differencing (grid MAD)
 │   ├── video_processor.h                      #   Video frame reading (MP4/V4L2/CoAP)
 │   ├── video_writer.h                         #   AVI video output writing
-│   ├── imu_handler.h                          #   IMU data processing (sliding window smoothing)
-│   ├── coap_receiver.h                        #   CoAP/UDP receiver (Block2 JPEG + IMU poll)
+│   ├── imu_handler.h                          #   IMU data processing (sliding window smoothing + Madgwick)
+│   ├── coap_receiver.h                        #   CoAP/UDP receiver (Block2 JPEG + IMU poll + servo)
 │   ├── web_server.h                           #   Embedded HTTP+WebSocket server (Mongoose)
 │   ├── terminal_ui.h                          #   Terminal UI (3-mode: HUMAN/PLAIN/MACHINE)
+│   ├── face_gallery.h                         #   Face thumbnail gallery (time-windowed, identity dedup)
+│   ├── benchmark.h                            #   Benchmark module (6-model timing + pipeline profiling)
 │   ├── ort_common.h                           #   ONNX Runtime shared utilities
 │   ├── ort_inference_context.h                #   ONNX inference context wrapper
 │   ├── spacemit_ort_bridge.h                  #   SpacemiT EP C→C++ bridge
 │   ├── config_manager.h                       #   YAML configuration manager
 │   ├── logger.h                               #   Leveled logging (JSON format, thread-safe)
 │   ├── json_writer.h                          #   JSON document builder
-│   ├── utils.h                                #   Utility functions (timing, file I/O)
+│   ├── utils.h                                #   Utility functions (timing, file I/O, base64)
 │   ├── result_manager.h                       #   Session-level result management
 │   └── model_store.h                          #   ONNX model file discovery + validation
-├── src/                                       # Source files (32 C + 1 C++)
-│   ├── main.c                                 #   Program entry (CLI parsing, mode dispatch)
-│   ├── system_controller.c                    #   System controller (3-mode orchestration)
+├── src/                                       # Source files (35 C + 1 C++)
+│   ├── main.c                                 #   Program entry (CLI parsing, 4-mode dispatch)
+│   ├── system_controller.c                    #   System controller (4-mode orchestration)
 │   ├── pipeline_state.c                       #   5-state pipeline FSM implementation
-│   ├── inference_pipeline.c                   #   Cascaded AI inference (4 models)
+│   ├── inference_pipeline.c                   #   Cascaded AI inference (4 models: pose+face+arcface+tcn)
 │   ├── tracking_manager.c                     #   ByteTrack: cascade+Hungarian+Kalman
 │   ├── spatial_engine.c                       #   Monocular depth + 3D back-projection
 │   ├── world_coord.c                          #   World coordinate system + adaptive anchors
@@ -1479,7 +1703,8 @@ lingqi_tantong/
 │   ├── yolov8_pose_estimator.c                #   YOLOv8-Pose: DFL decode + OKS-NMS
 │   ├── yolov5_face_detector.c                 #   YOLOv5-Face: 320×320 INT8 face detection
 │   ├── arcface_recognizer.c                   #   ArcFace: MobileFaceNet-cuted embedding
-│   ├── stgcn_action_recognizer.c              #   ST-GCN: skeleton action classification
+│   ├── stgcn_action_recognizer.c              #   ST-GCN: skeleton action classification (legacy)
+│   ├── tcn_action_predictor.c                 #   1D-TCN: Conv1D action prediction (INT8+EP, async API)
 │   ├── yolo_postprocess.c                     #   Shared YOLO decode: DFL, NMS, grid assembly
 │   ├── keypoint_validator.c                   #   3-tier anatomical validation
 │   ├── frame_diff.c                           #   Grid-based MAD frame differencing
@@ -1487,58 +1712,79 @@ lingqi_tantong/
 │   ├── video_writer.c                         #   AVI file output (Raw RGB24)
 │   ├── imu_handler.c                          #   IMU sliding window + Madgwick filter
 │   ├── coap_receiver.c                        #   CoAP Block2 JPEG + IMU poll + WiFi mgmt
-│   ├── web_server.c                           #   Mongoose HTTP+WS: REST API + frame streaming
+│   ├── web_server.c                           #   Mongoose HTTP+WS: REST API + frame streaming + gallery
 │   ├── terminal_ui.c                          #   TUI: spinners, progress bars, status lines
+│   ├── face_gallery.c                         #   Face thumbnail DB: track-ID dedup, identity merge
+│   ├── benchmark.c                            #   Benchmark: 6-model timing + pipeline E2E profiling
 │   ├── ort_common.c                           #   ORT environment + session management
 │   ├── ort_inference_context.c                #   ORT inference context (memory planning)
 │   ├── spacemit_ort_bridge.cpp                #   C++ bridge: SessionOptionsSpaceMITEnvInit
 │   ├── config_manager.c                       #   Minimal YAML parser + key-value store
 │   ├── logger.c                               #   JSON-formatted leveled logger
 │   ├── json_writer.c                          #   JSON document builder (no allocation)
-│   ├── utils.c                                #   Time, file, string utilities
+│   ├── utils.c                                #   Time, file, string, base64 utilities
 │   ├── result_manager.c                       #   Session tracking + JSON/CSV export
 │   ├── model_store.c                          #   Model file discovery + validation
 │   └── core_types.c                           #   Data structure initializers
 ├── web/                                       # Web UI frontend (SPA)
-│   ├── index.html                             #   Ceramic-white design, pipeline control
-│   └── three.module.js                        #   Three.js ES module (3D rendering)
-├── lib/mongoose/                              # Embedded HTTP+WebSocket library
-│   └── mongoose.c                             #   Single-file networking library
+│   ├── index.html                             #   Ceramic-white design, pipeline control, face gallery
+│   ├── three.module.js                        #   Three.js ES module (3D rendering engine)
+│   ├── three.core.js                          #   Three.js core module
+│   ├── OrbitControls.js                       #   Three.js orbit camera controls
+│   ├── favicon.svg                            #   Site favicon
+│   └── icons.svg                              #   SVG icon sprites
+├── lib/mongoose/                              # Embedded HTTP+WebSocket library (v7.22)
+│   ├── mongoose.c                             #   Mongoose amalgamated source (~40,000 lines)
+│   └── mongoose.h                             #   Mongoose single-header API
 ├── cmake/                                     # CMake toolchain files
-│   └── riscv64-toolchain.cmake                #   RISC-V cross-compilation toolchain
+│   ├── riscv64-toolchain.cmake                #   RISC-V cross-compilation toolchain
+│   └── esp32p4-toolchain.cmake                #   ESP32-P4 cross-compilation toolchain
 ├── configs/
 │   └── default.yaml                           #   Full-parameter default configuration
 ├── models/                                    # ONNX model files
-│   ├── Human Recognition/
-│   │   └── yolo11n.q.onnx                     #   YOLO11n secondary detector (optional, INT8)
-│   ├── Face Recognition/
-│   │   ├── yolov5n-face_320_cut.q.onnx        #   YOLOv5-Face face detection (INT8)
-│   │   └── arcface_mobilefacenet_cut.q.onnx   #   ArcFace feature extraction (INT8)
-│   └── Action Prediction/
-│       ├── Skeleton Recognition/
-│       │   ├── yolov8n-pose.q.onnx            #   YOLOv8-Pose PRIMARY detection+pose (INT8)
-│       │   └── yolo11n-pose.q.onnx            #   YOLO11n-Pose alternative variant (INT8)
-│       └── Skeleton-based Action Prediction/
-│           └── stgcn_int8.onnx                #   ST-GCN action recognition (INT8)
-├── docs/                                      # Design documents
-│   ├── 核心算法详解.md                         #   Core algorithm detailed explanation
-│   ├── ARCHITECTURE.md                        #   Architecture design details
-│   ├── CODE_CHANGE_LOG.md                     #   Code change log
-│   ├── COMPREHENSIVE_PROJECT_DOCUMENTATION.md #   Comprehensive project documentation
-│   ├── MODEL_SPECIFICATION.md                 #   Model specification
-│   ├── K1_HARDWARE_OPTIMIZATION_PLAN.md       #   K1 hardware optimization plan
-│   ├── INFERENCE_OPTIMIZATION_ANALYSIS.md     #   Inference optimization analysis
-│   ├── OPTIMIZATION_DESIGN.md                 #   Optimization design document
-│   ├── 3D_WORLD_COORDINATE_SYSTEM_PLAN.md     #   3D world coordinate system design
-│   ├── CODE_AUDIT_REPORT.md                   #   Code audit report
-│   ├── REFACTORING_REPORT.md                  #   Refactoring report
-│   ├── TESTING_GUIDE.md                       #   Testing guide
-│   └── TESTING_GUIDE_V2.md                    #   Testing guide v2
+│   ├── Action Prediction/
+│   │   ├── Object Detection/
+│   │   │   └── yolov11n_320x320.q.onnx        #   YOLO11n object detector (optional, disabled in unified mode)
+│   │   ├── Skeleton Recognition/
+│   │   │   ├── yolov8n-pose.q.onnx            #   YOLOv8-Pose PRIMARY detection+pose (INT8)
+│   │   │   └── yolo11n-pose.q.onnx            #   YOLO11n-Pose alternative variant (INT8)
+│   │   └── Skeleton-based Action Prediction/
+│   │       ├── 1D-TCN_Skeleton_INT8.onnx      #   1D-TCN PRIMARY action recognition (INT8+EP)
+│   │       ├── stgcn_int8.onnx                #   ST-GCN legacy action recognition (CPU EP)
+│   │       └── stgcn.fp32.onnx                #   ST-GCN FP32 variant (development/testing)
+│   └── Face Recognition/
+│       ├── yolov5n-face_320_cut.q.onnx        #   YOLOv5-Face face detection (INT8)
+│       ├── yolov5n-face_cut.q.onnx            #   YOLOv5-Face face detection (INT8, legacy)
+│       └── arcface_mobilefacenet_cut.q.onnx   #   ArcFace feature extraction (INT8)
+├── CV/                                        # Standalone model test/utility code (26 model families)
+│   ├── CLIP/python/                           #   CLIPSeg text-promptable segmentation
+│   ├── SAM/python/                            #   Segment Anything Model
+│   ├── arcface/python/                        #   ArcFace face recognition test
+│   ├── efficientnet/                          #   EfficientNet-B1 classifier
+│   ├── fcn/                                   #   FCN-ResNet50 semantic segmentation
+│   ├── inception_v1/                          #   Inception-v1 (GoogLeNet)
+│   ├── inception_v3/                          #   Inception-v3
+│   ├── mobilenet_v2/                          #   MobileNet-v2 classifier
+│   ├── mobilesam1/                            #   MobileSAM efficient segmentation
+│   ├── nanotrack/                             #   NanoTracker single-object tracking
+│   ├── ocr/python/                            #   PP-OCRv3 scene text recognition
+│   ├── resnet/                                #   ResNet-50 classifier
+│   ├── swin-tiny_16xb64_in1k/                 #   Swin-Tiny transformer classifier
+│   ├── unet/                                  #   UNet semantic segmentation
+│   ├── yolo-world/                            #   YOLO-World open-vocabulary detection
+│   ├── yoloe/                                 #   YOLOE open-vocabulary detection
+│   ├── yolov5/                                #   YOLOv5 object detection
+│   ├── yolov5-face/python/                    #   YOLOv5-Face face detection test
+│   ├── yolov6/                                #   YOLOv6 object detection
+│   ├── yolov8/                                #   YOLOv8 object detection (OpenCL)
+│   ├── yolov8-obb/python/                     #   YOLOv8 oriented bounding box
+│   ├── yolov8-pose/                           #   YOLOv8-Pose pose estimation (OpenCL)
+│   ├── yolov8-seg/                            #   YOLOv8 instance segmentation (OpenCL)
+│   └── yolov11/                               #   YOLOv11 object detection
 ├── receive/                                   # ESP32 Arrow-end firmware + test scripts
-│   ├── coap_server.h                          #   ESP32 CoAP server header
-│   ├── ov-imu-pwm.py                          #   Python receiver script
-│   ├── receive.ino                            #   Arduino receiver sketch
-│   └── test-udp.py                            #   UDP test script
+│   ├── coap_server.h                          #   ESP32 CoAP server (header-only C++ class)
+│   ├── ov-imu-pwm.py                          #   Python CoAP client (headless + Tkinter GUI)
+│   └── receive.ino                            #   ESP32 Arduino firmware (OV3660 + GY85 + SG90)
 ├── CMakeLists.txt                             #   Top-level CMake build configuration
 └── README.md                                  #   This document
 ```
@@ -1559,11 +1805,12 @@ lingqi_tantong/
 | `ENABLE_K1_VPU` | `ON` | Enable K1 VPU hardware video/JPEG acceleration |
 | `MUSE_PI_ARCH` | `rv64gcv0p7` | RISC-V target architecture (auto-detected at build time) |
 | `K1_MPP_DIR` | — | K1 MPP media processing SDK path (auto-detects system libmpp.so) |
+| `ENABLE_LTO` | `ON` | Enable Link-Time Optimization (thin LTO on Clang) |
 
 ---
 
 > **Project Repository**: lingqi_tantong
 > **License**: Proprietary
 > **Last Updated**: 2026-07
-> **Total Code**: ~15,000 lines C/C++ (Shooter End, K1 Muse Pi Pro)
-> **Models**: 5 ONNX models (4 INT8-quantized + 1 FP32)
+> **Total Code**: ~35,000 lines C/C++ (35 C + 1 C++ source files, 35 headers, plus Mongoose 7.22 library)
+> **Models**: 6 ONNX model types (5 INT8-quantized + 1 FP32) — YOLOv8-Pose, YOLO11n-Pose, YOLOv5-Face, ArcFace, 1D-TCN, ST-GCN | 9 total model files in models/ | 26 additional model families in CV/ test suite

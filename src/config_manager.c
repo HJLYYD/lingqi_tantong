@@ -50,11 +50,14 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_float(cm, "detection.keypoint_min_confidence", 0.30f);
     config_set_float(cm, "detection.keypoint_validity_threshold", 0.50f);
     /* Cascade defaults */
-    config_set_bool(cm, "detection.cascade_enabled", false);  /* unified single-model mode: no cascade needed */
+    config_set_bool(cm, "detection.cascade_enabled", true);   /* anti-stutter: reduce resolution when tracking */
     config_set_int(cm, "detection.cascade_validation_interval", 15);
     config_set_int(cm, "detection.cascade_secondary_interval", 5);  /* secondary detector interval in TRACKING mode */
     config_set_int(cm, "detection.cascade_tracking_resolution.0", 320);
     config_set_int(cm, "detection.cascade_tracking_resolution.1", 320);
+    /* Anti-stutter face detection defaults */
+    config_set_int(cm, "detection.face_new_person_delay", 3);       /* delay face check N frames after new person */
+    config_set_float(cm, "detection.face_motion_skip_threshold", 0.40f);  /* skip face when frame change > this */
     /* Enhanced fallback filter defaults */
     config_set_float(cm, "detection.fallback_confidence", 0.20f);
     config_set_float(cm, "detection.fallback_area_ratio_min", 0.008f);
@@ -83,13 +86,14 @@ static void config_set_defaults(ConfigManager* cm) {
     config_set_float(cm, "face.similarity_threshold", 0.55f);
 
     config_set_string(cm, "action.backend", "ai_accel");
-    config_set_string(cm, "action.model_path", "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx");
-    config_set_int(cm, "action.num_frames", 30);    /* ST-GCN temporal window */
-    config_set_int(cm, "action.num_keypoints", 14); /* ST-GCN model joint count */
+    config_set_string(cm, "action.model_path", "models/Action Prediction/Skeleton-based Action Prediction/1D-TCN_Skeleton_INT8.onnx");
+    config_set_int(cm, "action.num_frames", 300);   /* 1D-TCN temporal window */
+    config_set_int(cm, "action.num_keypoints", 18); /* OpenPose-18 joint count */
     config_set_int(cm, "action.num_persons", 1);
-    config_set_int(cm, "action.num_classes", 7);    /* Auto-detected from model output shape at load time */
+    config_set_int(cm, "action.num_classes", 400);  /* Auto-detected from model output shape at load time */
     config_set_float(cm, "action.confidence_threshold", 0.5f);
-    config_set_int(cm, "action.inference_interval", 10);  /* frames between ST-GCN inference runs */
+    config_set_int(cm, "action.inference_interval", 10);  /* frames between 1D-TCN inference runs */
+    config_set_int(cm, "action.min_frames", 30);          /* minimum frames before first prediction (fast-start) */
 
     config_set_int(cm, "tracking.max_lost", 30);
     config_set_float(cm, "tracking.min_iou", 0.30f);

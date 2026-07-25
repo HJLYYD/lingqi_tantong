@@ -20,11 +20,11 @@ extern "C" {
 #define K1_CPU_CLUSTER0_INFERENCE 1
 #define K1_CPU_CLUSTER0_DETECT    2   /* legacy */
 #define K1_CPU_CLUSTER0_POSE      3
-#define K1_CPU_CLUSTER0_STGCN      3   /* ST-GCN on Cluster0 (needs RVV), share CPU3 with unused POSE */
+#define K1_CPU_CLUSTER0_TCN       3   /* 1D-TCN on Cluster0 (needs RVV), share CPU3 with unused POSE */
 #define K1_CPU_CLUSTER1_CAPTURE   4
 #define K1_CPU_CLUSTER1_VPU       5
 #define K1_CPU_CLUSTER1_VIZ       6
-#define K1_CPU_CLUSTER1_STGCN     7   /* REMOVED: Cluster1 causes SIGILL in ORT MLAS RVV kernels */
+#define K1_CPU_CLUSTER1_TCN      7   /* REMOVED: Cluster1 causes SIGILL in ORT MLAS RVV kernels */
 
 typedef enum {
     K1_CLUSTER_AI       = 0,

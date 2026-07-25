@@ -17,10 +17,14 @@
 #define _GNU_SOURCE   /* for asprintf, open_memstream */
 #include "web_server.h"
 #include "system_controller.h"
+#include "coap_receiver.h"
 #include "config_manager.h"
 #include "pipeline_state.h"
 #include "logger.h"
 #include "json_writer.h"
+#include "face_gallery.h"
+#include "arcface_recognizer.h"
+#include "inference_pipeline.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,7 +187,7 @@ static char* build_models_json(int *out_len) {
             const char *mtype = "unknown";
             if (strstr(name, "yolov8") || strstr(name, "yolo11")) mtype = "pose";
             else if (strstr(name, "yolov5")) mtype = "face";
-            else if (strstr(name, "stgcn")) mtype = "action";
+            else if (strstr(name, "tcn") || strstr(name, "1D-TCN")) mtype = "action";
             else if (strstr(name, "arcface") || strstr(name, "mobilefacenet")) mtype = "face_recog";
 
             jw_obj_begin(&jw);
@@ -410,8 +414,247 @@ static void handle_ws_command(WebServer *ws, struct mg_connection *c,
         return;
     }
 
+    /* ── Servo control ── */
+    if (strcmp(cmd_buf, "servo") == 0) {
+        int servo_id = 0, angle = 90;
+        /* Parse "servo" and "angle" from JSON: {"cmd":"servo","servo":0,"angle":95}
+         * BUGFIX: search for "\"servo\":" (with colon) to avoid matching the
+         * "servo" substring inside "\"cmd\":\"servo\"".  Otherwise strstr() hits
+         * the cmd value first and atoi() always gets 0. */
+        {
+            const char* sk = strstr(data, "\"servo\":");
+            if (sk) {
+                servo_id = atoi(sk + 8);  /* skip "servo": */
+            }
+        }
+        {
+            const char* ak = strstr(data, "\"angle\":");
+            if (ak) {
+                angle = atoi(ak + 8);  /* skip "angle": */
+            }
+        }
+        if (servo_id < 0 || servo_id > 1 || angle < 0 || angle > 180) {
+            send_ws_response(c, id_buf, "error",
+                             "{\"message\":\"servo must be 0-1, angle 0-180\"}");
+            return;
+        }
+        bool ok = false;
+        if (!ws->controller) {
+            log_warn("[WS] servo: no controller attached");
+        } else if (!ws->controller->coap_receiver) {
+            log_warn("[WS] servo: coap_receiver is NULL (pipeline not started?)");
+        } else {
+            ok = coap_receiver_send_servo(ws->controller->coap_receiver,
+                                          servo_id, angle);
+        }
+        if (ok) {
+            char rsp[64];
+            snprintf(rsp, sizeof(rsp), "{\"servo\":%d,\"angle\":%d}", servo_id, angle);
+            send_ws_response(c, id_buf, "ok", rsp);
+        } else {
+            const char* detail = "unknown";
+            if (!ws->controller) detail = "no controller";
+            else if (!ws->controller->coap_receiver) detail = "CoAP not initialized (start pipeline first)";
+            else detail = "UDP send failed (check WiFi/ESP32)";
+            char err[128];
+            snprintf(err, sizeof(err), "{\"message\":\"Servo send failed: %s\"}", detail);
+            send_ws_response(c, id_buf, "error", err);
+        }
+        return;
+    }
+
+    if (strcmp(cmd_buf, "servo_center") == 0) {
+        bool ok_h = false, ok_v = false;
+        const char* detail = "ok";
+        if (!ws->controller) {
+            detail = "no controller";
+        } else if (!ws->controller->coap_receiver) {
+            detail = "CoAP not initialized (start pipeline first)";
+        } else {
+            ok_h = coap_receiver_send_servo(ws->controller->coap_receiver, 0, 90);
+            ok_v = coap_receiver_send_servo(ws->controller->coap_receiver, 1, 90);
+            if (!ok_h || !ok_v) detail = "UDP send failed (check WiFi/ESP32)";
+        }
+        bool all_ok = ok_h && ok_v;
+        char rsp[96];
+        snprintf(rsp, sizeof(rsp),
+                 "{\"centered\":%s,\"message\":\"%s\"}",
+                 all_ok ? "true" : "false", detail);
+        send_ws_response(c, id_buf, all_ok ? "ok" : "error", rsp);
+        return;
+    }
+
     if (strcmp(cmd_buf, "ping") == 0) {
         send_ws_response(c, id_buf, "ok", "{\"pong\":true}");
+        return;
+    }
+
+    /* ── Face Gallery commands ── */
+
+    if (strcmp(cmd_buf, "get_gallery") == 0) {
+        if (!ws->controller || !ws->controller->face_gallery) {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"No gallery\"}");
+            return;
+        }
+        int glen = 0;
+        char* gjson = face_gallery_build_json(ws->controller->face_gallery, &glen);
+        send_ws_response(c, id_buf, "ok", gjson ? gjson : "{\"entries\":[]}");
+        free(gjson);
+        return;
+    }
+
+    if (strcmp(cmd_buf, "register_face") == 0) {
+        if (!ws->controller || !ws->controller->face_gallery) {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"No gallery\"}");
+            return;
+        }
+        /* Parse track_id and identity from JSON */
+        int track_id = -1;
+        char identity[STR_LEN] = {0};
+        {
+            const char* tk = strstr(data, "\"track_id\":");
+            if (tk) track_id = atoi(tk + 11);
+            const char* nm = strstr(data, "\"identity\":\"");
+            if (nm) {
+                nm += 12;
+                int il = 0;
+                while (*nm && *nm != '"' && il < (int)(sizeof(identity) - 1)) {
+                    if (*nm == '\\' && *(nm + 1)) { nm++; identity[il++] = *nm++; }
+                    else { identity[il++] = *nm++; }
+                }
+                identity[il] = '\0';
+            }
+        }
+        if (track_id < 0 || identity[0] == '\0') {
+            send_ws_response(c, id_buf, "error",
+                             "{\"message\":\"Missing track_id or identity\"}");
+            return;
+        }
+
+        /* Find gallery entry and register its feature vector */
+        FaceGalleryEntry* ge = face_gallery_find(ws->controller->face_gallery, track_id);
+        if (!ge || !ge->has_feature) {
+            send_ws_response(c, id_buf, "error",
+                             "{\"message\":\"No feature vector for this track_id\"}");
+            return;
+        }
+
+        if (!ws->controller->inference_pipeline ||
+            !ws->controller->inference_pipeline->face_recognizer) {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"Face recognizer not available\"}");
+            return;
+        }
+
+        bool ok = arcface_recognizer_register_feature(
+            ws->controller->inference_pipeline->face_recognizer,
+            identity, ge->feature_vector);
+
+        if (ok) {
+            /* Update gallery entry identity in-place */
+            pthread_mutex_lock(&ws->controller->face_gallery->mutex);
+            strncpy(ge->identity, identity, STR_LEN - 1);
+            ge->identity[STR_LEN - 1] = '\0';
+            ge->similarity = 1.0f;
+            pthread_mutex_unlock(&ws->controller->face_gallery->mutex);
+
+            /* Persist database to disk */
+            arcface_recognizer_save_database(
+                ws->controller->inference_pipeline->face_recognizer,
+                ws->controller->face_db_path);
+
+            char rsp[192];
+            snprintf(rsp, sizeof(rsp),
+                     "{\"message\":\"Registered %s\",\"identity\":\"%s\"}",
+                     identity, identity);
+            send_ws_response(c, id_buf, "ok", rsp);
+        } else {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"Registration failed\"}");
+        }
+        return;
+    }
+
+    if (strcmp(cmd_buf, "delete_face_db") == 0) {
+        char identity[STR_LEN] = {0};
+        {
+            const char* nm = strstr(data, "\"identity\":\"");
+            if (nm) {
+                nm += 12;
+                int il = 0;
+                while (*nm && *nm != '"' && il < (int)(sizeof(identity) - 1)) {
+                    if (*nm == '\\' && *(nm + 1)) { nm++; identity[il++] = *nm++; }
+                    else { identity[il++] = *nm++; }
+                }
+                identity[il] = '\0';
+            }
+        }
+        if (identity[0] == '\0') {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"Missing identity\"}");
+            return;
+        }
+        if (!ws->controller->inference_pipeline ||
+            !ws->controller->inference_pipeline->face_recognizer) {
+            send_ws_response(c, id_buf, "error", "{\"message\":\"Face recognizer not available\"}");
+            return;
+        }
+        bool ok = arcface_recognizer_delete_entry(
+            ws->controller->inference_pipeline->face_recognizer, identity);
+        if (ok) {
+            arcface_recognizer_save_database(
+                ws->controller->inference_pipeline->face_recognizer,
+                ws->controller->face_db_path);
+        }
+        send_ws_response(c, id_buf, ok ? "ok" : "error",
+                         ok ? "{\"message\":\"Deleted\"}"
+                            : "{\"message\":\"Not found\"}");
+        return;
+    }
+
+    if (strcmp(cmd_buf, "clear_gallery") == 0) {
+        if (ws->controller && ws->controller->face_gallery) {
+            face_gallery_clear(ws->controller->face_gallery);
+        }
+        send_ws_response(c, id_buf, "ok", "{\"message\":\"Gallery cleared\"}");
+        return;
+    }
+
+    if (strcmp(cmd_buf, "clear_database") == 0) {
+        if (ws->controller->inference_pipeline &&
+            ws->controller->inference_pipeline->face_recognizer) {
+            arcface_recognizer_clear_database(
+                ws->controller->inference_pipeline->face_recognizer);
+            arcface_recognizer_save_database(
+                ws->controller->inference_pipeline->face_recognizer,
+                ws->controller->face_db_path);
+        }
+        send_ws_response(c, id_buf, "ok", "{\"message\":\"Database cleared\"}");
+        return;
+    }
+
+    if (strcmp(cmd_buf, "save_database") == 0) {
+        bool ok = false;
+        if (ws->controller->inference_pipeline &&
+            ws->controller->inference_pipeline->face_recognizer) {
+            ok = arcface_recognizer_save_database(
+                ws->controller->inference_pipeline->face_recognizer,
+                ws->controller->face_db_path);
+        }
+        send_ws_response(c, id_buf, ok ? "ok" : "error",
+                         ok ? "{\"message\":\"Database saved\"}"
+                            : "{\"message\":\"Save failed\"}");
+        return;
+    }
+
+    if (strcmp(cmd_buf, "load_database") == 0) {
+        bool ok = false;
+        if (ws->controller->inference_pipeline &&
+            ws->controller->inference_pipeline->face_recognizer) {
+            ok = arcface_recognizer_load_database(
+                ws->controller->inference_pipeline->face_recognizer,
+                ws->controller->face_db_path);
+        }
+        send_ws_response(c, id_buf, ok ? "ok" : "error",
+                         ok ? "{\"message\":\"Database loaded\"}"
+                            : "{\"message\":\"Load failed\"}");
         return;
     }
 
@@ -792,6 +1035,31 @@ static void broadcast_timer_fn(void *arg) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Timer callback: broadcast face gallery to all WebSocket clients
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void gallery_broadcast_timer_fn(void *arg) {
+    WebServer *ws = (WebServer *)arg;
+    if (!ws || !ws->controller) return;
+    if (ws->ws_count == 0) return;
+
+    FaceGallery* g = ws->controller->face_gallery;
+    if (!g) return;
+
+    int len = 0;
+    char* json = face_gallery_build_json(g, &len);
+    if (!json || len <= 0) return;
+
+    for (int i = 0; i < ws->ws_count; i++) {
+        struct mg_connection *client = ws->ws_clients[i];
+        if (client && is_ws(client)) {
+            mg_ws_send(client, json, (size_t)len, WEBSOCKET_OP_TEXT);
+        }
+    }
+    free(json);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Server thread function
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -808,6 +1076,10 @@ static void *server_thread_fn(void *arg) {
     /* Set up status broadcast timer (500ms) — Phase B */
     mg_timer_add(&ws->mgr, WS_STATUS_INTERVAL_MS, MG_TIMER_REPEAT,
                  status_broadcast_timer_fn, ws);
+
+    /* Set up face gallery broadcast timer (1s) */
+    mg_timer_add(&ws->mgr, WS_GALLERY_INTERVAL_MS, MG_TIMER_REPEAT,
+                 gallery_broadcast_timer_fn, ws);
 
     /* Create HTTP listener */
     mg_http_listen(&ws->mgr, ws->listen_addr, ev_handler, ws);

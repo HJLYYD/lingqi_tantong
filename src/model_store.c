@@ -94,20 +94,12 @@ OrtSession* model_store_load_onnx(ModelStore* store, const char* model_name) {
 }
 
 void model_store_clear_cache(ModelStore* store) {
-    const OrtApi* ort = ort_get_api();
-    if (ort) {
-        for (int i = 0; i < store->num_models; i++) {
-            if (store->models[i].session != NULL) {
-                ort->ReleaseSession(store->models[i].session);
-                store->models[i].session = NULL;
-            }
-            store->models[i].loaded = false;
-        }
-    } else {
-        for (int i = 0; i < store->num_models; i++) {
+    for (int i = 0; i < store->num_models; i++) {
+        if (store->models[i].session != NULL) {
+            ort_release_session(store->models[i].session);
             store->models[i].session = NULL;
-            store->models[i].loaded = false;
         }
+        store->models[i].loaded = false;
     }
     log_info("Model cache cleared");
 }

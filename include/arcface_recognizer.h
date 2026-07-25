@@ -45,6 +45,14 @@ FaceIdentity arcface_recognizer_recognize(ArcFaceRecognizer* rec, const uint8_t*
 float arcface_calculate_similarity(const float* feature1, const float* feature2, int dim);
 void arcface_recognizer_clear_database(ArcFaceRecognizer* rec);
 
+bool arcface_recognizer_register_feature(ArcFaceRecognizer* rec, const char* identity,
+                                          const float* feature);
+int  arcface_recognizer_find_entry(ArcFaceRecognizer* rec, const char* identity);
+bool arcface_recognizer_delete_entry(ArcFaceRecognizer* rec, const char* identity);
+bool arcface_recognizer_save_database(ArcFaceRecognizer* rec, const char* filepath);
+bool arcface_recognizer_load_database(ArcFaceRecognizer* rec, const char* filepath);
+int  arcface_recognizer_get_entry_count(const ArcFaceRecognizer* rec);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,6 +16,7 @@
 #include "result_manager.h"
 #include "coap_receiver.h"
 #include "web_server.h"
+#include "face_gallery.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,7 +43,7 @@ typedef struct SystemController {
 
     PipelineMode mode;
     _Atomic int frame_count;      /* BUGFIX: _Atomic for RISC-V weak memory (was volatile).
-                                     postproc writes, stgcn/viz read; acquire/release semantics
+                                     postproc writes, tcn/viz read; acquire/release semantics
                                      needed for cross-hart visibility on X60 OoO cores. */
     int max_frames;               /* 0 = unlimited */
     int frame_timeout_s;          /* auto-exit after N seconds of no frames */
@@ -83,6 +84,10 @@ typedef struct SystemController {
     uint8_t*             latest_jpeg;    /* latest JPEG frame for /api/frame.jpg */
     size_t               latest_jpeg_len;
     pthread_mutex_t      jpeg_mutex;     /* protects latest_jpeg */
+
+    /* ── Face Gallery ── */
+    FaceGallery*         face_gallery;   /* face thumbnail gallery for web UI */
+    char                 face_db_path[256]; /* path to face_database.json */
 } SystemController;
 
 SystemController* system_controller_create(const char* config_path,

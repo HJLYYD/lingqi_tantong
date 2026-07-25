@@ -107,7 +107,7 @@ static void usage(const char* p) {
     printf("  --video PATH         Offline video file processing (CLI mode)\n");
     printf("  --benchmark          Model inference benchmark (paper-ready tables)\n\n");
     printf("Benchmark options:\n");
-    printf("  --benchmark-model N  Filter: yolo|pose|face|arcface|stgcn|all\n");
+    printf("  --benchmark-model N  Filter: yolo|pose|face|arcface|tcn|stgcn|all\n");
     printf("  --benchmark-runs N   Timed iterations per model (default: 30)\n");
     printf("  --benchmark-video P  Video file for pipeline E2E profiling\n\n");
     printf("Options:\n");

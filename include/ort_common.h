@@ -37,6 +37,14 @@ int ort_validate_onnx_file(const char* model_path, size_t* out_file_size);
 OrtSession* ort_create_session(const char* model_path, int num_threads, bool use_ep);
 
 /*
+ * Release an ONNX Runtime session with correct EP accounting.
+ * Must be used instead of direct ort_api->ReleaseSession() for any session
+ * created via ort_create_session(), so that g_ep_session_count stays accurate
+ * and g_ep_tcm_permanently_failed is reset when all EP sessions are released.
+ */
+void ort_release_session(OrtSession* session);
+
+/*
  * Query the model's first input tensor shape. Writes up to `max_dims`
  * dimension values into out_dims and returns the actual rank (number of
  * dims), or -1 on error. Useful for detectors that need to know whether

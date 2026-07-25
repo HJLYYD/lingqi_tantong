@@ -72,26 +72,24 @@ float ax_off = 0.0f, ay_off = 0.0f, az_g_off = 0.0f;
 #define COMPLEMENTARY_ALPHA       0.96f
 
 // ============================================================================
-// 3. 舵机 (MG996R 连续旋转)
+// 3. 舵机 (SG90 角度定位 0~180°)
 // ============================================================================
 #define SERVO_PIN_H              40
 #define SERVO_PIN_V              41
 #define SERVO_COUNT               2
-#define SERVO_CCW_US            1000
-#define SERVO_STOP_US           1500
-#define SERVO_CW_US             2000
+#define SERVO_MIN_US             500     // ≈0°
+#define SERVO_MAX_US            2400     // ≈180°
 #define SERVO_FREQ_HZ             50
 #define SERVO_RES_BITS            13     // 8192步, ~2.44µs分辨率
 #define SERVO_PERIOD_US        20000UL
 #define SERVO_LEDC_TIMER    LEDC_TIMER_1
 #define SERVO_LEDC_MODE     LEDC_LOW_SPEED_MODE
-#define SERVO_DEADBAND_DEG         5
-#define SERVO_MIN_CMD_MS          50
+#define SERVO_MIN_CMD_MS          20
+#define SERVO_CENTER_DEG          90
 
 static const int SERVO_PINS[SERVO_COUNT] = { SERVO_PIN_H, SERVO_PIN_V };
 static const ledc_channel_t SERVO_CH[SERVO_COUNT] = { LEDC_CHANNEL_3, LEDC_CHANNEL_4 };
-enum ServoDir { DIR_STOP = 0, DIR_CCW = -1, DIR_CW = 1 };
-ServoDir g_sv_dir[SERVO_COUNT] = { DIR_STOP, DIR_STOP };
+int g_sv_angle[SERVO_COUNT] = { -1, -1 };  // -1=尚未定位，避免上电强制回中
 unsigned long g_sv_last_ms[SERVO_COUNT] = { 0, 0 };
 
 // ============================================================================
@@ -182,7 +180,7 @@ void updateImu();
 void updateAttitude(float dt);
 void initServo();
 void setServoPulse(int id, uint32_t us);
-void setServoDir(int id, ServoDir d);
+void setServoAngle(int id, int angle);
 void stopServo(int id);
 bool handleServo(int id, int angle, char* resp, size_t sz, size_t* len);
 void servoEmergencyStop();
@@ -463,8 +461,8 @@ void setup() {
   initWiFiAP();
 
   // --- 15.6 舵机 (摄像头之前) ---
+  // 不强制回中，等客户端发命令再定位，避免每次上电/重连抖动
   initServo();
-  stopServo(0); stopServo(1);
   LOG_INFO("Servos ready GPIO%d(H) GPIO%d(V)", SERVO_PIN_H, SERVO_PIN_V);
 
   // --- 15.7 摄像头 ---
@@ -923,42 +921,41 @@ void initServo() {
 
 void setServoPulse(int id, uint32_t us) {
   if (id < 0 || id >= SERVO_COUNT) return;
-  if (us < 500) us = 500; if (us > 2500) us = 2500;
+  if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+  if (us > SERVO_MAX_US) us = SERVO_MAX_US;
   uint32_t max_d = (1UL << SERVO_RES_BITS) - 1;
   uint32_t d = (uint32_t)((uint64_t)us * max_d / SERVO_PERIOD_US);
   ledc_set_duty(SERVO_LEDC_MODE, SERVO_CH[id], d);
   ledc_update_duty(SERVO_LEDC_MODE, SERVO_CH[id]);
 }
 
-void setServoDir(int id, ServoDir d) {
+void setServoAngle(int id, int angle) {
   if (id < 0 || id >= SERVO_COUNT) return;
-  g_sv_dir[id] = d;
-  uint32_t p = SERVO_STOP_US;
-  if (d == DIR_CCW) p = SERVO_CCW_US;
-  else if (d == DIR_CW) p = SERVO_CW_US;
-  setServoPulse(id, p);
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  // 相同角度不重复写 PWM，减轻舵机抖动
+  if (g_sv_angle[id] == angle) return;
+  g_sv_angle[id] = angle;
+  // SG90: 线性映射 0°→MIN_US, 180°→MAX_US
+  uint32_t us = SERVO_MIN_US +
+      (uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US) / 180UL;
+  setServoPulse(id, us);
 }
 
-void stopServo(int id)           { setServoDir(id, DIR_STOP); }
+void stopServo(int id)           { setServoAngle(id, SERVO_CENTER_DEG); }
 void servoEmergencyStop()        { for (int i = 0; i < SERVO_COUNT; i++) stopServo(i); }
 
 bool handleServo(int id, int angle, char* resp, size_t sz, size_t* len) {
   if (id < 0 || id >= SERVO_COUNT) return false;
+  if (angle < 0 || angle > 180) return false;
 
   unsigned long now = millis();
   if (elapsed(g_sv_last_ms[id]) < SERVO_MIN_CMD_MS) { /* 节流但不拒绝 */ }
   g_sv_last_ms[id] = now;
 
-  // 死区: 87~93° → 停止
-  if (angle >= (90 - SERVO_DEADBAND_DEG) && angle <= (90 + SERVO_DEADBAND_DEG))
-    setServoDir(id, DIR_STOP);
-  else if (angle < 90) setServoDir(id, DIR_CCW);
-  else                  setServoDir(id, DIR_CW);
+  setServoAngle(id, angle);
 
-  const char* ds = "stop";
-  if (g_sv_dir[id] == DIR_CCW) ds = (id == 0) ? "left" : "up";
-  else if (g_sv_dir[id] == DIR_CW) ds = (id == 0) ? "right" : "down";
-  int n = snprintf(resp, sz, "{\"s\":%d,\"a\":%d,\"d\":\"%s\",\"ok\":1}", id, angle, ds);
+  int n = snprintf(resp, sz, "{\"s\":%d,\"a\":%d,\"ok\":1}", id, g_sv_angle[id]);
   *len = (n > 0 && (size_t)n < sz) ? (size_t)n : 0;
   return true;
 }
@@ -1046,8 +1043,8 @@ void provideDiag(char* buf, size_t sz, size_t* len) {
     "\"imu_ok\":%d,"
     "\"imu_hz\":%.0f,"
     "\"frames\":%d,"
-    "\"sv0\":\"%s\","
-    "\"sv1\":\"%s\""
+    "\"sv0\":%d,"
+    "\"sv1\":%d"
     "}",
     up, heap, psram,
     g_wifi_ap_ok ? "up" : "DOWN",
@@ -1059,8 +1056,8 @@ void provideDiag(char* buf, size_t sz, size_t* len) {
     g_imu_valid ? 1 : 0,
     1000.0f / IMU_INTERVAL_MS,
     g_frame_cnt,
-    g_sv_dir[0] == DIR_CCW ? "left" : (g_sv_dir[0] == DIR_CW ? "right" : "stop"),
-    g_sv_dir[1] == DIR_CCW ? "up"   : (g_sv_dir[1] == DIR_CW ? "down"  : "stop")
+    g_sv_angle[0],
+    g_sv_angle[1]
   );
   *len = (n > 0 && (size_t)n < sz) ? (size_t)n : 0;
 }

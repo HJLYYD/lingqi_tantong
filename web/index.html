@@ -22,9 +22,9 @@
   --bg-card:       #FFFFFF;
   --bg-hover:      #F5EDE3;
   --bg-input:      #FDF9F4;
-  --text-primary:  #1a1a1a;
-  --text-secondary:#333333;
-  --text-muted:    #555555;
+  --text-primary:  #000000;
+  --text-secondary:#222222;
+  --text-muted:    #444444;
   --accent:        #5B8C7A;
   --accent-hover:  #4A7565;
   --accent-light:  #E8F2ED;
@@ -57,7 +57,7 @@ body {
   font-size: 14px;
   line-height: 1.5;
   background: #FDF7ED;
-  color: #111;
+  color: #000;
   display: flex;
   height: 100vh;
   overflow: hidden;
@@ -73,7 +73,7 @@ body {
   overflow-y: auto; z-index: 10;
 }
 #logo { font-size: 20px; font-weight: 700; color: #111; letter-spacing: 1px; }
-#logo span { font-weight: 400; font-size: 11px; color: #444; display: block; margin-top: 1px; letter-spacing: 0; }
+#logo span { font-weight: 400; font-size: 11px; color: #222; display: block; margin-top: 1px; letter-spacing: 0; }
 
 #status-bar {
   display: flex; align-items: center; gap: 8px;
@@ -87,7 +87,7 @@ body {
 .st-error   { background: #FDF0F0; color: #C47777; }
 #dot { width: 8px; height: 8px; border-radius: 50%; background: #C47777; flex-shrink: 0; transition: background 0.15s; }
 #dot.on { background: #5B8C7A; box-shadow: 0 0 6px rgba(91,140,122,0.4); }
-#ws-txt { font-size: 10px; color: #555; }
+#ws-txt { font-size: 10px; color: #333; }
 
 #ctls { display: flex; flex-direction: column; gap: 6px; }
 .btn {
@@ -115,7 +115,40 @@ body {
   padding: 10px 12px; border: 1px solid #F0EAE2;
 }
 .stat .v { font-size: 20px; font-weight: 600; color: #111; line-height: 1.2; }
-.stat .l { font-size: 9px; letter-spacing: 0.5px; color: #444; margin-top: 2px; }
+.stat .l { font-size: 9px; letter-spacing: 0.5px; color: #222; margin-top: 2px; }
+
+/* ── 舵机控制面板 ── */
+#servo-panel {
+  margin-top: 10px; background: #fff; border-radius: 8px;
+  padding: 12px; border: 1px solid #E8E2D8;
+}
+#servo-panel h4 { font-size: 11px; color: #333; margin: 0 0 10px; text-align: center; }
+#servo-dpad {
+  display: grid; grid-template-columns: 50px 50px 50px;
+  grid-template-rows: 50px 50px 50px; gap: 4px;
+  justify-content: center; margin-bottom: 8px;
+}
+#sv-up    { grid-column: 2; grid-row: 1; }
+#sv-left  { grid-column: 1; grid-row: 2; }
+#sv-ctr   { grid-column: 2; grid-row: 2; }
+#sv-right { grid-column: 3; grid-row: 2; }
+#sv-down  { grid-column: 2; grid-row: 3; }
+.sv-btn {
+  width: 50px; height: 50px; border: 1px solid #D0C8BC; border-radius: 8px;
+  background: #F5F0E8; font-size: 20px; cursor: pointer;
+  color: #444; user-select: none; -webkit-user-select: none;
+  touch-action: manipulation;
+}
+.sv-btn:active { background: #E0D8C8; transform: scale(0.95); }
+.sv-ctr { font-size: 16px; color: #555; }
+#servo-ang {
+  text-align: center; font-size: 13px; color: #333; font-weight: 600;
+  margin-bottom: 4px;
+}
+#servo-ang span { display: inline-block; width: 45px; }
+.sv-lbl {
+  text-align: center; font-size: 9px; color: #999; letter-spacing: 0.5px;
+}
 
 #diag {
   font-size: 10px; padding: 6px 10px; border-radius: 6px;
@@ -124,10 +157,10 @@ body {
 }
 
 #log-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-#log-wrap h4 { font-size: 10px; color: #555; margin-bottom: 6px; letter-spacing: 0.5px; }
+#log-wrap h4 { font-size: 10px; color: #333; margin-bottom: 6px; letter-spacing: 0.5px; }
 #log {
   flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 9px;
-  line-height: 1.7; color: #333;
+  line-height: 1.7; color: #111;
   background: #fff; border-radius: 6px;
   padding: 8px 10px; border: 1px solid #F0EAE2;
   max-height: 160px; word-break: break-all;
@@ -140,14 +173,14 @@ body {
 #tabs { display: flex; gap: 0; background: #FAF6F0; border-bottom: 1px solid #E5DDD2; padding: 0 16px; }
 .tab {
   padding: 12px 20px; font-size: 13px; font-weight: 500;
-  cursor: pointer; color: #444;
+  cursor: pointer; color: #222;
   border-bottom: 2px solid transparent; transition: all 0.15s;
   background: none; border-top: none; border-left: none; border-right: none;
   font-family: var(--font);
 }
-.tab:hover { color: #111; }
+.tab:hover { color: #000; }
 .tab.on { color: #5B8C7A; border-bottom-color: #5B8C7A; }
-.tab-count { font-size: 9px; color: #555; margin-left: 4px; }
+.tab-count { font-size: 9px; color: #333; margin-left: 4px; }
 
 #views { flex: 1; position: relative; overflow: hidden; }
 .vt { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: none; overflow: hidden; }
@@ -171,10 +204,10 @@ body {
 #ph {
   position: absolute; top: 50%; left: 50%;
   transform: translate(-50%,-50%); text-align: center;
-  color: #444; z-index: 1;
+  color: #ccc; z-index: 1;
 }
-#ph p { font-size: 14px; margin: 4px 0; }
-#ph small { font-size: 11px; display: block; color: #555; }
+#ph p { font-size: 14px; margin: 4px 0; color: #ddd; }
+#ph small { font-size: 11px; display: block; color: #aaa; }
 
 #v-map { background: #F0EDE6; flex-direction: column; }
 #mc-wrap { width: 100%; height: 100%; position: relative; }
@@ -188,7 +221,7 @@ body {
 }
 #map-fallback-msg {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-  text-align: center; color: #555; display: none;
+  text-align: center; color: #333; display: none;
 }
 
 #v-cfg { background: #FDF7ED; overflow-y: auto; padding: 20px; align-items: flex-start; justify-content: flex-start; flex-direction: column; }
@@ -208,7 +241,7 @@ body {
   padding: 7px 0; gap: 12px;
 }
 .cfg-row + .cfg-row { border-top: 1px solid #F0EAE2; }
-.cfg-label { font-size: 11px; color: #444; min-width: 140px; flex-shrink: 0; word-break: break-all; }
+.cfg-label { font-size: 11px; color: #222; min-width: 140px; flex-shrink: 0; word-break: break-all; }
 .cfg-label code { font-size: 10px; color: #5B8C7A; background: #E8F2ED; padding: 1px 5px; border-radius: 3px; }
 .cfg-control { flex: 1; max-width: 320px; min-width: 0; }
 
@@ -250,6 +283,103 @@ select { cursor: pointer; }
 }
 #cfg-actions .btn { width: auto; padding: 11px 28px; font-size: 13px; font-weight: 600; }
 
+/* ── 人脸库 Tab ── */
+#v-gallery { background: #FDF7ED; overflow-y: auto; padding: 20px; align-items: flex-start; justify-content: flex-start; flex-direction: column; }
+#gallery-controls {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 16px; background: #fff; border-radius: var(--radius);
+  border: 1px solid var(--border-light); margin-bottom: 12px;
+  width: 100%; max-width: 100%;
+}
+#gallery-controls label { font-size: 12px; color: #333; display: flex; align-items: center; gap: 6px; }
+#gallery-controls input[type="range"] { width: 80px; accent-color: var(--accent); }
+#gallery-ttl-val { font-size: 11px; color: var(--accent); font-weight: 600; min-width: 28px; }
+#gallery-controls .btn { width: auto; padding: 6px 14px; font-size: 11px; }
+#gallery-stats {
+  display: flex; gap: 20px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-muted); margin-bottom: 16px;
+  width: 100%; max-width: 100%;
+}
+#gallery-stats strong { color: var(--text-primary); }
+#gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px; width: 100%; max-width: 100%;
+}
+.gcard {
+  background: #fff; border-radius: var(--radius);
+  border: 1px solid var(--border-light);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden; text-align: center;
+  transition: box-shadow 0.2s;
+}
+.gcard:hover { box-shadow: var(--shadow-lg); }
+.gcard-img {
+  width: 100%; aspect-ratio: 1;
+  object-fit: cover; display: block;
+  background: #f0ede6;
+}
+.gcard-info { padding: 10px 12px; }
+.gcard-id {
+  font-size: 14px; font-weight: 600; color: var(--text-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+.gcard-id.known { color: var(--accent); }
+.gcard-sim {
+  font-size: 11px; color: var(--text-muted);
+  margin-bottom: 2px;
+}
+.gcard-sim-bar {
+  height: 3px; border-radius: 2px; background: var(--border-light);
+  margin: 4px 0; overflow: hidden;
+}
+.gcard-sim-bar-fill {
+  height: 100%; border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s;
+}
+.gcard-meta {
+  font-size: 10px; color: var(--text-muted);
+  display: flex; justify-content: space-between; gap: 6px;
+}
+.gcard-register {
+  display: inline-block; margin-top: 6px;
+  padding: 4px 14px; font-size: 11px; font-weight: 500;
+  border-radius: var(--radius-full); cursor: pointer; border: none;
+  background: var(--accent-light); color: var(--accent);
+  font-family: var(--font); transition: all 0.15s;
+}
+.gcard-register:hover { background: var(--accent); color: #fff; }
+/* Registration modal */
+.modal-overlay {
+  display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.4); z-index: 1000;
+  align-items: center; justify-content: center;
+}
+.modal-overlay.on { display: flex; }
+.modal-box {
+  background: #fff; border-radius: var(--radius-lg);
+  padding: 24px; text-align: center;
+  box-shadow: var(--shadow-lg); max-width: 340px; width: 90%;
+}
+.modal-box h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--text-primary); }
+.modal-box img {
+  width: 112px; height: 112px; border-radius: var(--radius-sm);
+  object-fit: cover; margin-bottom: 14px;
+  border: 2px solid var(--border-light);
+}
+.modal-box input {
+  display: block; width: 100%; margin-bottom: 14px;
+  text-align: center; font-size: 14px;
+}
+.modal-box .btn { width: auto; padding: 8px 20px; font-size: 12px; margin: 0 4px; }
+#gallery-empty {
+  text-align: center; padding: 40px 20px; color: var(--text-muted);
+  width: 100%;
+}
+#gallery-empty p { font-size: 14px; }
+
 @media (max-width: 768px) {
   body { flex-direction: column; }
   #side { width: 100%; min-width: 0; max-height: 40vh; }
@@ -285,6 +415,20 @@ select { cursor: pointer; }
     <div class="stat"><div class="v" id="sv-uptime">0秒</div><div class="l">运行</div></div>
   </div>
 
+  <!-- ── 舵机控制面板 ── -->
+  <div id="servo-panel">
+    <h4>☰ 舵机云台</h4>
+    <div id="servo-dpad">
+      <button id="sv-up"    class="sv-btn" data-dir="up">▲</button>
+      <button id="sv-left"  class="sv-btn" data-dir="left">◀</button>
+      <button id="sv-ctr"   class="sv-btn sv-ctr" title="回中">⌂</button>
+      <button id="sv-right" class="sv-btn" data-dir="right">▶</button>
+      <button id="sv-down"  class="sv-btn" data-dir="down">▼</button>
+    </div>
+    <div id="servo-ang"><span id="sv-ang-h">90°</span> <span id="sv-ang-v">90°</span></div>
+    <div class="sv-lbl">H 左右 / V 上下</div>
+  </div>
+
   <div id="diag"></div>
 
   <div id="log-wrap">
@@ -299,6 +443,7 @@ select { cursor: pointer; }
     <button class="tab on" data-tab="cam">相机</button>
     <button class="tab" data-tab="map">世界地图 <span class="tab-count" id="map-count"></span></button>
     <button class="tab" data-tab="cfg">配置</button>
+    <button class="tab" data-tab="gallery">人脸库 <span class="tab-count" id="gallery-count"></span></button>
   </div>
 
   <div id="views">
@@ -320,12 +465,43 @@ select { cursor: pointer; }
     </div>
 
     <div id="v-cfg" class="vt">
-      <div id="cfg-ct"><p style="color:#555;padding:40px;text-align:center">正在加载配置...</p></div>
+      <div id="cfg-ct"><p style="color:#222;padding:40px;text-align:center">正在加载配置...</p></div>
       <div id="cfg-actions">
         <button class="btn btn-cfg" id="cfg-save">保存配置</button>
         <button class="btn btn-start" id="cfg-start">保存并启动管线</button>
-        <span id="cfg-status" style="font-size:11px;color:#444;margin-left:auto"></span>
+        <span id="cfg-status" style="font-size:11px;color:#222;margin-left:auto"></span>
       </div>
+    </div>
+
+    <div id="v-gallery" class="vt">
+      <div id="gallery-controls">
+        <label>TTL:<input type="range" min="10" max="300" value="60" id="gallery-ttl"></label>
+        <span id="gallery-ttl-val">60s</span>
+        <button class="btn btn-reset" id="gallery-clear">清空图库</button>
+        <button class="btn btn-cfg" id="gallery-save-db">保存数据库</button>
+        <button class="btn btn-warn" id="gallery-load-db">加载数据库</button>
+      </div>
+      <div id="gallery-stats">
+        <span>已识别: <strong id="g-known">0</strong> 人</span>
+        <span>未识别: <strong id="g-unknown">0</strong> 人</span>
+        <span>数据库: <strong id="g-db-count">0</strong> 人</span>
+        <span>图库: <strong id="g-total">0</strong> 条目</span>
+      </div>
+      <div id="gallery-grid"></div>
+      <div id="gallery-empty"><p>等待人脸检测...</p><small>检测到人脸后将在此显示</small></div>
+    </div>
+  </div>
+</div>
+
+<!-- 人脸注册模态框 -->
+<div class="modal-overlay" id="reg-modal">
+  <div class="modal-box">
+    <h3>注册人脸</h3>
+    <img id="reg-thumb" src="" alt="人脸缩略图">
+    <input type="text" id="reg-name" placeholder="输入姓名" maxlength="31">
+    <div>
+      <button class="btn btn-reset" id="reg-cancel">取消</button>
+      <button class="btn btn-start" id="reg-confirm">确认注册</button>
     </div>
   </div>
 </div>
@@ -348,7 +524,8 @@ var D = {};
  'sv-fps','sv-frame','sv-tracks','sv-dets','sv-action','sv-uptime',
  'diag','log','vid','vid-back','ovl','ph','mc','map-info','map-fallback-msg',
  'map-count','cfg-ct','cfg-actions','cfg-save','cfg-start','cfg-status',
- 'mc-wrap'].forEach(function(id){
+ 'mc-wrap',
+ 'sv-up','sv-down','sv-left','sv-right','sv-ctr','sv-ang-h','sv-ang-v'].forEach(function(id){
   var el = document.getElementById(id);
   D[id] = el;
   if (!el) console.warn('Missing #'+id);
@@ -372,12 +549,13 @@ var currentTab = 'cam';
 var mapMode = '2d';
 var threeReady = false;
 var lastFrame = null;
+var pendingFrameIndex = -1;  /* frame_index from JPEG header, matched against msg.n */
 
 function log(msg, cls) {
   var t = new Date().toLocaleTimeString([], {hour12: false});
   var el = document.createElement('div');
-  if (cls) el.innerHTML = '<span style="color:#555">'+t+'</span> <span class="'+cls+'">'+msg+'</span>';
-  else el.innerHTML = '<span style="color:#555">'+t+'</span> '+msg;
+  if (cls) el.innerHTML = '<span style="color:#333">'+t+'</span> <span class="'+cls+'">'+msg+'</span>';
+  else el.innerHTML = '<span style="color:#333">'+t+'</span> '+msg;
   D.log.appendChild(el);
   while (D.log.children.length > 200) D.log.removeChild(D.log.firstChild);
   D.log.scrollTop = D.log.scrollHeight;
@@ -408,8 +586,10 @@ function switchTab(name) {
   document.getElementById('v-cam').classList.toggle('on', name === 'cam');
   document.getElementById('v-map').classList.toggle('on', name === 'map');
   document.getElementById('v-cfg').classList.toggle('on', name === 'cfg');
+  document.getElementById('v-gallery').classList.toggle('on', name === 'gallery');
   if (name === 'map') { resizeMap(); if (threeReady && mapMode === '3d') start3DRenderLoop(); }
   if (name === 'cfg' && !fullCfg._rendered) ConfigPanel.render();
+  if (name === 'gallery') renderGallery();
 }
 document.querySelectorAll('.tab').forEach(function(t){
   t.addEventListener('click', function(){ switchTab(t.dataset.tab); });
@@ -417,6 +597,9 @@ document.querySelectorAll('.tab').forEach(function(t){
 
 /* ═══════════════════════ 2D 叠加层 ═══════════════════════ */
 var CAM_W = 640, CAM_H = 480;
+/* Track last-known image dimensions for dynamic fallback (instead of
+ * hardcoding 640×480 which may not match the actual camera resolution). */
+var LAST_W = CAM_W, LAST_H = CAM_H;
 
 var _videoFb = 'vid'; /* which img is currently visible: 'vid' or 'vid-back' */
 
@@ -448,6 +631,7 @@ function alignOverlay() {
 function _swapVideoFrame(url, revoke) {
   var backId = (_videoFb === 'vid') ? 'vid-back' : 'vid';
   var backImg = D[backId];
+  var capturedIndex = pendingFrameIndex;  /* capture at swap time */
 
   backImg.onload = function() {
     /* Hide current front, show back */
@@ -456,9 +640,28 @@ function _swapVideoFrame(url, revoke) {
     _videoFb = backId;
     D.ph.style.display = 'none';
     if (revoke && url.startsWith('blob:')) URL.revokeObjectURL(url);
+    /* Track actual image dimensions for dynamic canvas fallback */
+    if (backImg.naturalWidth > 0 && backImg.naturalHeight > 0) {
+      LAST_W = backImg.naturalWidth;
+      LAST_H = backImg.naturalHeight;
+    }
     /* Re-align overlay to new frame's dimensions */
     alignOverlay();
-    if (lastFrame && currentTab === 'cam') renderOvl(lastFrame);
+    /* Only render overlay if JSON data matches this frame's index.
+     * Mismatch can happen when frames arrive faster than JPEG loads —
+     * lastFrame may have been updated by a newer JSON message.
+     * Log a warning so users can see sync quality. */
+    if (lastFrame && currentTab === 'cam') {
+      if (capturedIndex < 0 || lastFrame.n === capturedIndex) {
+        renderOvl(lastFrame);
+      } else if (lastFrame.n !== capturedIndex) {
+        console.warn('Frame sync mismatch: JPEG#' + capturedIndex +
+                     ' vs JSON#' + lastFrame.n +
+                     ' (diff=' + (lastFrame.n - capturedIndex) + ')');
+        /* Render anyway — better than blank overlay */
+        renderOvl(lastFrame);
+      }
+    }
   };
   backImg.src = url;
 }
@@ -481,7 +684,7 @@ function renderOvl(m) {
   alignOverlay();
   var c = D.ovl;
   var W = c.width, H = c.height;
-  if (W < 1 || H < 1) { W = CAM_W; H = CAM_H; c.width = W; c.height = H; }
+  if (W < 1 || H < 1) { W = LAST_W; H = LAST_H; c.width = W; c.height = H; }
   var ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H);
   /* Sharper text rendering */
@@ -594,6 +797,8 @@ function renderOvl(m) {
     ctx.strokeRect(t.b[0]+0.5, t.b[1]+0.5, t.b[2]-t.b[0], t.b[3]-t.b[1]); ctx.setLineDash([]);
     var lbl = '#'+t.i;
     if (t.p) lbl += ' '+t.p[0].toFixed(1)+','+t.p[2].toFixed(1)+'m';
+    /* Show global action label on tracked person if available */
+    if (m.a && m.a[0]) lbl += ' '+m.a[0];
     ctx.fillStyle = '#000'; ctx.font = 'bold 13px ' + getComputedStyle(document.body).fontFamily;
     ctx.fillText(lbl, t.b[0]+3, t.b[1] > 18 ? t.b[1]-17 : t.b[1]+3);
     ctx.fillStyle = '#4090FF'; ctx.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
@@ -1239,7 +1444,7 @@ var ConfigPanel = {
 
   render: function() {
     if (!fullCfg || Object.keys(fullCfg).length === 0) {
-      D['cfg-ct'].innerHTML = '<p style="color:#555;padding:40px;text-align:center">等待配置加载…<br><small>请先连接 WebSocket</small></p>';
+      D['cfg-ct'].innerHTML = '<p style="color:#222;padding:40px;text-align:center">等待配置加载…<br><small>请先连接 WebSocket</small></p>';
       return;
     }
     fullCfg._rendered = true;
@@ -1270,7 +1475,7 @@ var ConfigPanel = {
       }
     }
     if (!foundQuick) {
-      html += '<p style="color:#555;font-size:11px;padding:8px 0">未找到快速设置项，请连接后重试</p>';
+      html += '<p style="color:#222;font-size:11px;padding:8px 0">未找到快速设置项，请连接后重试</p>';
     }
     html += '</div>';
 
@@ -1416,6 +1621,8 @@ var WS = {
     if (ev.data instanceof ArrayBuffer) {
       var buf = new Uint8Array(ev.data);
       if (buf.length >= 4 && buf[0] === 0x4A && buf[1] === 0x50) {
+        /* Extract frame_index from JPEG header bytes 2-3 (big-endian) */
+        pendingFrameIndex = (buf[2] << 8) | buf[3];
         var jpeg = new Blob([buf.slice(4)], {type: 'image/jpeg'});
         _swapVideoFrame(URL.createObjectURL(jpeg), true);
       }
@@ -1475,7 +1682,19 @@ var WS = {
           fullCfg = msg.data;
           fullCfg._rendered = false;
           log('配置已加载 ('+JSON.stringify(msg.data).length+' 字节)', 'b');
-          ConfigPanel.render(); /* always render when config arrives */
+          ConfigPanel.render();
+          if (fullCfg.servo) {
+            if (fullCfg.servo.step_deg) SERVO_STEP = fullCfg.servo.step_deg;
+            if (fullCfg.servo.tick_ms) SERVO_TICK = fullCfg.servo.tick_ms;
+          }
+        } else {
+          /* Non-config responses (servo, register_face, etc.) */
+          if (msg.status === 'ok') {
+            if (msg.data.message) log(msg.data.message, 'g');
+          } else {
+            var err = msg.data.message || JSON.stringify(msg.data);
+            log('错误: ' + err, 'e');
+          }
         }
       }
       break;
@@ -1485,6 +1704,12 @@ var WS = {
         setState(msg.data.state);
         if (msg.data.frame_count) svFrame.textContent = msg.data.frame_count;
       }
+      break;
+
+    case 'g':
+      faceGallery = { entries: msg.entries || [] };
+      updateGalleryStats();
+      if (currentTab === 'gallery') renderGallery();
       break;
     }
   },
@@ -1496,6 +1721,252 @@ var WS = {
     this.ws.send(JSON.stringify(m));
   }
 };
+
+/* ═══════════════════════ 舵机云台控制 ═══════════════════════
+ * 严格对齐 Python ov-imu-pwm.py:
+ *   servo 0 = H(水平/左右) = GPIO40,  servo 1 = V(垂直/上下) = GPIO41
+ * 使用 PointerEvent + setPointerCapture 确保鼠标/手指在任何位置松开都能停止 */
+var _svAng = [90, 90];           /* [H, V] 当前角度 */
+var _svLastSent = [-1, -1];      /* [H, V] 上次已发送的角度, 避免重复 */
+var _svTimer = 0;                /* 按住时的定时器 ID, 0=未激活 */
+var _svDir = null;               /* 当前方向 [servo, delta] */
+var _svMaxTicks = 40;            /* 单次按住最多40步≈3.2s (80ms×40) */
+
+var _SV_MAP = {
+  up:    [1, -2],   /* V舵机 角度减小=仰头, 步进2° */
+  down:  [1,  2],   /* V舵机 角度增大=俯头 */
+  left:  [0, -2],   /* H舵机 角度减小=左转 */
+  right: [0,  2]    /* H舵机 角度增大=右转 */
+};
+
+function svUpdateDisplay() {
+  var ha = document.getElementById('sv-ang-h');
+  var va = document.getElementById('sv-ang-v');
+  if (ha) ha.textContent = _svAng[0] + '°';
+  if (va) va.textContent = _svAng[1] + '°';
+}
+
+function svSend(servo, angle) {
+  angle = Math.max(0, Math.min(180, angle|0));
+  /* 前端去重：与上次已发送角度相同则跳过, 减少无效 CoAP 请求 */
+  if (angle === _svLastSent[servo]) return;
+  _svAng[servo] = angle;
+  _svLastSent[servo] = angle;
+  svUpdateDisplay();
+  WS.send('servo', {servo: servo, angle: angle});
+}
+
+function svTick(remaining) {
+  if (!_svDir) return;
+  if (remaining <= 0) { svRelease(); return; }
+  var s = _svDir[0], d = _svDir[1];
+  svSend(s, _svAng[s] + d);
+  _svTimer = setTimeout(function(){ svTick(remaining - 1); }, 80);  /* 80ms 步进, 舵机有足够时间到位 */
+}
+
+/* pointerdown 按下按钮 → 开始转动 */
+function svDown(e) {
+  e.preventDefault();
+  var dir = e.currentTarget.getAttribute('data-dir');
+  if (!dir || !_SV_MAP[dir]) return;
+  /* 捕获指针：后续 pointermove/pointerup 都发到这个元素，即使鼠标移出 */
+  e.currentTarget.setPointerCapture(e.pointerId);
+  svRelease();                       /* 先停旧的 */
+  _svDir = _SV_MAP[dir];
+  svTick(_svMaxTicks);               /* 开始步进, 最多75步≈3秒 */
+}
+
+/* pointerup / lostpointercapture = 立刻停止 */
+function svUp(e) {
+  svRelease();
+}
+
+function svRelease() {
+  _svDir = null;
+  if (_svTimer) { clearTimeout(_svTimer); _svTimer = 0; }
+}
+
+function svCenterClick(e) {
+  e.preventDefault();
+  svRelease();
+  WS.send('servo_center');
+  _svAng[0] = 90; _svAng[1] = 90;
+  _svLastSent[0] = -1; _svLastSent[1] = -1;  /* 重置去重状态 */
+  svUpdateDisplay();
+  log('舵机回中', 'b');
+}
+
+/* ── 绑定 ── */
+['sv-up','sv-down','sv-left','sv-right'].forEach(function(id){
+  var btn = document.getElementById(id);
+  if (!btn) return;
+  btn.addEventListener('pointerdown', svDown);
+  btn.addEventListener('pointerup', svUp);
+  btn.addEventListener('pointercancel', svUp);
+  btn.addEventListener('lostpointercapture', svUp);
+});
+var ctr = document.getElementById('sv-ctr');
+if (ctr) ctr.addEventListener('click', svCenterClick);
+
+/* ═══════════════════════ 人脸库 ═══════════════════════ */
+var faceGallery = { entries: [] };
+var regTrackId = -1;
+
+function updateGalleryStats() {
+  var entries = faceGallery.entries || [];
+  var known = 0, unknown = 0;
+  for (var i = 0; i < entries.length; i++) {
+    var id = entries[i].id;
+    if (id && id !== 'unknown') known++; else unknown++;
+  }
+  var ge = document.getElementById('g-known');
+  var gu = document.getElementById('g-unknown');
+  var gt = document.getElementById('g-total');
+  if (ge) ge.textContent = known;
+  if (gu) gu.textContent = unknown;
+  if (gt) gt.textContent = entries.length;
+  var gc = document.getElementById('gallery-count');
+  if (gc) gc.textContent = entries.length > 0 ? entries.length : '';
+}
+
+function renderGallery() {
+  var grid = document.getElementById('gallery-grid');
+  var empty = document.getElementById('gallery-empty');
+  if (!grid) return;
+
+  var entries = faceGallery.entries || [];
+  grid.innerHTML = '';
+
+  if (entries.length === 0) {
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+
+  for (var i = 0; i < entries.length; i++) {
+    var e = entries[i];
+    var card = document.createElement('div');
+    card.className = 'gcard';
+
+    /* Thumbnail */
+    var img = document.createElement('img');
+    img.className = 'gcard-img';
+    if (e.thumb) {
+      img.src = 'data:image/jpeg;base64,' + e.thumb;
+    } else {
+      img.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="112" height="112"><rect fill="%23f0ede6" width="112" height="112"/><text fill="%23999" font-size="11" text-anchor="middle" x="56" y="60">无图像</text></svg>';
+    }
+    card.appendChild(img);
+
+    /* Info */
+    var info = document.createElement('div');
+    info.className = 'gcard-info';
+
+    /* Identity */
+    var idDiv = document.createElement('div');
+    idDiv.className = 'gcard-id';
+    var isKnown = e.id && e.id !== 'unknown';
+    if (isKnown) idDiv.classList.add('known');
+    idDiv.textContent = isKnown ? e.id : '未知';
+    info.appendChild(idDiv);
+
+    /* Similarity bar */
+    if (e.s > 0) {
+      var simDiv = document.createElement('div');
+      simDiv.className = 'gcard-sim';
+      simDiv.textContent = Math.round(e.s * 100) + '%';
+      info.appendChild(simDiv);
+
+      var bar = document.createElement('div');
+      bar.className = 'gcard-sim-bar';
+      var fill = document.createElement('div');
+      fill.className = 'gcard-sim-bar-fill';
+      fill.style.width = Math.round(e.s * 100) + '%';
+      bar.appendChild(fill);
+      info.appendChild(bar);
+    }
+
+    /* Meta: track_id + age */
+    var meta = document.createElement('div');
+    meta.className = 'gcard-meta';
+    meta.innerHTML = '<span>#' + e.t + '</span><span>' + (e.age != null ? e.age.toFixed(1) + 's前' : '') + '</span>';
+    info.appendChild(meta);
+
+    /* Register button for unknown faces */
+    if (!isKnown) {
+      var btn = document.createElement('button');
+      btn.className = 'gcard-register';
+      btn.textContent = '注册';
+      btn.onclick = (function(tid, thumb) {
+        return function() { openRegModal(tid, thumb); };
+      })(e.t, e.thumb);
+      info.appendChild(btn);
+    }
+
+    card.appendChild(info);
+    grid.appendChild(card);
+  }
+}
+
+function openRegModal(trackId, thumbB64) {
+  regTrackId = trackId;
+  var thumbImg = document.getElementById('reg-thumb');
+  if (thumbImg && thumbB64) {
+    thumbImg.src = 'data:image/jpeg;base64,' + thumbB64;
+  }
+  document.getElementById('reg-name').value = '';
+  document.getElementById('reg-modal').classList.add('on');
+  document.getElementById('reg-name').focus();
+}
+
+function closeRegModal() {
+  document.getElementById('reg-modal').classList.remove('on');
+  regTrackId = -1;
+}
+
+function confirmRegister() {
+  var name = document.getElementById('reg-name').value.trim();
+  if (!name) { log('请输入姓名', 'w'); return; }
+  if (regTrackId < 0) { log('无效的跟踪ID', 'e'); return; }
+  WS.send('register_face', { track_id: regTrackId, identity: name });
+  log('注册人脸: ' + name + ' (track_id=' + regTrackId + ')', 'g');
+  closeRegModal();
+}
+
+/* ── Gallery control events ── */
+document.getElementById('reg-cancel').addEventListener('click', closeRegModal);
+document.getElementById('reg-confirm').addEventListener('click', confirmRegister);
+document.getElementById('reg-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeRegModal();
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeRegModal();
+  if (e.key === 'Enter' && document.getElementById('reg-modal').classList.contains('on')) confirmRegister();
+});
+
+var galleryTtl = document.getElementById('gallery-ttl');
+var galleryTtlVal = document.getElementById('gallery-ttl-val');
+if (galleryTtl) {
+  galleryTtl.addEventListener('input', function() {
+    if (galleryTtlVal) galleryTtlVal.textContent = this.value + 's';
+  });
+}
+
+document.getElementById('gallery-clear').addEventListener('click', function() {
+  WS.send('clear_gallery');
+  faceGallery = { entries: [] };
+  renderGallery();
+  updateGalleryStats();
+  log('图库已清空', 'b');
+});
+document.getElementById('gallery-save-db').addEventListener('click', function() {
+  WS.send('save_database');
+  log('正在保存人脸数据库...', 'b');
+});
+document.getElementById('gallery-load-db').addEventListener('click', function() {
+  WS.send('load_database');
+  log('正在加载人脸数据库...', 'b');
+});
 
 /* ── 初始化 ── */
 D.vid.onerror = function(){ D.vid.style.display='none'; D.ph.style.display=''; };

@@ -89,6 +89,11 @@ void stgcn_action_recognizer_run_async(STGCNActionRecognizer* recognizer);
 bool stgcn_action_recognizer_get_latest(const STGCNActionRecognizer* recognizer,
                                         ActionResult* out);
 
+/** Query current skeleton buffer fill count (thread-safe).
+ *  Returns 0..num_frames.  Callers should skip run_async() until
+ *  buffer is full to avoid zero-padded inference producing empty results. */
+int stgcn_action_recognizer_get_buffer_fill(const STGCNActionRecognizer* recognizer);
+
 const char* stgcn_get_action_name(int action_id);
 
 #ifdef __cplusplus

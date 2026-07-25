@@ -170,9 +170,8 @@ STGCNActionRecognizer* stgcn_action_recognizer_create(const char* model_path,
 void stgcn_action_recognizer_destroy(STGCNActionRecognizer* recognizer) {
     if (!recognizer) return;
     ort_ctx_destroy(recognizer->ctx);
-    const OrtApi* g_ort = ort_get_api();
-    if (recognizer->session && g_ort) {
-        g_ort->ReleaseSession(recognizer->session);
+    if (recognizer->session) {
+        ort_release_session(recognizer->session);
     }
     free(recognizer->prealloc_pts);
     free(recognizer->prealloc_mot);
@@ -322,8 +321,8 @@ bool stgcn_action_recognizer_load_model(STGCNActionRecognizer* recognizer, const
                                       STGCN_NUM_CHANNELS);
     if (!recognizer->ctx) {
         log_error("STGCNActionRecognizer: failed to create inference context");
-        if (recognizer->session && ort) {
-            ort->ReleaseSession(recognizer->session);
+        if (recognizer->session) {
+            ort_release_session(recognizer->session);
             recognizer->session = NULL;
         }
         return false;
@@ -796,6 +795,16 @@ void stgcn_action_recognizer_reset(STGCNActionRecognizer* recognizer) {
     recognizer->buffer_frames = 0;
     recognizer->buffer_person_id = -1;
     pthread_mutex_unlock(&recognizer->mutex);
+}
+
+int stgcn_action_recognizer_get_buffer_fill(const STGCNActionRecognizer* recognizer) {
+    if (!recognizer) return 0;
+    /* Cast away const — internal synchronization only, no logical mutation */
+    STGCNActionRecognizer* rw = (STGCNActionRecognizer*)recognizer;
+    pthread_mutex_lock(&rw->mutex);
+    int fill = rw->buffer_frames;
+    pthread_mutex_unlock(&rw->mutex);
+    return fill;
 }
 
 const char* stgcn_get_action_name(int action_id) {

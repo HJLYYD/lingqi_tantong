@@ -40,9 +40,8 @@ void arcface_recognizer_destroy(ArcFaceRecognizer* rec) {
     if (rec->ctx) {
         ort_ctx_destroy(rec->ctx);
     }
-    const OrtApi* ort = ort_get_api();
-    if (rec->session && ort) {
-        ort->ReleaseSession(rec->session);
+    if (rec->session) {
+        ort_release_session(rec->session);
     }
     free(rec);
 }
@@ -102,8 +101,7 @@ bool arcface_recognizer_load_model(ArcFaceRecognizer* rec, const char* model_pat
     rec->ctx = ort_ctx_create(rec->session, rec->input_width, rec->input_height, 3);
     if (!rec->ctx) {
         log_error("ArcFace: failed to create inference context");
-        const OrtApi* o2 = ort_get_api();
-        if (o2) o2->ReleaseSession(rec->session);
+        ort_release_session(rec->session);
         rec->session = NULL;
         return false;
     }
@@ -273,4 +271,189 @@ void arcface_recognizer_clear_database(ArcFaceRecognizer* rec) {
     if (!rec) return;
     rec->num_entries = 0;
     log_info("Face database cleared");
+}
+
+bool arcface_recognizer_register_feature(ArcFaceRecognizer* rec, const char* identity,
+                                          const float* feature) {
+    if (!rec || !identity || !feature) return false;
+    if (rec->num_entries >= ARCFACE_MAX_FACES) {
+        log_error("Face database full");
+        return false;
+    }
+
+    /* Check if identity already exists — update instead of duplicate */
+    int existing = arcface_recognizer_find_entry(rec, identity);
+    if (existing >= 0) {
+        memcpy(rec->database[existing].feature, feature, ARCFACE_FEATURE_DIM * sizeof(float));
+        rec->database[existing].active = true;
+        log_info("Updated face identity: %s", identity);
+        return true;
+    }
+
+    FaceDatabaseEntry* entry = &rec->database[rec->num_entries++];
+    strncpy(entry->identity, identity, MAX_STRING_LEN - 1);
+    entry->identity[MAX_STRING_LEN - 1] = '\0';
+    entry->active = true;
+    memcpy(entry->feature, feature, ARCFACE_FEATURE_DIM * sizeof(float));
+
+    log_info("Registered face identity: %s", identity);
+    return true;
+}
+
+int arcface_recognizer_find_entry(ArcFaceRecognizer* rec, const char* identity) {
+    if (!rec || !identity) return -1;
+    for (int i = 0; i < rec->num_entries; i++) {
+        if (rec->database[i].active && strcmp(rec->database[i].identity, identity) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool arcface_recognizer_delete_entry(ArcFaceRecognizer* rec, const char* identity) {
+    if (!rec || !identity) return false;
+    int idx = arcface_recognizer_find_entry(rec, identity);
+    if (idx < 0) return false;
+    rec->database[idx].active = false;
+    log_info("Deleted face identity: %s", identity);
+    return true;
+}
+
+int arcface_recognizer_get_entry_count(const ArcFaceRecognizer* rec) {
+    if (!rec) return 0;
+    int count = 0;
+    for (int i = 0; i < rec->num_entries; i++) {
+        if (rec->database[i].active) count++;
+    }
+    return count;
+}
+
+bool arcface_recognizer_save_database(ArcFaceRecognizer* rec, const char* filepath) {
+    if (!rec || !filepath) return false;
+
+    FILE* f = fopen(filepath, "w");
+    if (!f) {
+        log_error("ArcFace: cannot open database for writing: %s", filepath);
+        return false;
+    }
+
+    fprintf(f, "{\n  \"version\": 1,\n  \"entries\": [\n");
+
+    int written = 0;
+    for (int i = 0; i < rec->num_entries; i++) {
+        if (!rec->database[i].active) continue;
+        if (written > 0) fprintf(f, ",\n");
+
+        fprintf(f, "    {\n      \"identity\": \"");
+        /* Escape backslash and double-quote in identity */
+        for (const char* s = rec->database[i].identity; *s; s++) {
+            if (*s == '\\' || *s == '"') fputc('\\', f);
+            fputc(*s, f);
+        }
+        fprintf(f, "\",\n      \"feature\": [");
+
+        for (int j = 0; j < ARCFACE_FEATURE_DIM; j++) {
+            if (j > 0) fprintf(f, ", ");
+            fprintf(f, "%.8f", (double)rec->database[i].feature[j]);
+        }
+        fprintf(f, "]\n    }");
+        written++;
+    }
+
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+
+    log_info("ArcFace: saved %d entries to %s", written, filepath);
+    return true;
+}
+
+/* Minimal JSON parser — extracts identity and feature array from database file */
+bool arcface_recognizer_load_database(ArcFaceRecognizer* rec, const char* filepath) {
+    if (!rec || !filepath) return false;
+
+    FILE* f = fopen(filepath, "r");
+    if (!f) {
+        log_warn("ArcFace: database file not found: %s (starting with empty DB)", filepath);
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0 || fsize > (4L * 1024 * 1024)) {  /* 4MB limit */
+        fclose(f);
+        return false;
+    }
+    fseek(f, 0, SEEK_SET);
+
+    char* buf = (char*)malloc((size_t)fsize + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t nread = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    if (nread <= 0) { free(buf); return false; }
+    buf[nread] = '\0';
+
+    int loaded = 0;
+    const char* p = buf;
+
+    while (*p) {
+        /* Find "identity": "..." */
+        const char* id_start = strstr(p, "\"identity\":");
+        if (!id_start) break;
+
+        /* Find opening quote of value */
+        const char* id_val = strchr(id_start + 11, '"');
+        if (!id_val) break;
+        id_val++;  /* skip opening quote */
+
+        char identity[MAX_STRING_LEN];
+        int id_len = 0;
+        while (*id_val && *id_val != '"' && id_len < (int)(sizeof(identity) - 1)) {
+            if (*id_val == '\\' && *(id_val + 1)) {
+                id_val++;
+                identity[id_len++] = *id_val++;
+            } else {
+                identity[id_len++] = *id_val++;
+            }
+        }
+        identity[id_len] = '\0';
+        if (id_len == 0) { p = id_val + 1; continue; }
+        p = id_val + 1;  /* advance past closing quote */
+
+        /* Find "feature": [...] */
+        const char* feat_start = strstr(p, "\"feature\":");
+        if (!feat_start) break;
+
+        const char* bracket = strchr(feat_start + 10, '[');
+        if (!bracket) break;
+
+        float feature[ARCFACE_FEATURE_DIM];
+        int feat_count = 0;
+        p = bracket + 1;
+
+        while (feat_count < ARCFACE_FEATURE_DIM && *p) {
+            /* Skip whitespace and commas */
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+            if (*p == ']' || *p == '\0') break;
+
+            char* end = NULL;
+            feature[feat_count++] = strtof(p, &end);
+            if (end == p) break;
+            p = end;
+        }
+
+        if (feat_count == ARCFACE_FEATURE_DIM) {
+            if (arcface_recognizer_register_feature(rec, identity, feature)) {
+                loaded++;
+            }
+        }
+
+        /* Advance past closing ']' */
+        p = strchr(p, ']');
+        if (!p) break;
+        p++;
+    }
+
+    free(buf);
+    log_info("ArcFace: loaded %d entries from %s", loaded, filepath);
+    return loaded > 0;
 }

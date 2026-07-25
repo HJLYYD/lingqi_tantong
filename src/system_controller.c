@@ -13,7 +13,8 @@
 #include "video_processor.h"
 #include "ort_common.h"
 #include "spacemit_ort_bridge.h"
-#include "stgcn_action_recognizer.h"
+#include "tcn_action_predictor.h"
+#include "face_gallery.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -247,6 +248,75 @@ static void push_frame_to_web(SystemController* sc, const InferenceResult* ir,
         web_server_push_frame_jpeg(sc->web_server, buf, frame_num,
                                    raw_jpeg, raw_jpeg_len);
     }
+
+    /* ── Face Gallery: extract face crops and update thumbnail gallery ── */
+    if (sc->face_gallery && rgb_data && cam_w > 0 && cam_h > 0) {
+        for (int i = 0; i < tr->num_tracked && i < MAX_TRACKS; i++) {
+            const TrackedObj* t = &tr->tracked_objects[i];
+            if (!t->has_face) continue;
+
+            /* Calculate face bbox with 20% margin for better thumbnail */
+            float fw = t->face.bbox.x_max - t->face.bbox.x_min;
+            float fh = t->face.bbox.y_max - t->face.bbox.y_min;
+            if (fw < 8.0f || fh < 8.0f) continue;  /* too small */
+
+            float margin = 0.20f;
+            int fx1 = (int)(t->face.bbox.x_min - fw * margin);
+            int fy1 = (int)(t->face.bbox.y_min - fh * margin);
+            int fx2 = (int)(t->face.bbox.x_max + fw * margin);
+            int fy2 = (int)(t->face.bbox.y_max + fh * margin);
+
+            /* Clamp to image bounds */
+            if (fx1 < 0) fx1 = 0;
+            if (fy1 < 0) fy1 = 0;
+            if (fx2 > cam_w) fx2 = cam_w;
+            if (fy2 > cam_h) fy2 = cam_h;
+
+            int crop_w = fx2 - fx1;
+            int crop_h = fy2 - fy1;
+            if (crop_w < 8 || crop_h < 8) continue;
+
+            /* Crop from RGB frame */
+            uint8_t* crop_rgb = (uint8_t*)malloc((size_t)crop_w * crop_h * 3);
+            if (!crop_rgb) continue;
+            utils_crop_image(rgb_data, cam_w, cam_h,
+                             fx1, fy1, crop_w, crop_h, crop_rgb);
+
+            /* Resize to 112x112 thumbnail */
+            uint8_t* resized = (uint8_t*)malloc(FACE_GALLERY_THUMB_W * FACE_GALLERY_THUMB_H * 3);
+            if (resized) {
+                utils_resize_image(crop_rgb, crop_w, crop_h,
+                                   resized, FACE_GALLERY_THUMB_W, FACE_GALLERY_THUMB_H, 3);
+
+                /* JPEG encode */
+                uint8_t* jpeg_out = NULL;
+                unsigned long jpeg_sz = 0;
+                tjhandle tj = tjInitCompress();
+                if (tj) {
+                    int rc = tjCompress2(tj, resized,
+                                         FACE_GALLERY_THUMB_W, 0, FACE_GALLERY_THUMB_H,
+                                         TJPF_RGB, &jpeg_out, &jpeg_sz,
+                                         TJSAMP_422, 70, TJFLAG_ACCURATEDCT);
+                    if (rc == 0 && jpeg_out && jpeg_sz > 0 &&
+                        jpeg_sz <= FACE_GALLERY_THUMB_MAX) {
+                        face_gallery_update(sc->face_gallery, t->track_id,
+                            t->face.identity, t->face.similarity,
+                            t->face.has_feature ? t->face.feature_vector : NULL,
+                            t->face.has_feature,
+                            &t->face.bbox,
+                            jpeg_out, (int)jpeg_sz);
+                    }
+                    if (jpeg_out) tjFree(jpeg_out);
+                    tjDestroy(tj);
+                }
+                free(resized);
+            }
+            free(crop_rgb);
+        }
+
+        /* Prune expired gallery entries */
+        face_gallery_prune(sc->face_gallery);
+    }
 }
 
 /* ── Broadcast pipeline state change to Web UI ── */
@@ -266,7 +336,7 @@ static void broadcast_pipeline_state(SystemController* sc, const char* event) {
 
 #define K1_RING_SIZE        4
 #define K1_MAX_PIPELINE_THREADS 8
-#define K1_PIPELINE_NUM_HEARTS   6   /* capture, inference, stgcn, postprocess, viz, output */
+#define K1_PIPELINE_NUM_HEARTS   6   /* capture, inference, tcn, postprocess, viz, output */
 
 typedef struct {
     uint8_t* rgb_data;
@@ -320,7 +390,7 @@ typedef struct {
      * Each worker thread bumps its heartbeat every loop iteration.
      * Main thread checks hearts are still beating; if a thread dies,
      * it shuts down the pipeline to prevent deadlocks. */
-    volatile int thread_heartbeats[K1_PIPELINE_NUM_HEARTS];  /* [0]=capture, [1]=inference, [2]=stgcn, [3]=postprocess, [4]=viz */
+    volatile int thread_heartbeats[K1_PIPELINE_NUM_HEARTS];  /* [0]=capture, [1]=inference, [2]=tcn, [3]=postprocess, [4]=viz */
     volatile bool thread_alive[K1_PIPELINE_NUM_HEARTS];
 
     SystemController* controller;
@@ -874,21 +944,21 @@ static void* k1_inference_thread(void* arg) {
  * ST-GCN 使用 CPU EP (FP32 模型, 未量化), 不占用 TCM。
  * 在独立核心上异步运行, 与 YOLO/Face 推理 (CPU 1) 并行:
  *   CPU 1: pose + face detect + face recog (SpacemiT EP, ~200ms)
- *   CPU 2: ST-GCN action recognition (CPU EP, FP32, ~400ms every 50 frames)
+ *   CPU 2: 1D-TCN action prediction (SpacemiT EP, INT8, ~6ms every interval frames)
  *
- * 唤醒间隔 = action_inference_interval 帧 (config: 50 frames ≈ 12s at 4 FPS)
- * 单次推理 ~400ms, 在间隔内安全完成。
+ * 唤醒间隔 = action_inference_interval 帧
+ * 单次推理 ~6ms, 在间隔内安全完成。
  */
-static void* k1_stgcn_thread(void* arg) {
+static void* k1_tcn_thread(void* arg) {
     K1ThreadArg* ta = (K1ThreadArg*)arg;
     K1Pipeline* pl = ta->pipeline;
     SystemController* sc = pl->controller;
 
     k1_pin_current_to_cpu(ta->cpu_core);
-    k1_apply_rt_priority("ST-GCN");
+    k1_apply_rt_priority("TCN");
     pl->thread_alive[2] = true;
-    log_set_thread_name("stgcn");
-    log_info("[Pipeline] ST-GCN thread on CPU %d (Cluster0)", ta->cpu_core);
+    log_set_thread_name("tcn");
+    log_info("[Pipeline] TCN thread on CPU %d (Cluster0)", ta->cpu_core);
 
     int interval = 10; /* default, updated below */
     {
@@ -897,24 +967,30 @@ static void* k1_stgcn_thread(void* arg) {
             interval = ip->action_inference_interval;
         }
     }
-    log_info("[Pipeline] ST-GCN async interval: %d frames", interval);
+    log_info("[Pipeline] TCN async interval: %d frames", interval);
 
     int last_run_frame = 0;
     while (pl->running) {
         pl->thread_heartbeats[2]++;
 
-        /* Check if it's time to run (based on frame count) */
+        /* Check if it's time to run (based on frame count).
+         * Skip until skeleton buffer is full to avoid zero-padded
+         * inference producing empty (num_actions=0) results that
+         * consume the has_new_action flag. */
         int current_frame = sc->frame_count;
         if (current_frame > 0 &&
             current_frame - last_run_frame >= interval &&
             sc->inference_pipeline &&
             sc->inference_pipeline->action_recognizer) {
-            last_run_frame = current_frame;
-            stgcn_action_recognizer_run_async(
-                sc->inference_pipeline->action_recognizer);
+            TcnActionPredictor* ar = sc->inference_pipeline->action_recognizer;
+            int buf_fill = tcn_action_predictor_get_buffer_fill(ar);
+            if (buf_fill >= ar->min_frames_to_predict) {
+                last_run_frame = current_frame;
+                tcn_action_predictor_run_async(ar);
+            }
         }
 
-        /* Sleep 5ms between checks — ST-GCN runs infrequently,
+        /* Sleep 5ms between checks — TCN runs infrequently,
          * no need to spin tight. */
         usleep(5000);
     }
@@ -1325,7 +1401,7 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
 
     CREATE_THREAD(K1_CPU_CLUSTER1_CAPTURE, "Capture", k1_capture_thread);
     CREATE_THREAD(K1_CPU_CLUSTER0_INFERENCE, "Inference", k1_inference_thread);
-    CREATE_THREAD(K1_CPU_CLUSTER0_STGCN, "ST-GCN", k1_stgcn_thread);
+    CREATE_THREAD(K1_CPU_CLUSTER0_TCN, "TCN", k1_tcn_thread);
     CREATE_THREAD(K1_CPU_CLUSTER0_AI, "PostProcess", k1_postprocess_thread);
     CREATE_THREAD(K1_CPU_CLUSTER1_VIZ, "Viz", k1_viz_thread);
     #undef CREATE_THREAD
@@ -1336,10 +1412,10 @@ SystemStatus system_controller_process_realtime_k1(SystemController* sc) {
 
     pl.num_threads = t;
 
-    log_info("[Pipeline] %d threads: Capture(CPU%d)→Inference(CPU%d)→ST-GCN(CPU%d)→Post(CPU%d)→Viz(CPU%d)",
+    log_info("[Pipeline] %d threads: Capture(CPU%d)→Inference(CPU%d)→TCN(CPU%d)→Post(CPU%d)→Viz(CPU%d)",
              pl.num_threads,
              K1_CPU_CLUSTER1_CAPTURE, K1_CPU_CLUSTER0_INFERENCE,
-             K1_CPU_CLUSTER0_STGCN, K1_CPU_CLUSTER0_AI, K1_CPU_CLUSTER1_VIZ);
+             K1_CPU_CLUSTER0_TCN, K1_CPU_CLUSTER0_AI, K1_CPU_CLUSTER1_VIZ);
 
     sc->running = 1;
     sc->start_time = k1_get_time_ms() / 1000.0;
@@ -1743,6 +1819,20 @@ SystemController* system_controller_create(const char* config_path,
         strncpy(sc->coap_wifi_password, pw ? pw : "", sizeof(sc->coap_wifi_password) - 1);
     }
 
+    /* ── Face Gallery initialization ── */
+    sc->face_gallery = (FaceGallery*)calloc(1, sizeof(FaceGallery));
+    if (sc->face_gallery) {
+        face_gallery_init(sc->face_gallery, 60);
+        snprintf(sc->face_db_path, sizeof(sc->face_db_path), "output/face_database.json");
+        /* Auto-load face database on startup */
+        if (sc->inference_pipeline && sc->inference_pipeline->face_recognizer) {
+            arcface_recognizer_load_database(
+                sc->inference_pipeline->face_recognizer, sc->face_db_path);
+        }
+        log_info("Face Gallery initialized (TTL=%ds, DB=%s)",
+                 sc->face_gallery->ttl_sec, sc->face_db_path);
+    }
+
     log_info("System Controller initialized");
     return sc;
 }
@@ -1886,6 +1976,19 @@ void system_controller_destroy(SystemController* sc) {
             log_debug("[Destroy] ort already down, skipping global shutdown");
             log_flush();
         }
+    }
+
+    /* ── Face Gallery cleanup ── */
+    if (sc->face_gallery) {
+        /* Auto-save database on shutdown */
+        if (sc->inference_pipeline && sc->inference_pipeline->face_recognizer) {
+            arcface_recognizer_save_database(
+                sc->inference_pipeline->face_recognizer, sc->face_db_path);
+        }
+        face_gallery_destroy(sc->face_gallery);
+        free(sc->face_gallery);
+        sc->face_gallery = NULL;
+        log_debug("[Destroy] face_gallery done"); log_flush();
     }
 
     free(sc);
@@ -2236,7 +2339,6 @@ static void render_overlay_bgr(uint8_t* rgb, int img_w, int img_h,
                                 const InferenceResult* inference,
                                 const TrackingResult* tracking,
                                 float fps, int frame_num) {
-    (void)inference;  /* reserved for face/action overlay expansion */
     if (!rgb || !tracking) return;
 
     /* ── Defensive: clamp num_tracked to array bounds ── */
@@ -2320,14 +2422,24 @@ static void render_overlay_bgr(uint8_t* rgb, int img_w, int img_h,
         }
     }
 
-    /* ── Top-right FPS + frame info overlay ── */
+    /* ── Top-right FPS + frame + action info overlay ── */
     {
-        char info[64];
-        snprintf(info, sizeof(info), "FPS:%.1f F:%d T:%d",
-                 (double)fps, frame_num, tracking->num_tracked);
+        char info[128];
+        int has_act = (inference && inference->has_action &&
+                       inference->action.num_actions > 0);
+        if (has_act) {
+            snprintf(info, sizeof(info), "FPS:%.1f F:%d T:%d  %s(%.0f%%)",
+                     (double)fps, frame_num, tracking->num_tracked,
+                     inference->action.actions[0].action_name,
+                     (double)(inference->action.actions[0].confidence * 100.0f));
+        } else {
+            snprintf(info, sizeof(info), "FPS:%.1f F:%d T:%d",
+                     (double)fps, frame_num, tracking->num_tracked);
+        }
         /* Draw semi-transparent background bar (darken top 20px strip).
          * Clamp start_x to 0: img_w < 220 would underflow int → UB. */
-        int bar_start = (img_w > 220) ? (img_w - 220) : 0;
+        int bar_width = has_act ? 380 : 220;
+        int bar_start = (img_w > bar_width) ? (img_w - bar_width) : 0;
         for (int y = 0; y < 20; y++) {
             for (int x = bar_start; x < img_w; x++) {
                 size_t off = ((size_t)y * (size_t)img_w + (size_t)x) * 3;
@@ -2336,7 +2448,11 @@ static void render_overlay_bgr(uint8_t* rgb, int img_w, int img_h,
                 rgb[off + 2] = (uint8_t)(rgb[off + 2] / 3);  /* B */
             }
         }
-        draw_text(rgb, img_w, img_h, img_w - 210, 4, info, 255, 255, 255);
+        int text_color_r = has_act ? 255 : 255;  /* yellow for action */
+        int text_color_g = has_act ? 212 : 255;
+        int text_color_b = has_act ? 40  : 255;
+        draw_text(rgb, img_w, img_h, bar_start + 5, 4, info,
+                  text_color_r, text_color_g, text_color_b);
     }
 }
 
@@ -2433,6 +2549,22 @@ SystemStatus system_controller_process_video(SystemController* sc,
 
         inference_pipeline_process_frame(
             sc->inference_pipeline, frame->data, frame->width, frame->height, inference);
+
+        /* ── Action Recognition: trigger async TCN inference periodically ──
+         * In offline mode there is no dedicated TCN thread, so we call
+         * run_async() inline from the main processing loop.  The model needs
+         * num_frames (default 30) of skeleton data before producing valid
+         * results — we skip runs until the buffer is full to avoid wasting
+         * CPU on zero-padded inference that always outputs num_actions=0. */
+        if (sc->inference_pipeline && sc->inference_pipeline->action_recognizer) {
+            TcnActionPredictor* ar = sc->inference_pipeline->action_recognizer;
+            int interval = sc->inference_pipeline->action_inference_interval;
+            if (interval <= 0) interval = 5;
+            int buf_fill = tcn_action_predictor_get_buffer_fill(ar);
+            if (sc->frame_count % interval == 0 && buf_fill >= ar->min_frames_to_predict) {
+                tcn_action_predictor_run_async(ar);
+            }
+        }
         if (sc->frame_count == 1 && inference->num_detections > 0) {
             spatial_engine_initialize_coordinate_system(
                 sc->spatial_engine, frame->height, frame->width, &inference->detections[0]);

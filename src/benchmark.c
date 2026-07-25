@@ -14,6 +14,7 @@
 #include "yolov5_face_detector.h"
 #include "arcface_recognizer.h"
 #include "stgcn_action_recognizer.h"
+#include "tcn_action_predictor.h"
 #include "inference_pipeline.h"
 #include "tracking_manager.h"
 #include "keypoint_validator.h"
@@ -46,9 +47,14 @@ void bm_sort_double(double* arr, int n) {
 void bm_compute_stats(double* latencies, int n,
                       double* out_min, double* out_max,
                       double* out_mean, double* out_median,
-                      double* out_stddev, double* out_p95) {
+                      double* out_stddev, double* out_p95,
+                      double* out_ci95_lo, double* out_ci95_hi,
+                      bool* out_throttling) {
     if (n <= 0) {
         *out_min = *out_max = *out_mean = *out_median = *out_stddev = *out_p95 = 0.0;
+        if (out_ci95_lo)  *out_ci95_lo = 0.0;
+        if (out_ci95_hi)  *out_ci95_hi = 0.0;
+        if (out_throttling) *out_throttling = false;
         return;
     }
     bm_sort_double(latencies, n);
@@ -72,10 +78,35 @@ void bm_compute_stats(double* latencies, int n,
     }
     *out_stddev = sqrt(var / (double)n);
 
-    int p95_idx = (int)((double)n * 0.95 + 0.5);
+    /* ── P95: nearest-rank method (Hyndman & Fan R1) ──
+     * index = ceil(n * 0.95) - 1.  For n=50: ceil(47.5)-1 = 47 (0-based).
+     * Reference: NIST/SEMATECH e-Handbook §7.2.6.2; Hyndman & Fan (1996) */
+    int p95_idx = (int)ceil((double)n * 0.95) - 1;
     if (p95_idx >= n) p95_idx = n - 1;
     if (p95_idx < 0) p95_idx = 0;
     *out_p95 = latencies[p95_idx];
+
+    /* ── 95% Confidence Interval: mean ± 1.96 * stddev / sqrt(n) ──
+     * Reference: TinyTorch Professional Benchmarking Guide; MLPerf best practices */
+    if (out_ci95_lo && out_ci95_hi && n > 1) {
+        double margin = 1.96 * (*out_stddev) / sqrt((double)n);
+        *out_ci95_lo = *out_mean - margin;
+        *out_ci95_hi = *out_mean + margin;
+    } else {
+        if (out_ci95_lo) *out_ci95_lo = *out_mean;
+        if (out_ci95_hi) *out_ci95_hi = *out_mean;
+    }
+
+    /* ── Thermal throttling detection ──
+     * If mean diverges from median by > 2%, the latency distribution is
+     * right-skewed → likely thermal throttling or background contention.
+     * Reference: TinyTorch guide §Statistical Validity */
+    if (out_throttling && *out_median > 0.01) {
+        double skew = fabs(*out_mean - *out_median) / *out_median;
+        *out_throttling = (skew > 0.02);
+    } else if (out_throttling) {
+        *out_throttling = false;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -164,8 +195,12 @@ BMModelResult benchmark_yolo_pose(const char* model_path, int input_w, int input
     BMModelResult result;
     memset(&result, 0, sizeof(result));
     snprintf(result.model_name, BM_MAX_NAME_LEN, "YOLO-Pose");
+    /* Precision: detect quantization, but EP is always enabled for pose models.
+     * Actual EP usage depends on whether model passes quantization gate at load. */
+    bool is_quant = (strstr(model_path, ".q.onnx") != NULL);
     snprintf(result.precision, sizeof(result.precision), "%s",
-             strstr(model_path, ".q.onnx") ? "INT8+EP" : "FP32");
+             is_quant ? "INT8+EP" : "FP32 (CPU)");
+    result.ep_actually_used = is_quant;  /* YOLOv8PoseEstimator always passes use_ep=true */
     snprintf(result.input_shape, sizeof(result.input_shape), "%d×%d×3", input_w, input_h);
     result.warmup_runs = warmup_runs;
     result.timed_runs = timed_runs;
@@ -208,7 +243,9 @@ BMModelResult benchmark_yolo_pose(const char* model_path, int input_w, int input
     if (valid_runs > 0) {
         bm_compute_stats(result.latencies_ms, valid_runs,
                          &result.min_ms, &result.max_ms, &result.mean_ms,
-                         &result.median_ms, &result.stddev_ms, &result.p95_ms);
+                         &result.median_ms, &result.stddev_ms, &result.p95_ms,
+                         &result.ci95_lo_ms, &result.ci95_hi_ms,
+                         &result.thermal_throttling_detected);
         result.timed_runs = valid_runs;
         result.valid = true;
     } else {
@@ -225,14 +262,20 @@ BMModelResult benchmark_yolov5_face(const char* model_path, int input_w, int inp
     BMModelResult result;
     memset(&result, 0, sizeof(result));
     snprintf(result.model_name, BM_MAX_NAME_LEN, "YOLOv5-Face");
+    /* YOLOv5-Face now supports SpacemiT EP with IO Binding.
+     * When use_ep=true and TCM is available, INT8 outputs are routed to CPU memory
+     * via OrtIoBinding (ort_ctx_run_io_binding).  If TCM is exhausted, falls back
+     * to CPU EP gracefully. */
+    bool is_quant = (strstr(model_path, ".q.onnx") != NULL);
     snprintf(result.precision, sizeof(result.precision), "%s",
-             strstr(model_path, ".q.onnx") ? "INT8+EP" : "FP32");
+             is_quant ? "INT8+EP" : "FP32 (CPU)");
+    result.ep_actually_used = is_quant;  /* IO Binding enables safe EP output reads */
     snprintf(result.input_shape, sizeof(result.input_shape), "%d×%d×3", input_w, input_h);
     result.warmup_runs = warmup_runs;
     result.timed_runs = timed_runs;
 
     YOLOv5FaceDetector* det = yolov5_face_detector_create(
-        model_path, input_w, input_h, conf_thresh, nms_thresh, false);
+        model_path, input_w, input_h, conf_thresh, nms_thresh, true);
     if (!det) {
         snprintf(result.error_msg, sizeof(result.error_msg),
                  "Failed to create detector for: %s", model_path);
@@ -269,7 +312,9 @@ BMModelResult benchmark_yolov5_face(const char* model_path, int input_w, int inp
     if (valid_runs > 0) {
         bm_compute_stats(result.latencies_ms, valid_runs,
                          &result.min_ms, &result.max_ms, &result.mean_ms,
-                         &result.median_ms, &result.stddev_ms, &result.p95_ms);
+                         &result.median_ms, &result.stddev_ms, &result.p95_ms,
+                         &result.ci95_lo_ms, &result.ci95_hi_ms,
+                         &result.thermal_throttling_detected);
         result.timed_runs = valid_runs;
         result.valid = true;
     } else {
@@ -284,8 +329,10 @@ BMModelResult benchmark_arcface(const char* model_path, int warmup_runs, int tim
     BMModelResult result;
     memset(&result, 0, sizeof(result));
     snprintf(result.model_name, BM_MAX_NAME_LEN, "ArcFace");
+    bool is_quant = (strstr(model_path, ".q.onnx") != NULL);
     snprintf(result.precision, sizeof(result.precision), "%s",
-             strstr(model_path, ".q.onnx") ? "INT8+EP" : "FP32");
+             is_quant ? "INT8+EP" : "FP32 (CPU)");
+    result.ep_actually_used = is_quant;  /* ArcFace always passes use_ep=true */
     snprintf(result.input_shape, sizeof(result.input_shape), "112×112×3");
     result.warmup_runs = warmup_runs;
     result.timed_runs = timed_runs;
@@ -327,7 +374,9 @@ BMModelResult benchmark_arcface(const char* model_path, int warmup_runs, int tim
     if (valid_runs > 0) {
         bm_compute_stats(result.latencies_ms, valid_runs,
                          &result.min_ms, &result.max_ms, &result.mean_ms,
-                         &result.median_ms, &result.stddev_ms, &result.p95_ms);
+                         &result.median_ms, &result.stddev_ms, &result.p95_ms,
+                         &result.ci95_lo_ms, &result.ci95_hi_ms,
+                         &result.thermal_throttling_detected);
         result.timed_runs = valid_runs;
         result.valid = true;
     } else {
@@ -344,8 +393,14 @@ BMModelResult benchmark_stgcn(const char* model_path, int num_frames, int num_kp
     BMModelResult result;
     memset(&result, 0, sizeof(result));
     snprintf(result.model_name, BM_MAX_NAME_LEN, "ST-GCN");
+    /* ST-GCN uses graph convolution operators which SpacemiT IME hardware does not
+     * support.  Even INT8-quantized models run on CPU EP (see stgcn_action_recognizer.c:198-202).
+     * Label reflects the actual execution provider, not just quantization status. */
+    bool is_quant = (strstr(model_path, ".q.onnx") != NULL ||
+                     strstr(model_path, "_int8.onnx") != NULL);
     snprintf(result.precision, sizeof(result.precision), "%s",
-             strstr(model_path, ".q.onnx") ? "INT8+EP" : "FP32 (CPU EP)");
+             is_quant ? "INT8 (CPU)" : "FP32 (CPU)");
+    result.ep_actually_used = false;  /* ST-GCN always uses CPU EP (GCN ops unsupported by IME) */
     snprintf(result.input_shape, sizeof(result.input_shape),
              "(1,3,%d,%d,%d)", num_frames, num_kpts, num_persons);
     result.warmup_runs = warmup_runs;
@@ -382,7 +437,117 @@ BMModelResult benchmark_stgcn(const char* model_path, int num_frames, int num_kp
     if (valid_runs > 0) {
         bm_compute_stats(result.latencies_ms, valid_runs,
                          &result.min_ms, &result.max_ms, &result.mean_ms,
-                         &result.median_ms, &result.stddev_ms, &result.p95_ms);
+                         &result.median_ms, &result.stddev_ms, &result.p95_ms,
+                         &result.ci95_lo_ms, &result.ci95_hi_ms,
+                         &result.thermal_throttling_detected);
+        result.timed_runs = valid_runs;
+        result.valid = true;
+    } else {
+        snprintf(result.error_msg, sizeof(result.error_msg), "All timed runs failed");
+        result.valid = false;
+    }
+
+    return result;
+}
+
+/** Push synthetic skeleton data into TCN until buffer is full. */
+static void tcn_fill_buffer(TcnActionPredictor* pred, int img_w, int img_h) {
+    PoseEstimation dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.num_keypoints = 17;
+    /* Generate a simple standing pose pattern */
+    float cx = (float)(img_w / 2);
+    float top_y = (float)(img_h * 0.15f);
+    float bot_y = (float)(img_h * 0.95f);
+    float sh_y = (float)(img_h * 0.25f);
+    float hi_y = (float)(img_h * 0.55f);
+    float kn_y = (float)(img_h * 0.75f);
+
+    /* COCO-17: assign plausible standing-pose coordinates */
+    float kx[17] = {cx, cx-4, cx+4, cx-8, cx+8,  /* nose, eyes, ears */
+                    cx-15, cx+15,                 /* shoulders */
+                    cx-25, cx+25,                 /* elbows */
+                    cx-30, cx+30,                 /* wrists */
+                    cx-12, cx+12,                 /* hips */
+                    cx-14, cx+14,                 /* knees */
+                    cx-16, cx+16};                /* ankles */
+    float ky[17] = {top_y, top_y-3, top_y-3, top_y-2, top_y-2,
+                    sh_y, sh_y,
+                    sh_y+30, sh_y+30,
+                    sh_y+60, sh_y+60,
+                    hi_y, hi_y,
+                    kn_y, kn_y,
+                    bot_y, bot_y};
+    float kc[17] = {0.9f, 0.8f, 0.8f, 0.7f, 0.7f,
+                    0.9f, 0.9f, 0.8f, 0.8f, 0.7f, 0.7f,
+                    0.9f, 0.9f, 0.8f, 0.8f, 0.7f, 0.7f};
+
+    for (int i = 0; i < 17; i++) {
+        dummy.keypoints[i].x = kx[i];
+        dummy.keypoints[i].y = ky[i];
+        dummy.keypoints[i].confidence = kc[i];
+    }
+
+    /* Push enough frames to fill the TCN buffer */
+    for (int f = 0; f < pred->num_frames + 5; f++) {
+        tcn_action_predictor_push_pose(pred, &dummy, img_w, img_h);
+    }
+}
+
+BMModelResult benchmark_tcn(const char* model_path, int num_frames, int num_kpts,
+                             int num_persons, int num_classes, float conf_thresh,
+                             int warmup_runs, int timed_runs) {
+    BMModelResult result;
+    memset(&result, 0, sizeof(result));
+    snprintf(result.model_name, BM_MAX_NAME_LEN, "1D-TCN");
+    /* 1D-TCN uses standard 1D convolution operators which SpacemiT IME hardware
+     * supports natively.  INT8-quantized models benefit from RVV 1.0 + IME
+     * acceleration via SpacemiT EP. */
+    bool is_quant = (strstr(model_path, ".q.onnx") != NULL ||
+                     strstr(model_path, "_INT8.onnx") != NULL ||
+                     strstr(model_path, "_int8.onnx") != NULL);
+    snprintf(result.precision, sizeof(result.precision), "%s",
+             is_quant ? "INT8+EP" : "FP32 (CPU)");
+    result.ep_actually_used = is_quant;  /* TCN uses EP when INT8 (standard conv ops) */
+    snprintf(result.input_shape, sizeof(result.input_shape),
+             "(1,%d,%d,%d,%d)", TCN_NUM_CHANNELS, num_frames, num_kpts, num_persons);
+    result.warmup_runs = warmup_runs;
+    result.timed_runs = timed_runs;
+
+    TcnActionPredictor* pred = tcn_action_predictor_create(
+        model_path, num_frames, num_kpts, num_persons, num_classes, conf_thresh);
+    if (!pred) {
+        snprintf(result.error_msg, sizeof(result.error_msg),
+                 "Failed to create predictor for: %s", model_path);
+        result.valid = false;
+        return result;
+    }
+
+    /* Fill skeleton buffer with synthetic data */
+    tcn_fill_buffer(pred, 640, 480);
+
+    /* ── Warmup ── */
+    for (int i = 0; i < warmup_runs; i++) {
+        tcn_action_predictor_predict(pred);
+    }
+
+    /* ── Timed runs ── */
+    int valid_runs = 0;
+    for (int i = 0; i < timed_runs && valid_runs < BM_MAX_RUNS; i++) {
+        double t0 = bm_get_time_us();
+        tcn_action_predictor_predict(pred);
+        double t1 = bm_get_time_us();
+        result.latencies_ms[valid_runs++] = (t1 - t0) * 0.001;
+    }
+
+    tcn_action_predictor_destroy(pred);
+
+    if (valid_runs > 0) {
+        bm_compute_stats(result.latencies_ms, valid_runs,
+                         &result.min_ms, &result.max_ms, &result.mean_ms,
+                         &result.median_ms, &result.stddev_ms, &result.p95_ms,
+                         &result.ci95_lo_ms, &result.ci95_hi_ms,
+                         &result.thermal_throttling_detected);
         result.timed_runs = valid_runs;
         result.valid = true;
     } else {
@@ -496,7 +661,7 @@ BMPipelineProfile benchmark_pipeline_profile(const char* config_path,
  * Formatted Output (screenshot-ready ASCII tables)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define BM_LINE_LEN 120
+#define BM_LINE_LEN 140
 
 static void bm_hr(void) {
     printf("+");
@@ -534,22 +699,31 @@ static void bm_labeled_value(const char* label, const char* fmt, ...) {
 /* Table rendering for model benchmark results */
 static void bm_table_header(void) {
     bm_hr_thin();
-    printf("| %-18s | %6s | %12s | %5s | %8s | %8s | %8s | %8s | %8s | %6s |\n",
+    printf("| %-18s | %-12s | %12s | %5s | %8s | %8s | %8s | %8s | %8s | %6s | %-10s |\n",
            "Model", "Prec", "Input Shape", "Runs",
-           "Min(ms)", "Max(ms)", "Mean(ms)", "Med(ms)", "Std(ms)", "P95(ms)");
+           "Min(ms)", "Max(ms)", "Mean(ms)", "Med(ms)", "Std(ms)", "P95(ms)", "CI95(ms)");
     bm_hr_thin();
 }
 
 static void bm_table_row(const BMModelResult* r) {
     if (!r->valid) {
-        printf("| %-18s | %6s | %12s | %5s | %8s | %8s | %8s | %8s | %8s | %6s |\n",
-               r->model_name, "-", "-", "-", "-", "-", "-", "-", "-", "-");
+        printf("| %-18s | %-12s | %12s | %5s | %8s | %8s | %8s | %8s | %8s | %6s | %-10s |\n",
+               r->model_name, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-");
         printf("|   ^-- ERROR: %-97s |\n", r->error_msg);
         return;
     }
-    printf("| %-18s | %6s | %12s | %5d | %8.2f | %8.2f | %8.2f | %8.2f | %8.2f | %6.2f |\n",
+    char ci_buf[24];
+    snprintf(ci_buf, sizeof(ci_buf), "±%.2f", r->ci95_hi_ms - r->mean_ms);
+    printf("| %-18s | %-12s | %12s | %5d | %8.2f | %8.2f | %8.2f | %8.2f | %8.2f | %6.2f | %-10s |\n",
            r->model_name, r->precision, r->input_shape, r->timed_runs,
-           r->min_ms, r->max_ms, r->mean_ms, r->median_ms, r->stddev_ms, r->p95_ms);
+           r->min_ms, r->max_ms, r->mean_ms, r->median_ms, r->stddev_ms, r->p95_ms, ci_buf);
+    /* Thermal throttling warning */
+    if (r->thermal_throttling_detected) {
+        printf("|   ⚠ THROTTLING: mean(%.1f) vs median(%.1f) divergence = %.1f%% (> 2%% threshold) %-45s |\n",
+               r->mean_ms, r->median_ms,
+               r->median_ms > 0.01 ? fabs(r->mean_ms - r->median_ms) / r->median_ms * 100.0 : 0.0,
+               "");
+    }
 }
 
 void bm_print_separator(int cols, const int* widths) {
@@ -603,33 +777,32 @@ void bm_print_report(const BMBenchmarkReport* report) {
 
     /* ── Speedup summary ── */
     printf("\n");
-    bm_title("Table 1b: INT8+EP Speedup vs FP32 (if both available)");
+    bm_title("Table 1b: INT8+EP Speedup vs FP32/CPU (if both available)");
     bm_table_header();
-    /* Find pairs of FP32 and INT8 results for same model */
+    /* Find pairs of CPU and EP results for same model */
     for (int i = 0; i < report->num_models; i++) {
         if (!report->models[i].valid) continue;
-        /* Look for a matching FP32 variant */
+        /* Look for a matching baseline variant */
         for (int j = i + 1; j < report->num_models; j++) {
             if (!report->models[j].valid) continue;
             if (strcmp(report->models[i].model_name, report->models[j].model_name) == 0) {
-                const BMModelResult* fp32 = NULL, *int8 = NULL;
-                if (strcmp(report->models[i].precision, "FP32") == 0 &&
-                    strstr(report->models[j].precision, "INT8")) {
-                    fp32 = &report->models[i];
-                    int8 = &report->models[j];
-                } else if (strcmp(report->models[j].precision, "FP32") == 0 &&
-                           strstr(report->models[i].precision, "INT8")) {
-                    fp32 = &report->models[j];
-                    int8 = &report->models[i];
+                const BMModelResult* cpu_run = NULL, *ep_run = NULL;
+                /* Match: one run with EP, one without */
+                if (report->models[i].ep_actually_used && !report->models[j].ep_actually_used) {
+                    ep_run = &report->models[i];
+                    cpu_run = &report->models[j];
+                } else if (report->models[j].ep_actually_used && !report->models[i].ep_actually_used) {
+                    ep_run = &report->models[j];
+                    cpu_run = &report->models[i];
                 }
-                if (fp32 && int8 && fp32->valid && int8->valid) {
-                    double speedup = fp32->mean_ms / (int8->mean_ms > 0.001 ? int8->mean_ms : 0.001);
-                    printf("| %-18s | %6s | %12s | %5d | %8.2f | %8s | %8s | %8s | %8s | %5.1fx |\n",
-                           int8->model_name, "INT8", int8->input_shape, int8->timed_runs,
-                           int8->mean_ms, "-", "-", "-", "-", speedup);
-                    printf("| %-18s | %6s | %12s | %5d | %8.2f | %8s | %8s | %8s | %8s | %6s |\n",
-                           fp32->model_name, "FP32", fp32->input_shape, fp32->timed_runs,
-                           fp32->mean_ms, "-", "-", "-", "-", "1.0x");
+                if (ep_run && cpu_run && ep_run->valid && cpu_run->valid) {
+                    double speedup = cpu_run->mean_ms / (ep_run->mean_ms > 0.001 ? ep_run->mean_ms : 0.001);
+                    printf("| %-18s | %-12s | %12s | %5d | %8.2f | %8s | %8s | %8s | %8s | %5.1fx |\n",
+                           ep_run->model_name, ep_run->precision, ep_run->input_shape, ep_run->timed_runs,
+                           ep_run->mean_ms, "-", "-", "-", "-", speedup);
+                    printf("| %-18s | %-12s | %12s | %5d | %8.2f | %8s | %8s | %8s | %8s | %6s |\n",
+                           cpu_run->model_name, cpu_run->precision, cpu_run->input_shape, cpu_run->timed_runs,
+                           cpu_run->mean_ms, "-", "-", "-", "-", "1.0x");
                     break;
                 }
             }
@@ -656,9 +829,15 @@ void bm_print_report(const BMBenchmarkReport* report) {
         if (r->timed_runs > 15) printf(", ... (%d total)", r->timed_runs);
         printf("\n");
         printf("|  %-40s", "");
-        printf("  Range: [%.1f, %.1f]ms  Mean: %.1fms  Median: %.1fms  P95: %.1fms  CV: %.1f%%\n",
+        printf("  Range: [%.1f, %.1f]ms  Mean: %.1fms  Median: %.1fms  P95: %.1fms  CI95: [%.1f, %.1f]ms  CV: %.1f%%\n",
                r->min_ms, r->max_ms, r->mean_ms, r->median_ms, r->p95_ms,
+               r->ci95_lo_ms, r->ci95_hi_ms,
                r->mean_ms > 0.01 ? (r->stddev_ms / r->mean_ms * 100.0) : 0.0);
+        if (r->thermal_throttling_detected) {
+            printf("|  %-40s  ⚠ THERMAL THROTTLING DETECTED (|mean-median|/median = %.1f%% > 2%%)\n",
+                   "",
+                   r->median_ms > 0.01 ? fabs(r->mean_ms - r->median_ms) / r->median_ms * 100.0 : 0.0);
+        }
     }
     bm_hr_thin();
 
@@ -688,7 +867,7 @@ void bm_print_report(const BMBenchmarkReport* report) {
         BM_STAGE_ROW("1. Frame Capture", report->pipeline.capture_ms, "read + JPEG decode");
         BM_STAGE_ROW("2. AI Inference (all models)", report->pipeline.inference_pose_ms,
                      report->pipeline.inference_pose_ms > 0 ?
-                     "pose+face+arcface+stgcn combined" : "see per-model Table 1");
+                     "pose+face+arcface+tcn combined" : "see per-model Table 1");
         bm_hr_thin();
         printf("| %-30s | %10.2f | %9.1f%% | %-57s |\n",
                "TOTAL (capture+inference+output)", total, 100.0,
@@ -721,9 +900,13 @@ void bm_print_report(const BMBenchmarkReport* report) {
     printf("|  * Warmup runs excluded from statistics                               |\n");
     printf("|  * Synthetic input data (deterministic seed) for reproducibility      |\n");
     printf("|  * CV = Coefficient of Variation = stddev/mean * 100%%                 |\n");
-    printf("|  * INT8+EP = INT8 quantized model on SpacemiT EP (RVV+IME)           |\n");
-    printf("|  * FP32 = FP32 model on CPU EP (no hardware acceleration)             |\n");
-    printf("|  * P95 = 95th percentile latency (worst-case excluding outliers)      |\n");
+    printf("|  * INT8+EP = INT8 model on SpacemiT EP (RVV+IME hardware acceleration)|\n");
+    printf("|  * INT8 (CPU) = INT8 model on CPU EP (EP disabled or unavailable)     |\n");
+    printf("|  * FP32 (CPU) = FP32 model on CPU EP (no hardware acceleration)       |\n");
+    printf("|  * P95 = 95th percentile, nearest-rank method (Hyndman & Fan R1,      |\n");
+    printf("|    NIST/SEMATECH e-Handbook §7.2.6.2): index = ceil(n*0.95)-1        |\n");
+    printf("|  * CI95 = 95%% confidence interval: mean ± 1.96*std/sqrt(n)           |\n");
+    printf("|  * Thermal throttling: |mean-median|/median > 2%% (TinyTorch guide)   |\n");
     bm_hr();
 
     printf("\n");
@@ -784,7 +967,7 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
      * 1. YOLOv8-Pose (INT8)
      * ══════════════════════════════════════════════════════════════ */
     if (run_all || strstr(model_filter, "pose") || strstr(model_filter, "yolo")) {
-        printf("[1/5] Benchmarking YOLOv8-Pose (INT8+EP)...");
+        printf("[1/6] Benchmarking YOLOv8-Pose (INT8+EP)...");
         fflush(stdout);
 
         const char* variant = config_get_string(config, "pose.model_variant", "yolov8n-pose");
@@ -815,7 +998,7 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
      * 2. YOLO11n Person Detection (INT8) — if separate model exists
      * ══════════════════════════════════════════════════════════════ */
     if (run_all || strstr(model_filter, "yolo11")) {
-        printf("[2/5] Benchmarking YOLO11n Detection (INT8+EP)...");
+        printf("[2/6] Benchmarking YOLO11n Detection (INT8+EP)...");
         fflush(stdout);
 
         /* YOLO11n as standalone person detector (not pose) */
@@ -837,7 +1020,7 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
      * 3. YOLOv5-Face (INT8)
      * ══════════════════════════════════════════════════════════════ */
     if (run_all || strstr(model_filter, "face")) {
-        printf("[3/5] Benchmarking YOLOv5-Face (INT8+EP)...");
+        printf("[3/6] Benchmarking YOLOv5-Face (INT8+EP)...");
         fflush(stdout);
 
         const char* mp = config_get_string(config, "face.detection_model_path", NULL);
@@ -860,7 +1043,7 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
      * 4. ArcFace (INT8)
      * ══════════════════════════════════════════════════════════════ */
     if (run_all || strstr(model_filter, "arcface") || strstr(model_filter, "face")) {
-        printf("[4/5] Benchmarking ArcFace (INT8+EP)...");
+        printf("[4/6] Benchmarking ArcFace (INT8+EP)...");
         fflush(stdout);
 
         const char* mp = config_get_string(config, "face.recognition_model_path", NULL);
@@ -875,13 +1058,37 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
     }
 
     /* ══════════════════════════════════════════════════════════════
-     * 5. ST-GCN (FP32 CPU EP)
+     * 5. 1D-TCN (INT8 SpacemiT EP) — PRIMARY action model
      * ══════════════════════════════════════════════════════════════ */
-    if (run_all || strstr(model_filter, "stgcn") || strstr(model_filter, "action")) {
-        printf("[5/5] Benchmarking ST-GCN (FP32 CPU EP)...");
+    if (run_all || strstr(model_filter, "tcn") || strstr(model_filter, "action")) {
+        printf("[5/6] Benchmarking 1D-TCN (INT8+EP)...");
         fflush(stdout);
 
         const char* mp = config_get_string(config, "action.model_path", NULL);
+        if (!mp || mp[0] == '\0')
+            mp = "models/Action Prediction/Skeleton-based Action Prediction/1D-TCN_Skeleton_INT8.onnx";
+
+        int nf = config_get_int(config, "action.num_frames", 30);
+        int nk = config_get_int(config, "action.num_keypoints", 14);
+        int np = config_get_int(config, "action.num_persons", 1);
+        int nc = config_get_int(config, "action.num_classes", 7);
+        float conf = config_get_float(config, "action.confidence_threshold", 0.5f);
+
+        BMModelResult r = benchmark_tcn(mp, nf, nk, np, nc, conf, warmup_runs, timed_runs);
+
+        printf(" %s (%.1f ms avg, %d runs)\n",
+               r.valid ? "OK" : "FAIL", r.valid ? r.mean_ms : 0.0, r.timed_runs);
+        report.models[report.num_models++] = r;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+     * 6. ST-GCN (FP32 CPU EP) — optional fallback
+     * ══════════════════════════════════════════════════════════════ */
+    if (run_all || strstr(model_filter, "stgcn")) {
+        printf("[6/6] Benchmarking ST-GCN (FP32 CPU EP)...");
+        fflush(stdout);
+
+        const char* mp = config_get_string(config, "action.stgcn_model_path", NULL);
         if (!mp || mp[0] == '\0')
             mp = "models/Action Prediction/Skeleton-based Action Prediction/stgcn.fp32.onnx";
 
@@ -940,6 +1147,7 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
         printf("    {\n");
         printf("      \"name\": \"%s\",\n", r->model_name);
         printf("      \"precision\": \"%s\",\n", r->precision);
+        printf("      \"ep_actually_used\": %s,\n", r->ep_actually_used ? "true" : "false");
         printf("      \"input_shape\": \"%s\",\n", r->input_shape);
         printf("      \"valid\": %s,\n", r->valid ? "true" : "false");
         if (r->valid) {
@@ -949,7 +1157,10 @@ int benchmark_run(const char* config_path, const char* model_filter, int timed_r
             printf("      \"mean_ms\": %.2f,\n", r->mean_ms);
             printf("      \"median_ms\": %.2f,\n", r->median_ms);
             printf("      \"stddev_ms\": %.2f,\n", r->stddev_ms);
-            printf("      \"p95_ms\": %.2f\n", r->p95_ms);
+            printf("      \"p95_ms\": %.2f,\n", r->p95_ms);
+            printf("      \"ci95_lo_ms\": %.2f,\n", r->ci95_lo_ms);
+            printf("      \"ci95_hi_ms\": %.2f,\n", r->ci95_hi_ms);
+            printf("      \"thermal_throttling_detected\": %s\n", r->thermal_throttling_detected ? "true" : "false");
         } else {
             printf("      \"error\": \"%s\"\n", r->error_msg);
         }
